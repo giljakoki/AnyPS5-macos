@@ -6,9 +6,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <span>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
@@ -250,6 +252,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 const SampledReadScope sampling(evidenceReads);
                 return shaderMemory->Capture(invocation);
             }();
+            if (Graphics::TraceMultisampling()) {
+                for (const auto& image : capture->snapshot.images) Graphics::TraceMultisampleDescriptor(std::span(image.dwords).first(std::min<std::size_t>(image.dwordCount, image.dwords.size())), address);
+            }
             captured = shaderMemory->Regions();
             request.context.memory = captured;
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);

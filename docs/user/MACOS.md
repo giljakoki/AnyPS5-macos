@@ -65,9 +65,28 @@ python3 package_macos_app.py --relinked out --game source --libs libs --vulkan ~
 open Title.app
 ```
 
-With the prebuilt package, run these commands inside `anyps5-macos-x86_64` and pass `--vulkan vulkan`. From a source build, the packager is `tools/package_macos_app.py`, `--libs` is `build/core/libs/libs` and `--vulkan` is the SDK's `macOS` directory. `--to-rosetta` lowers instructions Rosetta does not run (RDSEED, CLWB, RDPID); titles for Apple silicon always need it.
+With the prebuilt package, run these commands inside `anyps5-macos-x86_64` and pass `--vulkan vulkan`. The package's `convert-ps5.sh` runs both steps for a title folder: `bash convert-ps5.sh <title folder> <AppName> [relinker options]`. It uses decrypted `<module>.elf` copies in place of the encrypted modules beside them, unpacks fake-signed executables and modules with `unfself.py`, adds `--module-dir` for a Unity title's `Media/Modules` and `Media/Plugins`, checks for `sce_sys/param.json`, and opens the app; `INPUT=<file>` adds a key mapping. From a source build, the packager is `tools/package_macos_app.py`, `--libs` is `build/core/libs/libs` and `--vulkan` is the SDK's `macOS` directory. `--to-rosetta` lowers instructions Rosetta does not run (RDSEED, CLWB, RDPID); titles for Apple silicon always need it.
 
 The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, and starts without the SDK. The title runs in `~/Library/Application Support/AnyPS5/<title id>`, where its saves are written. Shaders are cached in `~/Library/Caches/<bundle id>`; the first start of a title compiles them and is slower. Output goes to `~/Library/Logs/AnyPS5/<title id>.log`. [Input mapping](INPUT_MAPPING.md) applies unchanged; pass `--input-config anyps5-input.ini` to the packager to put a mapping file in the bundle.
+
+## Tested on macOS
+
+| Title | ID | Result | Mac |
+|-------|----|--------|-----|
+| DOOM Shareware (homebrew, [lowbit/ps5-doom](https://github.com/lowbit/ps5-doom) v1.1.1) | PPSA99666 | In game: stable frame rate, keyboard input without noticeable latency | M5 Pro, macOS package of `b11de50f` |
+
+DOOM's release ships `eboot.bin` and `sce_module/libc.prx` as fake-signed SELF containers. Unpack the executable with `python3 tools/unfself.py eboot.bin eboot.elf`, set `eboot.bin` and the bundled `libc.prx` aside (the title runs on AnyPS5's libc, as on [Linux and Windows](COMPATIBILITY.md)), then convert `eboot.elf` as above.
+
+The first commercial titles tried stop at their first draws on features MoltenVK lacks or the driver does not implement yet: 4x multisampled render targets, pixel shaders that need barycentrics without geometry shaders, and a viewport depth range outside [0, 1] without `VK_EXT_depth_range_unrestricted`.
+
+The bundle's launcher passes its own environment to the title, so a runtime variable from [USAGE.md](USAGE.md#runtime-layout), such as [`APS5_MSAA_SINGLE_SAMPLE=1`](USAGE.md#multisampled-render-targets) for titles that stop on multisampled render targets, is set when the bundle is started while the title is not running:
+
+```sh
+open --env APS5_MSAA_SINGLE_SAMPLE=1 Title.app
+APS5_MSAA_SINGLE_SAMPLE=1 Title.app/Contents/MacOS/launch
+```
+
+Repeat `--env` for each variable. The second form starts the launcher from Terminal and waits until the title exits; either way the output still goes to the log.
 
 ## Limitations
 

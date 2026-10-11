@@ -2900,6 +2900,31 @@ void verifyGuardedNullPointers() {
 #endif
 }
 
+void verifyMultisampledImageCapture() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 6> code{0xf0001f30u, 0x00000400u, 0xbf8c3f70u, 0xe0700000u, 0x80020400u, 0xbf810000u};
+    struct alignas(256) Texels {
+        std::array<std::uint8_t, 4096> bytes{};
+    };
+    static Texels texels;
+    static std::array<std::uint32_t, 4> output{};
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.bytes.data()));
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 8> descriptor{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (56u << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (2u << 16u) | (14u << 28u), 0u, 2u << 4u, 0u, 0u};
+    std::array<std::uint32_t, 12> userData{};
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin());
+    userData[8] = static_cast<std::uint32_t>(outputAddress);
+    userData[9] = static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu);
+    userData[10] = 16u;
+    userData[11] = 0xfacu;
+    auto request = FrontendRequest(code, userData);
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    request.context.memory = memory.Regions();
+    require(capture->snapshot.images.size() == 1u && capture->snapshot.images[0].dwordCount == 8u && capture->snapshot.images[0].dwords == descriptor, "a 2D MSAA image load did not capture its type-14 descriptor");
+    expectFailure([&] { static_cast<void>(Recompile(request, *capture)); }, "multisampled image resources have no descriptor image shape", "a 2D MSAA image load compiled, so the descriptor trace need not run at its capture");
+}
+
 void verifyCubeDepthCompareMode() {
     using namespace ShaderRecompiler;
     ImageResource image{};
@@ -2958,6 +2983,7 @@ int main(int argc, char** argv) {
         verifyFunctionLdsBound();
         verifyGuardedNullPointers();
         verifyCubeDepthCompareMode();
+        verifyMultisampledImageCapture();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

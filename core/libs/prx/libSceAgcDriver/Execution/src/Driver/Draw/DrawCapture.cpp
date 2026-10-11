@@ -4,9 +4,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 
 namespace AgcDriver::DriverDetail {
 
@@ -33,6 +36,9 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
     }();
+    if (Graphics::TraceMultisampling()) {
+        for (const auto& image : capture->snapshot.images) Graphics::TraceMultisampleDescriptor(std::span(image.dwords).first(std::min<std::size_t>(image.dwordCount, image.dwords.size())), program.binary.codeAddress);
+    }
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;

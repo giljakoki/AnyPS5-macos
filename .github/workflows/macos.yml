@@ -128,13 +128,16 @@ jobs:
         if: ${{ !cancelled() && steps.libs.outcome == 'success' }}
         env:
           VULKAN_SDK_DIR: ${{ steps.vulkan.outputs.dir }}
+          # A pull request builds GitHub's merge of its head into the base branch; COMMIT names the head first.
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
           out=dist/anyps5-macos-x86_64
           mkdir -p "$out/libs" "$out/docs"
           cp build/core/relinker/relinker "$out/"
           cp build/core/libs/libs/*.prx "$out/libs/"
-          cp tools/package_macos_app.py "$out/"
+          cp tools/package_macos_app.py tools/unfself.py tools/convert-ps5.sh "$out/"
           cp docs/user/MACOS.md docs/user/USAGE.md docs/user/INPUT_MAPPING.md docs/user/COMPATIBILITY.md "$out/docs/"
           if [ -n "$VULKAN_SDK_DIR" ]; then
             mkdir -p "$out/vulkan/lib" "$out/vulkan/share/vulkan/icd.d" "$out/vulkan/licenses"
@@ -143,7 +146,9 @@ jobs:
             find "$(dirname "$VULKAN_SDK_DIR")" -maxdepth 3 -iname '*licen[cs]e*' -type f -exec cp {} "$out/vulkan/licenses/" \; || true
             printf '%s\n' "libvulkan.1.dylib (Khronos Vulkan-Loader) and libMoltenVK.dylib (KhronosGroup/MoltenVK) from the LunarG Vulkan SDK, both under the Apache License 2.0." > "$out/vulkan/README.txt"
           fi
-          git rev-parse HEAD > "$out/COMMIT"
+          printf '%s\n' "$SOURCE_SHA" > "$out/COMMIT"
+          built=$(git rev-parse HEAD)
+          [ "$built" = "$SOURCE_SHA" ] || printf 'built as %s, its merge into %s\n' "$built" "$BASE_REF" >> "$out/COMMIT"
           file "$out/relinker" "$out/libs/libkernel.prx"
           tar -czf dist/anyps5-macos-x86_64.tar.gz -C dist anyps5-macos-x86_64
       - uses: actions/upload-artifact@v7

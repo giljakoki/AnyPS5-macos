@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include "Recompiler.hpp"
 
@@ -57,6 +58,7 @@ struct ColorTarget {
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
+    std::uint32_t samples = 1;
 };
 
 struct DepthTarget {
@@ -68,6 +70,7 @@ struct DepthTarget {
     std::uint8_t clearStencil;
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
+    std::uint32_t samples = 1;
 };
 
 struct State {
@@ -120,9 +123,10 @@ std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
 
 struct ColorMetadataPass {
-    enum class Mode { EliminateFastClear, DccDecompress };
+    enum class Mode { EliminateFastClear, DccDecompress, Resolve, FmaskDecompress };
     Mode mode;
     std::vector<ColorTarget> targets;
+    std::optional<ColorTarget> source;
 };
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
 std::string DepthMaintenanceRejection(const QueueState& queue);
@@ -132,6 +136,17 @@ std::string DepthMaintenanceRejection(const QueueState& queue);
 std::string DrawRejection(const QueueState& queue, bool indexed);
 bool PixelProgramSkipped(const QueueState& queue);
 std::string NullPixelProgramRejection(const QueueState& queue);
+bool SingleSampleMultisamplingRequested(const char* value);
+bool SingleSampleMultisampling();
+bool MultisampleTraceRequested(const char* value);
+bool TraceMultisampling();
+std::vector<std::string>*& MultisampleTraceLog();
+std::optional<std::string> MultisampleStateLine(const QueueState& queue);
+std::optional<std::string> MultisampleDescriptorLine(std::span<const std::uint32_t> words, std::uint64_t program);
+std::optional<std::string> MultisampleFillLine(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source);
+void TraceMultisampleState(const QueueState& queue);
+void TraceMultisampleDescriptor(std::span<const std::uint32_t> words, std::uint64_t program);
+void TraceMultisampleFill(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source);
 
 // The recording facade of the draw decoders (design_cpu_final M8, step 8a): every register read
 // of DecodeShaderStages, DecodeState, DrawRejection, DecodePixelStageInfo and Driver::draw's
