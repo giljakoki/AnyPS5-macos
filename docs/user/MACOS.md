@@ -73,7 +73,7 @@ The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, an
 
 | Title | ID | Result | Mac |
 |-------|----|--------|-----|
-| DOOM Shareware (homebrew, [lowbit/ps5-doom](https://github.com/lowbit/ps5-doom) v1.1.1) | PPSA99666 | In game: stable frame rate, keyboard input without noticeable latency | M5 Pro, `main` after #2 plus `dde80ad1` |
+| DOOM Shareware (homebrew, [lowbit/ps5-doom](https://github.com/lowbit/ps5-doom) v1.1.1) | PPSA99666 | In game: stable frame rate, keyboard input without noticeable latency | M5 Pro, macOS package of `b11de50f` |
 
 DOOM's release ships `eboot.bin` and `sce_module/libc.prx` as fake-signed SELF containers. Unpack the executable with `python3 tools/unfself.py eboot.bin eboot.elf`, set `eboot.bin` and the bundled `libc.prx` aside (the title runs on AnyPS5's libc, as on [Linux and Windows](COMPATIBILITY.md)), then convert `eboot.elf` as above.
 
