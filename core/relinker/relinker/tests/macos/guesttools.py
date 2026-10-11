@@ -34,8 +34,8 @@ def stub_library(names, out, soname):
     subprocess.run([f"{LLVM}/clang", TARGET, "-c", out + ".s", "-o", out + ".o"], check=True)
     subprocess.run(["ld.lld", "-shared", "-soname", soname, out + ".o", "-o", out], check=True)
 
-def link_module(objs, libs, out, soname):
-    subprocess.run(["ld.lld", "-shared", "-z", "now", "--hash-style=sysv", "--eh-frame-hdr", "-soname", soname, *objs, *libs, "-o", out], check=True)
+def link_module(objs, libs, out, soname, extra=()):
+    subprocess.run(["ld.lld", "-shared", "-z", "now", "--hash-style=sysv", "--eh-frame-hdr", "-soname", soname, *extra, *objs, *libs, "-o", out], check=True)
 
 def link_executable(objs, libs, out):
     subprocess.run(["ld.lld", "-pie", "-z", "now", "--hash-style=sysv", "--eh-frame-hdr", "--no-dynamic-linker", "-e", "_start", *objs, *libs, "-o", out], check=True)

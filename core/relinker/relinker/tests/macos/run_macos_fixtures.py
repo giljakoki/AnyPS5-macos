@@ -25,13 +25,16 @@ def relink_and_run(relinker, libraries, directory, expected, arguments=(), modul
     directory = pathlib.Path(directory)
     output = directory / "eboot"
     source = directory / "eboot.elf"
-    if (directory / "sce_module").exists():
+    module_directories = ["sce_module"] + [value for option, value in zip(relink_options, relink_options[1:]) if option == "--module-dir"]
+    if any((directory / name).exists() for name in module_directories):
         # The relinker also looks for the executable's needed modules below the executable's directory,
         # so the link stubs (libc.prx, libkernel.prx) must not sit there.
         staged = directory / "input"
         staged.mkdir()
         shutil.move(str(source), str(staged / "eboot.elf"))
-        shutil.move(str(directory / "sce_module"), str(staged / "sce_module"))
+        for name in module_directories:
+            if (directory / name).exists():
+                shutil.move(str(directory / name), str(staged / name))
         source = staged / "eboot.elf"
     options = [*relink_options] + ([] if modules else ["--skip-sce-module"])
     relinked = subprocess.run([relinker, "--macos", *options, str(source), str(output)], capture_output=True, text=True, timeout=120)
@@ -85,6 +88,22 @@ def compiled_module(directory):
     tools.compile(str(HERE / "module_main.cpp"), str(directory / "main.o"))
     tools.nidify(str(directory / "main.o"), str(directory / "main.nid.o"))
     tools.link_executable([str(directory / "main.nid.o")], [str(module), str(directory / "libc.prx"), str(directory / "libkernel.prx")], str(directory / "eboot.elf"))
+
+
+def compiled_start_module(directory):
+    """A module the guest starts with sceKernelLoadStartModule: its initializer checks the start arguments
+    and returns the value they carry, which the guest exits with."""
+    tools = guesttools
+    (directory / "sce_module").mkdir()
+    (directory / "Plugins").mkdir()
+    tools.stub_library(["exit"], str(directory / "libc.prx"), "libc.prx")
+    tools.stub_library(["sceKernelLoadStartModule"], str(directory / "libkernel.prx"), "libkernel.prx")
+    tools.compile(str(HERE / "start_module.cpp"), str(directory / "start.o"), pic=True)
+    tools.nidify(str(directory / "start.o"), str(directory / "start.nid.o"), keep=("module_start",))
+    tools.link_module([str(directory / "start.nid.o")], [], str(directory / "Plugins" / "libstart.prx"), "libstart.prx", extra=["-init", "module_start"])
+    tools.compile(str(HERE / "start_main.cpp"), str(directory / "main.o"))
+    tools.nidify(str(directory / "main.o"), str(directory / "main.nid.o"))
+    tools.link_executable([str(directory / "main.nid.o")], [str(directory / "libc.prx"), str(directory / "libkernel.prx")], str(directory / "eboot.elf"))
 
 
 def compiled_intel(directory):
@@ -234,6 +253,7 @@ def main():
                   ("threads", compiled_threads, 51, [], False),
                   ("module", compiled_module, 143, [], True),
                   ("tls-modules", compiled_tls_modules, 47, [], True),
+                  ("module-start", compiled_start_module, 47, [], True, ["--module-dir", "Plugins"]),
                   # Without --to-rosetta the AMD-only instructions fault under Rosetta; with it they run.
                   ("intel-unconverted", compiled_intel, -signal.SIGILL, [], True),
                   ("intel", compiled_intel, 47, [], True, ["--to-rosetta"]),

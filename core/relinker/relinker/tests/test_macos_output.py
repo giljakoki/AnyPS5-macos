@@ -1,9 +1,11 @@
 """Check the Mach-O that `relinker --macos` writes from small byte-built guests.
 
 The output only runs on macOS, but its structure can be read anywhere: header, segments, entry point,
-dependencies, binds, the TLS descriptor and the rewrite of %fs accesses."""
+dependencies, binds, the TLS descriptor, the rewrite of %fs accesses and a module initializer that gets the
+start arguments of sceKernelLoadStartModule."""
 
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -13,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "macos"))
 
 from import_fixture import fixture as import_fixture
 from nid import nid
+from test_guest_module_args import GETTER, SETTER, args_module
+from test_windows_import_modules import executable
 from tls_fixture import fixture as tls_fixture
 
 MH_MAGIC_64 = 0xFEEDFACF
@@ -30,6 +34,8 @@ META_VERSION = 2
 PROT_EXEC = 4
 FS_LOAD = bytes.fromhex("64488b0425" "00000000")
 GS_LOAD = bytes.fromhex("65488b04c5" "00000000")
+# call [args getter]; mov rdi, [rax]; mov rsi, [rax + 8]; xor edx, edx; call DT_INIT; mov edi, eax; call [result setter]
+MODULE_START = re.compile(rb"\xff\x15.{4}\x48\x8b\x38\x48\x8b\x70\x08\x31\xd2\xe8.{4}\x89\xc7\xff\x15", re.S)
 
 
 class MachO:
@@ -138,6 +144,23 @@ def check_tls(data):
     check(GS_LOAD in code, "tls: the thread pointer is not read through a pthread key")
 
 
+def check_module_start(relinker, directory):
+    work = Path(directory) / "start"
+    (work / "sce_module").mkdir(parents=True)
+    (work / "sce_module" / "args.prx").write_bytes(bytes(args_module()))
+    (work / "eboot.elf").write_bytes(bytes(executable("args.prx")))
+    result = subprocess.run([str(relinker), "--macos", "--skip-syscall-check", str(work / "eboot.elf"), str(work / "eboot")], capture_output=True, text=True, timeout=120)
+    check(result.returncode == 0, f"module start: relinker failed: {result.stdout}{result.stderr}")
+    data = (work / "app0" / "sce_module" / "args.prx.guest.prx").read_bytes()
+    macho = MachO(data)
+    linkedit = macho.segment("__LINKEDIT")
+    binds = data[linkedit["fileoff"]:linkedit["fileoff"] + linkedit["filesize"]]
+    for symbol in (GETTER, SETTER):
+        check(("_" + symbol).encode() in binds, f"module start: {symbol} is not bound")
+    code = b"".join(data[lo:hi] for lo, hi in macho.executable_ranges())
+    check(MODULE_START.search(code) is not None, "module start: the initializer does not pass the start arguments or report the result")
+
+
 def check_options(relinker, directory):
     source = Path(directory) / "conflict.elf"
     source.write_bytes(bytes(import_fixture()))
@@ -158,6 +181,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="anyps5-macos-output-") as directory:
         check_imports(relink(relinker, directory, "import", import_fixture()))
         check_tls(relink(relinker, directory, "tls", tls_fixture()))
+        check_module_start(relinker, directory)
         check_options(relinker, directory)
         check_output_directory(relinker, directory)
     print("macOS output checks passed")
