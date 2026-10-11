@@ -11,9 +11,6 @@
 #include <poll.h>
 #include <unistd.h>
 #include <cerrno>
-#ifdef __APPLE__
-#include <sys/event.h>
-#endif
 #endif
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -461,19 +458,7 @@ int UnnamedAddress(void* address, std::uint32_t* length) {
 }
 
 #ifdef __APPLE__
-static bool PeerShutDown(NativeSocket native) {
-    const int queue = ::kqueue();
-    if (queue < 0) throw std::runtime_error("equeue poll: kqueue failed, guest errno " + std::to_string(NativeError()));
-    struct kevent change;
-    EV_SET(&change, native, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, nullptr);
-    struct kevent event{};
-    const timespec now{0, 0};
-    const int count = ::kevent(queue, &change, 1, &event, 1, &now);
-    const int error = count < 0 ? errno : (count == 1 && (event.flags & EV_ERROR) != 0 ? static_cast<int>(event.data) : 0);
-    ::close(queue);
-    if (error != 0) throw std::runtime_error("equeue poll: kevent failed, host errno " + std::to_string(error));
-    return count == 1 && (event.flags & EV_EOF) != 0;
-}
+extern "C" bool SocketPeerShutDown_nid_no_patch(int native);
 #endif
 
 bool GuestSockets::Ready(int descriptor, bool write, std::int64_t* data, bool* eof) {
@@ -490,7 +475,7 @@ bool GuestSockets::Ready(int descriptor, bool write, std::int64_t* data, bool* e
 #elif defined(__APPLE__)
     pollfd entry{socket->value, static_cast<short>(write ? POLLOUT : POLLIN), 0};
     if (::poll(&entry, 1, 0) <= 0) return false;
-    if (!write && socket->type == 1 && (entry.revents & POLLIN) && PeerShutDown(socket->value)) entry.revents |= POLLHUP;
+    if (!write && socket->type == 1 && (entry.revents & POLLIN) && SocketPeerShutDown_nid_no_patch(socket->value)) entry.revents |= POLLHUP;
 #else
     pollfd entry{socket->value, static_cast<short>(write ? POLLOUT : (POLLIN | POLLRDHUP)), 0};
     if (::poll(&entry, 1, 0) <= 0) return false;
