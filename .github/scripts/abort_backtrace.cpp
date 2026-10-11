@@ -1,5 +1,3 @@
-// Inserted into a failing test (DYLD_INSERT_LIBRARIES) to print the stack when it aborts, since the hosted
-// runners write no crash reports. The load address of the test lets atos resolve its frames to lines.
 #include <execinfo.h>
 #include <mach-o/dyld.h>
 #include <signal.h>

@@ -1,6 +1,3 @@
-// Measures how late 5 ms timed waits and 1 ms sleeps end on this machine, for a thread at the default
-// QoS, a thread at user-interactive QoS, and the default thread again once the task asks for latency
-// tier 0. macOS may coalesce timers of tasks it does not consider latency-sensitive.
 #include <mach/mach.h>
 #include <mach/task_policy.h>
 #include <mach/thread_policy.h>

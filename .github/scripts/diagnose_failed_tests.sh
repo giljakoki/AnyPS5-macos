@@ -1,8 +1,10 @@
 #!/bin/bash
 # Reports on each test ctest recorded as failed: it runs the test again alone and prints its output, how long
-# it took, the stack when it aborts (abort_backtrace.cpp, resolved to lines by resolve_backtrace.py) and the
-# stacks of all its threads (sample) when it still runs after 25 s. It first prints how late timed waits end
-# on this runner (timer_probe.cpp), for the tests that measure time. Usage: diagnose_failed_tests.sh <build dir>
+# it took, the stack when it aborts (abort_backtrace.cpp, a library inserted into the test, resolved to lines
+# by resolve_backtrace.py) and the stacks of all its threads (sample) when it still runs after 25 s. It first
+# prints how late 5 ms timed waits and 1 ms sleeps end on this runner at default QoS, user-interactive QoS and
+# with the task at latency tier 0 (timer_probe.cpp), for the tests that measure time.
+# Usage: diagnose_failed_tests.sh <build dir>
 # No debugger: on the hosted runners lldb waits for an authorization nobody gives, and a process it was
 # attaching to could not be killed; the runners write no crash reports. Every wait has a time limit.
 build=$1
