@@ -6,8 +6,10 @@
 # The title folder holds eboot.elf or eboot.bin, sce_sys/param.json and the title's data. Decrypted
 # module copies named <module>.elf replace the encrypted <module>.prx beside them (the originals move
 # to <title folder>-encrypted-backup). A fake-signed eboot.bin or module (homebrew) is unpacked with
-# unfself.py. Unity titles get --module-dir for Media/Modules and Media/Plugins. Extra arguments go to
-# the relinker, for example --exclude-sce-module libc.prx. INPUT=<file> puts a key mapping in the app.
+# unfself.py. Every other folder that holds modules (Unity's Media/Modules and Media/Plugins, a
+# middleware folder) gets --module-dir. fakelib/, where some dumpers put console system libraries, is
+# left alone: AnyPS5 provides those libraries itself. Extra arguments go to the relinker, for example
+# --exclude-sce-module libc.prx. INPUT=<file> puts a key mapping in the app.
 # The app is written next to the relinker as <AppName>.app and opened.
 here=$(cd "$(dirname "$0")" && pwd)
 if [ -x "$here/relinker" ]; then tools=$here; else tools=${ANYPS5_TOOLS:-$HOME/Downloads/anyps5-macos-x86_64}; fi
@@ -21,7 +23,10 @@ shift 2
 magic() { head -c 4 "$1" | od -An -tx1 | tr -d ' \n'; }
 backup="$game-encrypted-backup"
 cd "$game" || exit 1
-for d in sce_module sce_modules prx Media/Plugins Media/Modules; do
+folders=()
+while IFS= read -r d; do folders+=("$d"); done < <(find . \( -name '*.prx' -o -name '*.sprx' -o -name '*.elf' \) -not -path './sce_sys/*' -not -path './fakelib/*' -not -name 'eboot.elf' | sed 's|/[^/]*$||; s|^\./||; s|^\.$||' | sort -u)
+for d in "${folders[@]}"; do
+  [ -n "$d" ] || { echo "STOP: modules directly in the title folder are not supported; move them into a subfolder"; exit 1; }
   [ -d "$d" ] || continue
   for e in "$d"/*.elf; do
     [ -f "$e" ] || continue
@@ -61,7 +66,9 @@ fi
 [ -f sce_sys/param.json ] || { echo "STOP: no sce_sys/param.json; copy the complete sce_sys folder of the dump"; exit 1; }
 find . -name '* [0-9].prx' -not -path './sce_sys/*' | while read -r f; do echo "possible duplicate copy (move it out of the title folder): $f"; done
 options=()
-for d in Media/Modules Media/Plugins; do [ -d "$d" ] && options+=(--module-dir "$d"); done
+for d in "${folders[@]}"; do
+  case "$d" in sce_module|sce_modules|prx) ;; *) options+=(--module-dir "$d");; esac
+done
 packaging=()
 [ -n "$INPUT" ] && packaging+=(--input-config "$INPUT")
 cd "$tools" || exit 1
