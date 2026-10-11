@@ -137,7 +137,7 @@ jobs:
           mkdir -p "$out/libs" "$out/docs"
           cp build/core/relinker/relinker "$out/"
           cp build/core/libs/libs/*.prx "$out/libs/"
-          cp tools/package_macos_app.py "$out/"
+          cp tools/package_macos_app.py tools/unfself.py tools/convert-ps5.sh "$out/"
           cp docs/user/MACOS.md docs/user/USAGE.md docs/user/INPUT_MAPPING.md docs/user/COMPATIBILITY.md "$out/docs/"
           if [ -n "$VULKAN_SDK_DIR" ]; then
             mkdir -p "$out/vulkan/lib" "$out/vulkan/share/vulkan/icd.d" "$out/vulkan/licenses"
