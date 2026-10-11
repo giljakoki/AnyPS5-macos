@@ -268,6 +268,10 @@ bool GuestSockets::WaitAny(const std::vector<Interest>& interests, std::uint64_t
     }
     if (WSAPoll(entries.data(), static_cast<ULONG>(entries.size()), timeout) == SOCKET_ERROR)
         throw std::runtime_error("equeue wait: WSAPoll failed, guest errno " + std::to_string(NativeError()));
+#elif defined(__APPLE__)
+    const int timeout = deadlineNanos != 0 ? static_cast<int>(std::min<std::uint64_t>((remaining + 999999) / 1000000, INT_MAX)) : -1;
+    if (::poll(entries.data(), static_cast<nfds_t>(entries.size()), timeout) < 0 && errno != EINTR)
+        throw std::runtime_error("equeue wait: poll failed, guest errno " + std::to_string(NativeError()));
 #else
     timespec timeout{static_cast<time_t>(remaining / 1000000000), static_cast<long>(remaining % 1000000000)};
     if (::ppoll(entries.data(), entries.size(), deadlineNanos != 0 ? &timeout : nullptr, nullptr) < 0 && errno != EINTR)
