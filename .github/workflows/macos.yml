@@ -52,7 +52,7 @@ jobs:
           set -o pipefail
           cmake --build build -- -k 0 2>&1 | tee build.log && exit 0
           echo "===== build errors ====="
-          grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' build.log | grep -v -E '^\[[0-9]+/[0-9]+\] ' | head -n 2000
+          grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' build.log | grep -v -E '^\[[0-9]+/[0-9]+\] |^ld: warning: ' | head -n 2000
           exit 1
       - name: Build the system libraries
         id: libs
@@ -60,7 +60,7 @@ jobs:
           set -o pipefail
           cmake --build build --target libs -- -k 0 2>&1 | tee libs.log && exit 0
           echo "===== build errors ====="
-          grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' libs.log | grep -v -E '^\[[0-9]+/[0-9]+\] ' | head -n 2000
+          grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' libs.log | grep -v -E '^\[[0-9]+/[0-9]+\] |^ld: warning: ' | head -n 2000
           exit 1
       # No Vulkan loader is installed yet, so the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
       - name: Test
