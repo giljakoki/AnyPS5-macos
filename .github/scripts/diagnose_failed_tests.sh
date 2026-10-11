@@ -7,7 +7,7 @@
 # Usage: diagnose_failed_tests.sh <build dir>
 # No debugger: on the hosted runners lldb waits for an authorization nobody gives, and a process it was
 # attaching to could not be killed; the runners write no crash reports. Every wait has a time limit.
-build=$1
+build=$(cd "$1" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
 failed="$build/Testing/Temporary/LastTestsFailed.log"
 [ -f "$failed" ] || { echo "no failed tests recorded"; exit 0; }
