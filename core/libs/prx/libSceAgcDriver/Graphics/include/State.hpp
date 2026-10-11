@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include "Recompiler.hpp"
 
@@ -132,6 +133,11 @@ std::string DepthMaintenanceRejection(const QueueState& queue);
 std::string DrawRejection(const QueueState& queue, bool indexed);
 bool PixelProgramSkipped(const QueueState& queue);
 std::string NullPixelProgramRejection(const QueueState& queue);
+bool MultisampleTraceRequested(const char* value);
+bool TraceMultisampling();
+void TraceMultisampleState(const QueueState& queue);
+void TraceMultisampleDescriptor(std::span<const std::uint32_t> words);
+void TraceMultisampleFill(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source);
 
 // The recording facade of the draw decoders (design_cpu_final M8, step 8a): every register read
 // of DecodeShaderStages, DecodeState, DrawRejection, DecodePixelStageInfo and Driver::draw's

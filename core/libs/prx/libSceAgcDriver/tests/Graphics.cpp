@@ -4120,6 +4120,20 @@ void storeAtFlipTests() {
     for (const char* value : {"0", "", "true", "11"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1");
 }
 
+void multisampleTraceTests() {
+    using AgcDriver::Graphics::MultisampleTraceRequested;
+    Require(!MultisampleTraceRequested(nullptr), "an unset APS5_TRACE_MSAA traced");
+    Require(MultisampleTraceRequested("1"), "APS5_TRACE_MSAA=1 did not trace");
+    for (const char* value : {"0", "", "yes", "11"}) expectFailure([&] { MultisampleTraceRequested(value); }, "APS5_TRACE_MSAA=");
+    auto queue = makeState();
+    queue.context[0x2f8] = 0x0020c002u;
+    queue.context[0x31d] = (2u << 12u) | (2u << 15u);
+    AgcDriver::Graphics::TraceMultisampleState(queue);
+    const std::array<std::uint32_t, 8> words{0x100u, 0, 0, 0xe0000000u, 0, 0, 0, 0};
+    AgcDriver::Graphics::TraceMultisampleDescriptor(words);
+    AgcDriver::Graphics::TraceMultisampleFill(0x10000, 0x1000, 0xccccccccu, "test fill");
+}
+
 void nullVertexDescriptorTests() {
     using AgcDriver::Graphics::DecodeVertexFormat;
     constexpr std::array formats{VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT};
@@ -4339,6 +4353,7 @@ int main(int argc, char** argv) {
         vertexCopyTests();
         highestDrawIndexTests();
         storeAtFlipTests();
+        multisampleTraceTests();
         nullVertexDescriptorTests();
         vertexZeroFillTests();
         vertexZeroFillMergeTests();

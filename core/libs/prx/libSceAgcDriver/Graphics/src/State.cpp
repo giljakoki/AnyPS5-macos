@@ -11,7 +11,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <sstream>
+#include <string_view>
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -1090,6 +1093,92 @@ bool DrawKeyCovers(RegisterRead read) {
         return bits;
     }();
     return read.bank < RegisterBank::Count && read.offset < 1024 && covered[static_cast<std::size_t>(read.bank)].test(read.offset);
+}
+
+namespace {
+
+enum class MultisampleTrace : std::size_t { State, Descriptor, Fill, Count };
+
+constexpr std::size_t MultisampleTraceLines = 1024;
+
+void traceOnce(MultisampleTrace kind, const std::string& line) {
+    static constexpr const char* names[] = {"state", "descriptor", "fill"};
+    static std::mutex mutex;
+    static std::array<std::set<std::string>, static_cast<std::size_t>(MultisampleTrace::Count)> seen;
+    std::lock_guard lock(mutex);
+    auto& lines = seen[static_cast<std::size_t>(kind)];
+    if (lines.size() >= MultisampleTraceLines || !lines.insert(line).second) return;
+    std::fprintf(stderr, "%s\n", line.c_str());
+    if (lines.size() == MultisampleTraceLines) std::fprintf(stderr, "[msaa] %zu distinct %s lines printed; further ones are not\n", MultisampleTraceLines, names[static_cast<std::size_t>(kind)]);
+}
+
+void appendRegister(std::string& line, const Registers& registers, std::uint32_t offset) {
+    char text[24];
+    const auto it = registers.find(offset);
+    if (it == registers.end()) std::snprintf(text, sizeof(text), " %x=-", offset);
+    else std::snprintf(text, sizeof(text), " %x=%08x", offset, it->second);
+    line += text;
+}
+
+}
+
+bool MultisampleTraceRequested(const char* value) {
+    if (value == nullptr) return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::runtime_error(std::string("APS5_TRACE_MSAA=") + value + ": expected 1");
+}
+
+bool TraceMultisampling() {
+    static const bool trace = MultisampleTraceRequested(std::getenv("APS5_TRACE_MSAA"));
+    return trace;
+}
+
+void TraceMultisampleState(const QueueState& queue) {
+    if (!TraceMultisampling()) return;
+    const auto& cx = queue.context;
+    const auto word = [&](std::uint32_t offset) {
+        const auto it = cx.find(offset);
+        return it == cx.end() ? 0u : it->second;
+    };
+    const auto mode = (word(0x202) >> 4u) & 7u;
+    std::uint32_t slots = 0;
+    bool multisampledSlot = false;
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        if (((word(0x31c + slot * 0xfu) >> 2u) & 0x1fu) == 0) continue;
+        slots |= 1u << slot;
+        multisampledSlot = multisampledSlot || (word(0x31d + slot * 0xfu) & 0x1f000u) != 0;
+    }
+    if (word(0x2f8) == 0 && (mode < 2u || mode > 6u) && !multisampledSlot && (word(0x010) & 0xcu) == 0) return;
+    std::string line = "[msaa] state";
+    for (const auto offset : {0x202u, 0x2f8u, 0x292u, 0x293u, 0x201u, 0x2dcu, 0x203u, 0x30eu, 0x30fu, 0x2feu, 0x302u, 0x306u, 0x30au, 0x8eu, 0x8fu, 0x1c5u, 0x1b3u, 0x1b4u, 0x000u, 0x010u, 0x011u, 0x200u}) appendRegister(line, cx, offset);
+    const auto low = queue.shader.find(0x008);
+    const auto high = queue.shader.find(0x009);
+    const auto pixelProgram = (low == queue.shader.end() ? 0ull : static_cast<std::uint64_t>(low->second) << 8u) | (high == queue.shader.end() ? 0ull : static_cast<std::uint64_t>(high->second) << 40u);
+    char text[48];
+    std::snprintf(text, sizeof(text), " ps=0x%llx", static_cast<unsigned long long>(pixelProgram));
+    line += text;
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        if ((slots & (1u << slot)) == 0) continue;
+        std::snprintf(text, sizeof(text), " cb%u:", slot);
+        line += text;
+        for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du, 0x31fu, 0x321u, 0x323u, 0x324u, 0x325u}) appendRegister(line, cx, offset + slot * 0xfu);
+        for (const auto offset : {0x390u, 0x398u, 0x3a0u, 0x3a8u, 0x3b0u, 0x3b8u}) appendRegister(line, cx, offset + slot);
+    }
+    traceOnce(MultisampleTrace::State, line);
+}
+
+void TraceMultisampleDescriptor(std::span<const std::uint32_t> words) {
+    if (!TraceMultisampling() || words.size() != 8) return;
+    char text[160];
+    std::snprintf(text, sizeof(text), "[msaa] texture descriptor %08x %08x %08x %08x %08x %08x %08x %08x", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    traceOnce(MultisampleTrace::Descriptor, text);
+}
+
+void TraceMultisampleFill(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source) {
+    if (!TraceMultisampling() || bytes > (4u << 20u)) return;
+    char text[160];
+    std::snprintf(text, sizeof(text), "[msaa] %s 0x%llx+0x%zx with %08x", source, static_cast<unsigned long long>(address), bytes, value);
+    traceOnce(MultisampleTrace::Fill, text);
 }
 
 }
