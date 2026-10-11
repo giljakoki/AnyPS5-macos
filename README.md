@@ -1,3 +1,5 @@
+> **macOS fork:** this repository adds the macOS port for Apple silicon (M1 to M5, titles run under Rosetta 2) to [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5) and follows upstream automatically. See [macOS on Apple silicon](docs/user/MACOS.md).
+
 # About
 
 Tool for automatic executables porting to Linux and Windows.
