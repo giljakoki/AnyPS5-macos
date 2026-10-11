@@ -15,6 +15,10 @@ static void Require(bool condition, const char* message) {
 
 int main() {
     try {
+        if (!GuestArena::GuestArenaAvailable_nid_postfix()) {
+            std::puts("skipped, no guest arena is reserved on this platform");
+            return 77;
+        }
         std::uintptr_t arenaBase = 0;
         std::size_t arenaBytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
