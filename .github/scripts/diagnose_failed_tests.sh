@@ -4,12 +4,12 @@
 # by resolve_backtrace.py) and the stacks of all its threads (sample) when it still runs after 25 s. It first
 # prints how late 5 ms timed waits and 1 ms sleeps end on this runner at default QoS, user-interactive QoS and
 # with the task at latency tier 0 (timer_probe.cpp), for the tests that measure time.
-# Usage: diagnose_failed_tests.sh <build dir>
+# Usage: diagnose_failed_tests.sh <build dir> [file listing the failed tests as ctest's LastTestsFailed.log does]
 # No debugger: on the hosted runners lldb waits for an authorization nobody gives, and a process it was
 # attaching to could not be killed; the runners write no crash reports. Every wait has a time limit.
 build=$(cd "$1" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
-failed="$build/Testing/Temporary/LastTestsFailed.log"
+failed=${2:-$build/Testing/Temporary/LastTestsFailed.log}
 [ -f "$failed" ] || { echo "no failed tests recorded"; exit 0; }
 
 # Waits for a background process for at most $2 seconds; kills it and its children when it overruns, and

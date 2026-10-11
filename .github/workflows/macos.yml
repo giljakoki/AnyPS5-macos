@@ -66,13 +66,22 @@ jobs:
           grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' libs.log | grep -v -E '^\[[0-9]+/[0-9]+\] |^ld: warning: ' | head -n 2000
           exit 1
       # No Vulkan loader is installed yet, so the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
+      # The tests that measure time run alone after the others: timers on the hosted runners end 8 ms or more
+      # late, and with three tests sharing the three cores guest_raise_exception ran past its 30 s limit.
       - name: Test
         timeout-minutes: 40
         run: |
+          timed='^(guest_raise_exception|guest_avplayer)$'
+          failed="$RUNNER_TEMP/failed-tests.log"
+          : > "$failed"
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
-            --output-log ctest.log --output-junit ctest.xml -E 'agc_driver_lds_atomics64|flip|display' && exit 0
+            --output-log ctest.log --output-junit ctest.xml -E "agc_driver_lds_atomics64|flip|display|$timed" ||
+            cat build/Testing/Temporary/LastTestsFailed.log >> "$failed"
+          ctest --test-dir build --output-on-failure --timeout 120 --output-log ctest-timed.log -R "$timed" ||
+            cat build/Testing/Temporary/LastTestsFailed.log >> "$failed"
+          [ -s "$failed" ] || exit 0
           echo "===== failed tests, run again one at a time ====="
-          bash .github/scripts/diagnose_failed_tests.sh build || true
+          bash .github/scripts/diagnose_failed_tests.sh build "$failed" || true
           exit 1
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
@@ -80,7 +89,7 @@ jobs:
         run: |
           [ -f ctest.log ] || exit 0
           awk '/Test +#[0-9]+: / && $NF == "sec" { for (i = 1; i <= NF; i++) if ($i ~ /^#[0-9]+:$/) name = $(i + 1); t = $(NF - 1) + 0; if (t > max[name]) max[name] = t }
-            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on macOS\n", name, max[name] }' ctest.log
+            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on macOS\n", name, max[name] }' ctest*.log
       # The Vulkan loader and MoltenVK for the package and the demo; installed after the tests so they keep skipping the GPU.
       - name: Install the Vulkan SDK
         id: vulkan
