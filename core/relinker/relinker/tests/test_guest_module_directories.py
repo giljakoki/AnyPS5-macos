@@ -119,9 +119,11 @@ def main():
                 result, output = convert(case, windows)
                 assert result.returncode == 0 and output.exists(), result.stderr
                 assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"provider.prx.guest.prx"}
+                assert "Warning: sce_module/libc.prx is a SELF container (encrypted)" in result.stderr, result.stderr
                 result, output = convert(case, windows, ["--exclude-sce-module", "libc.prx"])
                 assert result.returncode == 0 and output.exists(), result.stderr
                 assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"provider.prx.guest.prx"}
+                assert "SELF container" not in result.stderr, result.stderr
 
             case = work / f"{windows}-ambiguous"
             for name in ("sce_module", "sce_modules", "prx"):
