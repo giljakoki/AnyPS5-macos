@@ -16,6 +16,10 @@ The bundle runs without the SDK or environment variables:
     Contents/Resources/game/app0    the title's files
     Contents/Resources/vulkan/icd.d MoltenVK's driver manifest
 
+On macOS the title's files are cloned into the bundle (APFS copy-on-write, no extra space), and the
+quarantine attribute that downloaded files carry is removed, so Gatekeeper does not scan the copied
+title before the first start.
+
 AnyPS5 maps /app0 and the mount points under the working directory, so the bundle itself stays read-only: the
 run directory is ~/Library/Application Support/AnyPS5/<title id>, where app0 is a link to the bundle's game
 folder and download0 exists, and the title's saves are written. The shader cache goes to
@@ -25,6 +29,7 @@ import json
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -87,10 +92,20 @@ def package(relinked, game, libs, vulkan, input_config, bundle):
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+    if sys.platform == "darwin":
+        subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(staging)], capture_output=True)
     if bundle.exists():
         shutil.rmtree(bundle)
     staging.rename(bundle)
     return result
+
+
+def copy_game(game, app0):
+    """On macOS the title's files are cloned (APFS copy-on-write), so a title of tens of gigabytes takes
+    no extra space and copies at once; elsewhere, or where cloning fails, they are copied."""
+    if sys.platform == "darwin" and subprocess.run(["cp", "-cR", f"{game}/.", str(app0)], capture_output=True).returncode == 0:
+        return
+    shutil.copytree(game, app0, dirs_exist_ok=True)
 
 
 def fill(executable, relinked, game, libs, vulkan, input_config, bundle):
@@ -103,7 +118,7 @@ def fill(executable, relinked, game, libs, vulkan, input_config, bundle):
 
     # The title's files first, then the guest modules the relinker wrote over them.
     if game is not None:
-        shutil.copytree(game, app0, dirs_exist_ok=True)
+        copy_game(game, app0)
     if (relinked / "app0").is_dir():
         shutil.copytree(relinked / "app0", app0, dirs_exist_ok=True)
     title_id, name, version = title_metadata(app0)
