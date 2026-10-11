@@ -150,6 +150,16 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
 #endif
     int fd = NativeOpen(native, MapFlags(flags), mode);
+#ifdef __APPLE__
+    if (fd >= 0 && (flags & SCE_KERNEL_O_CREAT) != 0) {
+        std::error_code error;
+        if (std::filesystem::is_directory(native, error)) {
+            NativeClose(fd);
+            fd = -1;
+            errno = EISDIR;
+        }
+    }
+#endif
 #ifdef _WIN32
     if (fd < 0 && errno != ENOENT) {
         std::error_code error;

@@ -11,7 +11,6 @@
 #include <utility>
 #include <random>
 #include <string>
-#include <cinttypes>
 
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
@@ -93,16 +92,6 @@ int APS5_VABI _Atomic_compare_exchange_weak_4_nid_postfix(volatile unsigned int*
 unsigned int APS5_VABI _Atomic_load_4_nid_postfix(volatile unsigned int* target, int memoryOrder) {
     (void)memoryOrder;
     return GccAtomicLoad(target);
-}
-
-std::intmax_t APS5_VABI strtoimax_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoimax(str, endptr, base);
-}
-
-std::uintmax_t APS5_VABI strtoumax_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoumax(str, endptr, base);
 }
 
 unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix() {

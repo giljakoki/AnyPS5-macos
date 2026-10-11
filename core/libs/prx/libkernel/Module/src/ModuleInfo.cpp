@@ -19,7 +19,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <filesystem>
-#else
+#elif !defined(__APPLE__)
 #include <dlfcn.h>
 #include <link.h>
 #include <unistd.h>
@@ -63,7 +63,7 @@ struct GuestImage {
     std::uintptr_t address;
 };
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 template<typename TInfo>
 struct ImageSearch {
     std::uintptr_t address;
@@ -162,7 +162,7 @@ std::vector<GuestImage> GuestImages() {
     }
     return images;
 }
-#else
+#elif defined(_WIN32)
 bool SectionNamed(const IMAGE_SECTION_HEADER& section, const char* name) {
     return std::strncmp(reinterpret_cast<const char*>(section.Name), name, IMAGE_SIZEOF_SHORT_NAME) == 0;
 }
@@ -273,6 +273,22 @@ std::vector<GuestImage> GuestImages() {
 
 extern "C" {
 
+#ifdef __APPLE__
+int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t, int, ModuleInfoEx*) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceKernelGetModuleList(KernelModule*, std::size_t, std::size_t*) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceKernelGetModuleInfo(KernelModule, ModuleInfo*) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+#else
 int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info) {
     if (!info) return SCE_KERNEL_ERROR_EFAULT;
     if (flags != 2) throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported flags " + std::to_string(flags));
@@ -322,5 +338,6 @@ int APS5_VABI sceKernelGetModuleInfo(KernelModule handle, ModuleInfo* info) {
     }
     return SCE_KERNEL_ERROR_ESRCH;
 }
+#endif
 
 }

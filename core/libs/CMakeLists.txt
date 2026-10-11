@@ -9,6 +9,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# The guest unwinder steps through the runtime's own frames, and on macOS it reads them from DWARF
+# (__eh_frame); ld64 otherwise folds that into compact unwind info and drops it.
+if(APPLE)
+    add_link_options(LINKER:-no_compact_unwind)
+endif()
+
+# A prx finds the others beside itself. The build-tree rpath would point a patched copy at the
+# unpatched libraries. dyld does not know $ORIGIN.
+if(APPLE)
+    set(ANYPS5_PRX_RPATH "@loader_path")
+else()
+    set(ANYPS5_PRX_RPATH "$ORIGIN")
+endif()
+function(configure_prx_rpath target)
+    set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH "${ANYPS5_PRX_RPATH}")
+endfunction()
+
 add_executable(nid_patcher
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/Sha1.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/NidCompute.cpp
@@ -56,6 +73,7 @@ configure_windows_unwind(libc)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libc PRIVATE LINKER:-z,now)
 endif()
+configure_prx_rpath(libc)
 
 set(UNPATCHED_DIR ${CMAKE_CURRENT_BINARY_DIR}/libs/unpatched)
 set(PATCHED_DIR ${CMAKE_CURRENT_BINARY_DIR}/libs)
@@ -68,7 +86,7 @@ set_target_properties(libc PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
         ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
         BUILD_WITH_INSTALL_RPATH ON
-        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
 )
 
 set(LIBC_UNPATCHED ${UNPATCHED_DIR}/libc.prx)
@@ -100,6 +118,7 @@ foreach(LIB_DIR ${LIBS_DIRS})
             configure_windows_unwind(${LIB_NAME})
         endif()
 
+        configure_prx_rpath(${LIB_NAME})
         if(LIB_NAME STREQUAL "libkernel")
             target_link_libraries(${LIB_NAME} PRIVATE libc)
         else()
@@ -123,7 +142,7 @@ foreach(LIB_DIR ${LIBS_DIRS})
                 LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
                 ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
                 BUILD_WITH_INSTALL_RPATH ON
-                INSTALL_RPATH "$ORIGIN"
+                INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
         )
 
         set(UNPATCHED_FILE ${UNPATCHED_DIR}/${LIB_NAME}.prx)
