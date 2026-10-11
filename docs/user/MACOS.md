@@ -60,6 +60,7 @@ A window with a Breakout game opens and plays a tone when the ball bounces. Left
 The input is the same as on Linux and Windows: a decrypted ELF executable with its bundled modules, see [USAGE.md](USAGE.md#input-and-conversion).
 
 ```sh
+mkdir -p out
 relinker --macos --to-rosetta source/eboot.elf out/eboot
 python3 package_macos_app.py --relinked out --game source --libs libs --vulkan ~/VulkanSDK/<version>/macOS Title.app
 open Title.app
@@ -81,9 +82,10 @@ The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, an
 ## Keeping the fork current
 
 - `main` is upstream `main` plus the macOS port and the fixes needed to build upstream's newer code on macOS.
-- [Sync upstream](../../.github/workflows/sync-upstream.yml) merges upstream `main` and `macos-port` every 6 hours and starts the macOS build. A conflict, or a push GitHub refuses, opens an issue labeled `upstream-sync`.
+- [Sync upstream](../../.github/workflows/sync-upstream.yml) merges upstream `main` and `macos-port` every 6 hours and starts the macOS build. A conflict, or a push GitHub refuses, opens an issue labeled `upstream-sync`; with issues turned off (as they are on a new fork) the sync run fails and its summary says why.
 - GitHub does not let the workflow's built-in token push changes to workflow files, which upstream makes often. Create a fine-grained personal access token for this repository with Contents and Workflows read and write access, and save it as the `SYNC_TOKEN` repository secret. Without it, such updates wait for **Sync fork** on the repository page.
-- A failing macOS build on `main` opens an issue labeled `macos-build`; the next passing build closes it.
+- A failing macOS build on `main` opens an issue labeled `macos-build` when issues are turned on; the next passing build closes it.
+- The tests that measure time (`guest_avplayer`, `guest_audio3d_port`, `guest_raise_exception`) run in their own step. Timers on GitHub's hosted macOS runners end 8 ms or more late, more than these tests allow, so there a failure only adds a warning; on a self-hosted Mac it fails the build.
 - Upstream maintenance workflows (labels, pull request intake, progress pages, conventions) run only in boykopovar/AnyPS5. `build.yml` runs here as upstream configured it.
 
 ## Credits

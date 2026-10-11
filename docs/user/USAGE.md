@@ -30,6 +30,7 @@ relinker --windows source/input.elf app.exe
 macOS output (x86-64, runs under Rosetta on Apple silicon), packaged as an application that starts without the Vulkan SDK:
 
 ```sh
+mkdir -p out
 relinker --macos --to-rosetta source/input.elf out/eboot
 python3 tools/package_macos_app.py --relinked out --game source --libs build/core/libs/libs --vulkan ~/VulkanSDK/<version>/macOS Title.app
 ```

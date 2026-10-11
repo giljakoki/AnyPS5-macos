@@ -20,6 +20,8 @@ jobs:
     name: Build and test (x86-64 under Rosetta)
     runs-on: macos-15
     timeout-minutes: 180
+    env:
+      TIMED_TESTS: ^(guest_raise_exception|guest_avplayer|guest_audio3d_port)$
     steps:
       - uses: actions/checkout@v7
         with:
@@ -66,22 +68,26 @@ jobs:
           grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' libs.log | grep -v -E '^\[[0-9]+/[0-9]+\] |^ld: warning: ' | head -n 2000
           exit 1
       # No Vulkan loader is installed yet, so the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
-      # The tests that measure time run alone after the others: timers on the hosted runners end 8 ms or more
-      # late, and with three tests sharing the three cores guest_raise_exception ran past its 30 s limit.
       - name: Test
         timeout-minutes: 40
         run: |
-          timed='^(guest_raise_exception|guest_avplayer|guest_audio3d_port)$'
-          failed="$RUNNER_TEMP/failed-tests.log"
-          : > "$failed"
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
-            --output-log ctest.log --output-junit ctest.xml -E "agc_driver_lds_atomics64|flip|display|$timed" ||
-            cat build/Testing/Temporary/LastTestsFailed.log >> "$failed"
-          ctest --test-dir build --output-on-failure --timeout 120 --output-log ctest-timed.log -R "$timed" ||
-            cat build/Testing/Temporary/LastTestsFailed.log >> "$failed"
-          [ -s "$failed" ] || exit 0
+            --output-log ctest.log --output-junit ctest.xml -E "agc_driver_lds_atomics64|flip|display|$TIMED_TESTS" && exit 0
           echo "===== failed tests, run again one at a time ====="
-          bash .github/scripts/diagnose_failed_tests.sh build "$failed" || true
+          bash .github/scripts/diagnose_failed_tests.sh build || true
+          exit 1
+      # The tests that measure time run alone after the others. Timers on the hosted runners end 8 ms or more late
+      # (a 1 ms sleep takes about 10 ms, a 5 ms wait up to 50 ms), more than these tests allow, so there a failure
+      # is a warning; on a self-hosted Mac it fails the build.
+      - name: Test timing
+        if: ${{ !cancelled() && steps.libs.outcome == 'success' }}
+        timeout-minutes: 20
+        continue-on-error: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 120 --output-log ctest-timed.log -R "$TIMED_TESTS" && exit 0
+          echo "::warning title=Timing test failed::A test that measures time failed; on a hosted runner its timers end late, see the report in the Test timing step."
+          echo "===== failed tests, run again one at a time ====="
+          bash .github/scripts/diagnose_failed_tests.sh build || true
           exit 1
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
