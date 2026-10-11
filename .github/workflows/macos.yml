@@ -40,10 +40,11 @@ jobs:
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      # -k 0 keeps going after a failure, so one run reports every file that does not build.
       - name: Build
-        run: cmake --build build
+        run: cmake --build build -- -k 0
       - name: Build the system libraries
-        run: cmake --build build --target libs
+        run: cmake --build build --target libs -- -k 0
       - name: Package
         run: |
           set -euo pipefail
