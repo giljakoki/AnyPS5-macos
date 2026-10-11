@@ -115,6 +115,7 @@ int Run(const int argc, char* argv[]) {
         const Elfpatcher::Linux::LinuxDesktopEntryWriter desktopEntryWriter;
         const auto desktopEntry = args.toWindows || args.toMacos ? std::nullopt : desktopEntryWriter.Prepare(Io::NativePath(args.inputPath).parent_path() / "sce_sys", Io::NativePath(absPath));
 
+        std::filesystem::create_directories(Io::NativePath(absPath).parent_path());
         if (args.writeRegistry) {
             const std::filesystem::path outFsPath = Io::NativePath(absPath);
             const std::string registryPath = Io::Utf8Path(outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + ".registry.json"));

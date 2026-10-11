@@ -2,7 +2,7 @@
 
 ## Input and conversion
 
-Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. Only files directly inside the module directories are processed. A bundled module in a SELF container is an error, as the executable is. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
+Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. Only files directly inside the module directories are processed. A bundled module in a SELF container (encrypted) is not converted; the relinker warns about each one and says when the executable needs it. An executable in a SELF container is an error. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
 
 ```text
 source/
@@ -30,7 +30,6 @@ relinker --windows source/input.elf app.exe
 macOS output (x86-64, runs under Rosetta on Apple silicon), packaged as an application that starts without the Vulkan SDK:
 
 ```sh
-mkdir -p out
 relinker --macos --to-rosetta source/input.elf out/eboot
 python3 tools/package_macos_app.py --relinked out --game source --libs build/core/libs/libs --vulkan ~/VulkanSDK/<version>/macOS Title.app
 ```

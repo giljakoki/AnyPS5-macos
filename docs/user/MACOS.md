@@ -60,7 +60,6 @@ A window with a Breakout game opens and plays a tone when the ball bounces. Left
 The input is the same as on Linux and Windows: a decrypted ELF executable with its bundled modules, see [USAGE.md](USAGE.md#input-and-conversion).
 
 ```sh
-mkdir -p out
 relinker --macos --to-rosetta source/eboot.elf out/eboot
 python3 package_macos_app.py --relinked out --game source --libs libs --vulkan ~/VulkanSDK/<version>/macOS Title.app
 open Title.app

@@ -81,7 +81,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     }
     std::vector<std::filesystem::path> paths;
     std::set<std::string> unmatchedExclusions = excludedModules;
-    const auto isElf = [](const std::filesystem::path& path) {
+    std::vector<std::filesystem::path> encrypted;
+    const auto isElf = [&encrypted](const std::filesystem::path& path) {
         std::ifstream stream(path, std::ios::binary);
         if (!stream) throw Domain::RelinkerException("Cannot read guest candidate: " + Io::Utf8Path(path));
         char magic[4]{};
@@ -90,6 +91,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (stream.gcount() != 4) return false;
         const auto byte = [&](const std::size_t index) { return static_cast<unsigned char>(magic[index]); };
         const bool self = (byte(0) == 0x4f && byte(1) == 0x15 && byte(2) == 0x3d && byte(3) == 0x1d) || (byte(0) == 0x54 && byte(1) == 0x14 && byte(2) == 0xf5 && byte(3) == 0xee);
+        if (self) encrypted.push_back(path);
         return byte(0) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
     };
     for (const auto& directory : directories) {
@@ -105,6 +107,17 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
     }
     const auto neededNames = ReadNeededNames(dynamic);
+    for (const auto& path : encrypted) {
+        const auto name = Io::Utf8Path(path.filename());
+        const auto stem = ModuleStem(name, windows);
+        const bool needed = std::any_of(neededNames.begin(), neededNames.end(), [&](const auto& neededName) {
+            return neededName == name || (!stem.empty() && ModuleStem(neededName, windows) == stem);
+        });
+        auto relative = Io::Utf8Path(path.lexically_relative(root));
+        std::replace(relative.begin(), relative.end(), '\\', '/');
+        std::cerr << "Warning: " << relative << " is a SELF container (encrypted), not an ELF, and is not converted"
+                  << (needed ? "; the executable needs it" : "") << '\n';
+    }
     std::set<std::string> missingNeeded;
     std::map<std::string, std::filesystem::path> neededAliases;
     for (const auto& name : neededNames) {

@@ -145,12 +145,21 @@ def check_options(relinker, directory):
     check(result.returncode != 0 and "--windows conflicts with --macos" in result.stdout + result.stderr, "--macos together with --windows was accepted")
 
 
+def check_output_directory(relinker, directory):
+    source = Path(directory) / "nested.elf"
+    source.write_bytes(bytes(import_fixture()))
+    output = Path(directory) / "out" / "eboot"
+    result = subprocess.run([str(relinker), "--macos", "--skip-sce-module", str(source), str(output)], capture_output=True, text=True, timeout=120)
+    check(result.returncode == 0 and output.is_file(), f"an output in a missing directory was not written: {result.stdout}{result.stderr}")
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-macos-output-") as directory:
         check_imports(relink(relinker, directory, "import", import_fixture()))
         check_tls(relink(relinker, directory, "tls", tls_fixture()))
         check_options(relinker, directory)
+        check_output_directory(relinker, directory)
     print("macOS output checks passed")
 
 
