@@ -93,8 +93,9 @@ jobs:
           fi
           echo "pushed=$pushed" >> "$GITHUB_OUTPUT"
           { echo "report<<REPORT_END"; echo "$report"; echo "REPORT_END"; } >> "$GITHUB_OUTPUT"
+      # A push with SYNC_TOKEN starts it like any push; one with GITHUB_TOKEN starts nothing.
       - name: Start the macOS build
-        if: steps.merge.outputs.pushed == 'true'
+        if: steps.merge.outputs.pushed == 'true' && env.HAS_SYNC_TOKEN != 'true'
         run: gh workflow run macos.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
       - name: Report
         shell: bash
