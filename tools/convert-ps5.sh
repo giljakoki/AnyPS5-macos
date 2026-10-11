@@ -10,7 +10,8 @@
 # middleware folder) gets --module-dir. fakelib/, where some dumpers put console system libraries, is
 # left alone: AnyPS5 provides those libraries itself.
 # Modules directly in the title folder move to root-modules/, since the relinker takes module folders
-# below it; that suits modules the executable links, not ones a title loads by their /app0 path. Extra arguments go to the relinker, for example
+# below it; the app gets a link at each one's old place, so a title that also loads such a module by
+# its /app0 path (as FMOD titles do) gets the module already loaded. Extra arguments go to the relinker, for example
 # --exclude-sce-module libc.prx. INPUT=<file> puts a key mapping in the app.
 # The app is written next to the relinker as <AppName>.app and opened.
 here=$(cd "$(dirname "$0")" && pwd)
@@ -92,5 +93,12 @@ status=$?
 grep -E "Processing|Warning|FAIL" "$out.log"
 [ "$status" -eq 0 ] || { echo "STOP: the relinker failed; its output is in $tools/$out.log"; exit 1; }
 python3 package_macos_app.py --relinked "$out" --game "$game" --libs libs --vulkan vulkan "${packaging[@]}" "$name.app" || exit 1
+bundled="$name.app/Contents/Resources/game/app0"
+for f in "$out/app0/root-modules"/*.guest.prx; do
+  [ -f "$f" ] || continue
+  module=$(basename "$f")
+  ln -sfn "root-modules/$module" "$bundled/$module"
+  echo "linked /app0/${module%.guest.prx} to root-modules/$module"
+done
 echo "opening $name.app; if it closes, run: tail -n 100 \"\$(ls -t ~/Library/Logs/AnyPS5/*.log | head -n 1)\""
 open "$name.app"
