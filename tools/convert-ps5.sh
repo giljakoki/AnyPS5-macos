@@ -8,7 +8,9 @@
 # to <title folder>-encrypted-backup). A fake-signed eboot.bin or module (homebrew) is unpacked with
 # unfself.py. Every other folder that holds modules (Unity's Media/Modules and Media/Plugins, a
 # middleware folder) gets --module-dir. fakelib/, where some dumpers put console system libraries, is
-# left alone: AnyPS5 provides those libraries itself. Extra arguments go to the relinker, for example
+# left alone: AnyPS5 provides those libraries itself.
+# Modules directly in the title folder move to root-modules/, since the relinker takes module folders
+# below it; that suits modules the executable links, not ones a title loads by their /app0 path. Extra arguments go to the relinker, for example
 # --exclude-sce-module libc.prx. INPUT=<file> puts a key mapping in the app.
 # The app is written next to the relinker as <AppName>.app and opened.
 here=$(cd "$(dirname "$0")" && pwd)
@@ -23,6 +25,15 @@ shift 2
 magic() { head -c 4 "$1" | od -An -tx1 | tr -d ' \n'; }
 backup="$game-encrypted-backup"
 cd "$game" || exit 1
+loose=()
+for f in *.prx *.sprx *.elf; do
+  [ -f "$f" ] && [ "$f" != eboot.elf ] && loose+=("$f")
+done
+if [ "${#loose[@]}" -gt 0 ]; then
+  mkdir -p root-modules
+  mv "${loose[@]}" root-modules/
+  echo "moved the modules in the title folder into root-modules/: ${loose[*]}"
+fi
 folders=()
 while IFS= read -r d; do folders+=("$d"); done < <(find . \( -name '*.prx' -o -name '*.sprx' -o -name '*.elf' \) -not -path './sce_sys/*' -not -path './fakelib/*' -not -name 'eboot.elf' | sed 's|/[^/]*$||; s|^\./||; s|^\.$||' | sort -u)
 for d in "${folders[@]}"; do
