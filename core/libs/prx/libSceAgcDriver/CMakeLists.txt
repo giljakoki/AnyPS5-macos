@@ -1040,8 +1040,12 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_pm4_failure COMMAND agc_driver_pm4_tests failure)
     set_tests_properties(agc_driver_pm4_failure PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_descriptor_pool_reset_failure COMMAND agc_driver_graphics_tests --descriptor-pool-reset-failure)
+    add_test(NAME agc_driver_graphics_single_sample_msaa COMMAND agc_driver_graphics_tests --single-sample-msaa)
+    set_tests_properties(agc_driver_graphics_single_sample_msaa PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_MSAA_SINGLE_SAMPLE=1")
+    add_test(NAME agc_driver_cmask_fast_clear_unimported COMMAND agc_driver_cmask_fast_clear_tests multisample)
+    set_tests_properties(agc_driver_cmask_fast_clear_unimported PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_pm4_failure agc_descriptor_pool_reset_failure PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_pm4_failure agc_descriptor_pool_reset_failure agc_driver_graphics_single_sample_msaa agc_driver_cmask_fast_clear_unimported PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(NOT WIN32 AND NOT APPLE)

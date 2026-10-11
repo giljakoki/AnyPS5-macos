@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Cover_vert_spv.h"
@@ -34,6 +35,10 @@ constexpr std::uint32_t Drawn = 0xffffffffu;
 alignas(4096) std::array<std::byte, 2 * 65536> SurfaceStorage{};
 const std::span<std::byte, 65536> Surface{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(SurfaceStorage.data()) + 65535u) & ~std::uintptr_t{65535u}), 65536};
 alignas(4096) std::array<std::uint8_t, 4096> Cmask{};
+alignas(4096) std::array<std::byte, 2 * 65536> DestinationStorage{};
+const std::span<std::byte, 65536> Destination{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(DestinationStorage.data()) + 65535u) & ~std::uintptr_t{65535u}), 65536};
+alignas(4096) std::array<std::uint8_t, 4096> Keys{};
+constexpr std::uint32_t Other = 0x77777777u;
 
 ColorTarget target(ColorTileMode mode) {
     const ColorTargetLayout layout(Width, Height, mode, 4);
@@ -101,24 +106,29 @@ void draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D sc
     device.WaitIdle();
 }
 
-void expect(AgcDriver::VulkanDevice& device, const ColorTarget& color, const std::function<std::uint32_t(std::uint32_t, std::uint32_t)>& texel, const std::string& what) {
+void expect(AgcDriver::VulkanDevice& device, const ColorTarget& color, const std::function<std::uint32_t(std::uint32_t, std::uint32_t)>& texel, const std::string& what, std::optional<std::uint8_t> cmask = std::uint8_t{0xffu}) {
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
     StorageTexture::FlushPending(color.address, color.bytes, nullptr, "test");
     device.WaitIdle();
     const ColorTargetLayout layout(Width, Height, color.tileMode, 4);
+    const auto* texels = reinterpret_cast<const std::byte*>(color.address);
     for (std::uint32_t y = 0; y < Height; ++y) {
         for (std::uint32_t x = 0; x < Width; ++x) {
             std::uint32_t stored = 0;
-            std::memcpy(&stored, Surface.data() + layout.Offset(x, y), 4);
+            std::memcpy(&stored, texels + layout.Offset(x, y), 4);
             Require(stored == texel(x, y), what + ": texel (" + std::to_string(x) + ", " + std::to_string(y) + ") holds " + std::to_string(stored));
         }
     }
-    Require(std::all_of(Cmask.begin(), Cmask.end(), [](std::uint8_t value) { return value == 0xffu; }), what + ": the CMASK was not left expanded");
+    if (cmask) Require(std::all_of(Cmask.begin(), Cmask.end(), [&](std::uint8_t value) { return value == *cmask; }), what + ": the CMASK was not left at " + std::to_string(*cmask));
+}
+
+void metadataPass(AgcDriver::VulkanDevice& device, const ColorMetadataPass& pass) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    device.ColorMetadataPass(pass);
 }
 
 void eliminate(AgcDriver::VulkanDevice& device, const ColorTarget& color) {
-    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-    device.ColorMetadataPass({ColorMetadataPass::Mode::EliminateFastClear, {color}});
+    metadataPass(device, {ColorMetadataPass::Mode::EliminateFastClear, {color}, std::nullopt});
 }
 
 void run(AgcDriver::VulkanDevice& device, ColorTileMode mode, const std::string& name) {
@@ -165,8 +175,103 @@ void invalidCode(AgcDriver::VulkanDevice& device) {
 
 }
 
-int main() {
+ColorTarget multisampled() {
+    auto color = target(ColorTileMode::RenderTarget);
+    color.samples = 4;
+    return color;
+}
+
+ColorTarget resolveDestination() {
+    auto color = target(ColorTileMode::RenderTarget);
+    color.address = reinterpret_cast<std::uintptr_t>(Destination.data());
+    color.surfaceAddress = color.address;
+    color.cmaskAddress = 0;
+    color.cmaskBytes = 0;
+    return color;
+}
+
+void prepareUniform(const ColorTarget& color, std::uint8_t code) {
+    prepare(color, [](std::uint32_t, std::uint32_t) { return false; });
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    const std::vector<std::byte> mask(Cmask.size(), std::byte{code});
+    AgcDriver::GuestMemory::Write(color.cmaskAddress, mask);
+}
+
+void fillDestination(const ColorTarget& color) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushPending(color.address, Destination.size(), nullptr, "test");
+    std::vector<std::byte> other(Destination.size());
+    for (std::size_t offset = 0; offset < other.size(); offset += 4) std::memcpy(other.data() + offset, &Other, 4);
+    AgcDriver::GuestMemory::Write(color.address, other);
+}
+
+void multisampledCmask(AgcDriver::VulkanDevice& device) {
+    const auto color = multisampled();
+    prepareUniform(color, 0x00);
+    draw(device, color, {{0, 0}, {20, Height}});
+    expect(device, color, [](std::uint32_t x, std::uint32_t) { return x < 20 ? Drawn : Clear; }, "fast-cleared 4x target drawn over its left part", 0xcc);
+    prepareUniform(color, 0x00);
+    metadataPass(device, {ColorMetadataPass::Mode::FmaskDecompress, {color}, std::nullopt});
+    expect(device, color, [](std::uint32_t, std::uint32_t) { return Clear; }, "fast-cleared 4x target FMASK-decompressed without a draw", 0xcc);
+    for (const std::uint8_t code : {0xccu, 0xeeu}) {
+        prepareUniform(color, code);
+        eliminate(device, color);
+        expect(device, color, [](std::uint32_t, std::uint32_t) { return Stale; }, "expanded 4x target eliminated", code);
+        draw(device, color, {{40, 0}, {Width - 40, Height}});
+        expect(device, color, [](std::uint32_t x, std::uint32_t) { return x >= 40 ? Drawn : Stale; }, "expanded 4x target drawn over its right part", code);
+    }
+    prepareUniform(color, 0xcc);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const std::array<std::byte, 1> cleared{std::byte{0x0c}};
+        AgcDriver::GuestMemory::Write(color.cmaskAddress + 7, cleared);
+    }
     try {
+        eliminate(device, color);
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()).find("fast-clears part of it") != std::string::npos, std::string("unexpected failure: ") + error.what());
+        return;
+    }
+    throw std::runtime_error("a partly fast-cleared 4x CMASK did not throw");
+}
+
+void resolve(AgcDriver::VulkanDevice& device) {
+    const auto source = multisampled();
+    auto destination = resolveDestination();
+    prepareUniform(source, 0x00);
+    fillDestination(destination);
+    draw(device, source, {{0, 0}, {20, Height}});
+    metadataPass(device, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+    expect(device, destination, [](std::uint32_t x, std::uint32_t) { return x < 20 ? Drawn : Clear; }, "CB resolve of a drawn, fast-cleared 4x target", std::nullopt);
+    expect(device, source, [](std::uint32_t x, std::uint32_t) { return x < 20 ? Drawn : Clear; }, "the source of a CB resolve", 0xcc);
+    prepareUniform(source, 0xcc);
+    fillDestination(destination);
+    draw(device, source, {{40, 0}, {Width - 40, Height}});
+    metadataPass(device, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+    expect(device, destination, [](std::uint32_t x, std::uint32_t) { return x >= 40 ? Drawn : Stale; }, "CB resolve of a drawn, expanded 4x target", std::nullopt);
+    destination.dccAddress = reinterpret_cast<std::uintptr_t>(Keys.data());
+    prepareUniform(source, 0xcc);
+    fillDestination(destination);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const std::vector<std::byte> clear(Keys.size(), std::byte{0x00});
+        AgcDriver::GuestMemory::Write(destination.dccAddress, clear);
+    }
+    draw(device, source, {{0, 0}, {Width, 4}});
+    metadataPass(device, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+    expect(device, destination, [](std::uint32_t, std::uint32_t y) { return y < 4 ? Drawn : Stale; }, "CB resolve into a DCC target with cleared keys", std::nullopt);
+    const auto keys = AgcDriver::Graphics::DccKeyBytes(destination.bytes);
+    Require(std::all_of(Keys.begin(), Keys.begin() + static_cast<std::ptrdiff_t>(keys), [](std::uint8_t key) { return key == 0xffu; }), "a CB resolve left the destination's DCC keys compressed");
+}
+
+void multisampleTests(AgcDriver::VulkanDevice& device) {
+    multisampledCmask(device);
+    resolve(device);
+}
+
+int main(int argc, char** argv) {
+    try {
+        const bool multisampleOnly = argc == 2 && std::string(argv[1]) == "multisample";
         std::unique_ptr<AgcDriver::VulkanDevice> device;
         try {
             device = std::make_unique<AgcDriver::VulkanDevice>();
@@ -179,16 +284,23 @@ int main() {
             GuestAllocations::Mutation mutation;
             mutation.Add(SurfaceStorage.data(), SurfaceStorage.size(), true, true, true);
             mutation.Add(Cmask.data(), Cmask.size(), true, true, true);
+            mutation.Add(DestinationStorage.data(), DestinationStorage.size(), true, true, true);
+            mutation.Add(Keys.data(), Keys.size(), true, true, true);
         }
-        run(*device, ColorTileMode::Linear, "linear");
-        run(*device, ColorTileMode::RenderTarget, "SW_64KB_R_X");
-        invalidCode(*device);
+        if (!multisampleOnly) {
+            run(*device, ColorTileMode::Linear, "linear");
+            run(*device, ColorTileMode::RenderTarget, "SW_64KB_R_X");
+        }
+        multisampleTests(*device);
+        if (!multisampleOnly) invalidCode(*device);
         device->WaitIdle();
         device.reset();
         {
             GuestAllocations::Mutation mutation;
             mutation.Remove(SurfaceStorage.data());
             mutation.Remove(Cmask.data());
+            mutation.Remove(DestinationStorage.data());
+            mutation.Remove(Keys.data());
         }
         std::cout << "CMASK fast clear draw and eliminate tests passed\n";
         return 0;

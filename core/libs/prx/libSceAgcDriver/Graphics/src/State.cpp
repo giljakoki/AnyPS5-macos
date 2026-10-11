@@ -135,6 +135,23 @@ bool IgnoreDepthTest() {
     return ignore;
 }
 
+constexpr std::uint32_t AaConfigSingleSample = 0x7u | 0x10u | 0x1e000u | 0x700000u | 0x20000000u;
+constexpr const char* SingleSampleHint = "; APS5_MSAA_SINGLE_SAMPLE=1 renders multisampled targets with one sample";
+
+const char* aaConfigName() {
+    return SingleSampleMultisampling() ? "coverage conversion, detail-to-exposed sample mapping or reserved PA_SC_AA_CONFIG bits" : "multisampling or coverage conversion";
+}
+
+std::string multisampleMessage(std::uint32_t offset, std::uint32_t value, std::uint32_t mask, std::uint32_t singleSampleBits, const char* name) {
+    const auto offending = value & mask & (SingleSampleMultisampling() ? ~singleSampleBits : ~0u);
+    if (offending == 0) return {};
+    return zeroMessage(offset, value, name) + ((offending & ~singleSampleBits) == 0 ? SingleSampleHint : "");
+}
+
+void zeroMultisample(const Registers& registers, std::uint32_t offset, std::uint32_t mask, std::uint32_t singleSampleBits, const char* name) {
+    if (auto message = multisampleMessage(offset, read(registers, offset), mask, singleSampleBits, name); !message.empty()) throw std::runtime_error(message);
+}
+
 bool depthSurfaceBound(const Registers& cx) {
     const auto z = find(cx, 0x010);
     const auto stencil = find(cx, 0x011);
@@ -202,7 +219,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
-    zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
+    zeroMultisample(cx, 0x010, 0x000f100cu, 0xcu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
     const auto zFormat = read(cx, 0x010) & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
@@ -218,6 +235,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     Require(!stencilClear || (stencil && !stencilReadOnly), "stencil clear requires a writable stencil plane");
     Require(!depthClear || (zFormat != 0 && !depthReadOnly), "depth clear requires a writable depth plane");
     DepthTarget depth{};
+    depth.samples = 1u << ((read(cx, 0x010) >> 2u) & 3u);
     depth.address = zFormat != 0 ? base(0x012, 0x01a) : 0;
     depth.stencilAddress = stencil ? base(0x013, 0x01b) : 0;
     Require(zFormat == 0 || depthReadOnly || base(0x014, 0x01c) == depth.address, "depth read and written at different addresses is unsupported");
@@ -225,6 +243,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     const auto size = read(cx, 0x007);
     depth.extent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
     if (const auto slice = view & 0x1fffu; slice != 0) {
+        Require(depth.samples == 1, "slices of a multisampled depth array are unsupported");
         if (depth.address != 0) depth.address += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, zFormat == 1 ? 2u : 4u);
         if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, 1u);
     }
@@ -609,8 +628,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     zero(cx, 0x203, shaderControlMask(read(cx, 0x1c4)), "depth export, shader coverage or ordered fragment execution");
     result.alphaToCoverage = read(cx, 0x2dc) == AlphaToCoverageUndithered;
     if (!result.alphaToCoverage) zero(cx, 0x2dc, AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
-    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
-    zero(cx, 0x292, ScanModeMask, "scan conversion mode");
+    zeroMultisample(cx, 0x2f8, ~0u, AaConfigSingleSample, aaConfigName());
+    zeroMultisample(cx, 0x292, ScanModeMask, 1u, "scan conversion mode");
     zero(cx, 0x293, ScanControlMask, "sample iteration, primitive discard or out-of-order rasterization");
     zero(cx, 0x80, ~0u, "window offset");
     zero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits");
@@ -852,17 +871,26 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     APS5_LOG_OUT_DEBUG("Color %u info=0x%x number=%u swap=%u", slot, info, number, swap);
     const auto format = (info >> 2u) & 0x1fu;
     const auto decoded = DecodeColorFormat(format, number, swap);
+    if (const auto attrib = find(cx, 0x31d + stride); attrib != cx.end()) {
+        color.samples = 1u << ((attrib->second >> 12u) & 7u);
+        if (color.samples > 1u && !SingleSampleMultisampling()) throw std::runtime_error(multisampleMessage(0x31d + stride, attrib->second, ~0x20000u, 0x1f000u, "color samples, fragments or destination alpha override"));
+        if (SingleSampleMultisampling()) Require(color.samples <= 16u && (1u << ((attrib->second >> 15u) & 3u)) <= color.samples, "more than 16 color samples, or more color fragments than samples, are invalid");
+    }
+    Require(color.samples == 1u || (info & 0x10000000u) == 0, "DCC over a multisampled color target is unsupported");
+    const auto fmaskInfo = color.samples > 1u ? 0x0c004000u : 0u;
     // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
-    if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x00002000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
+    if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x00002000u | fmaskInfo)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
     Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
     Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
     const auto viewMip = (view >> 26u) & 0xfu;
-    zero(cx, 0x31d + stride, ~0x20000u, "color samples, fragments or destination alpha override");
+    if (SingleSampleMultisampling()) zero(cx, 0x31d + stride, ~(0x20000u | 0x1f000u), "CB_COLOR_ATTRIB modes other than samples, fragments and destination alpha override");
+    else zero(cx, 0x31d + stride, ~0x20000u, "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
+    Require(color.samples == 1u || maxMip == 0u, "mipmapped multisampled color targets are unsupported");
     Require(viewMip <= maxMip, "color view mip exceeds the surface");
     const auto attrib3 = read(cx, 0x3b8 + slot);
     color.tileMode = DecodeColorTileMode(attrib3);
@@ -876,6 +904,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     } else if ((attrib3 & 0x1fffu) != 0) {
         Require(slice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
     }
+    Require(color.samples == 1u || (!volume && slice == 0u), "3D or array slices of multisampled color targets are unsupported");
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
     std::uint64_t mipOffset = 0;
@@ -943,11 +972,13 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     const auto control = find(cx, 0x202);
     if (control == cx.end()) return std::nullopt;
     const auto mode = (control->second >> 4u) & 7u;
-    if (mode != 2u && mode != 6u) return std::nullopt;
-    ColorMetadataPass pass{mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : ColorMetadataPass::Mode::DccDecompress, {}};
+    const bool multisampled = (mode == 3u || mode == 5u) && SingleSampleMultisampling();
+    if (mode != 2u && mode != 6u && !multisampled) return std::nullopt;
+    using Mode = ColorMetadataPass::Mode;
+    ColorMetadataPass pass{mode == 2u ? Mode::EliminateFastClear : mode == 3u ? Mode::Resolve : mode == 5u ? Mode::FmaskDecompress : Mode::DccDecompress, {}, std::nullopt};
     Require((control->second & ~0x70u) == 0xcc0000u, "CB metadata pass with a nonstandard ROP, dual quads disabled or degamma");
     Require((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0, "CB metadata pass with depth or stencil work");
-    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
+    zeroMultisample(cx, 0x2f8, ~0u, AaConfigSingleSample, aaConfigName());
     zero(cx, 0x80, ~0u, "window offset");
     const auto viewportControl = read(cx, 0x206);
     if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
@@ -960,16 +991,34 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     intersect(covered, cx, 0x81, false);
     intersect(covered, cx, 0x90, false);
     if ((read(cx, 0x292) & 2u) != 0) intersect(covered, cx, 0x94, false);
-    const auto targetMask = read(cx, 0x8e);
-    for (std::uint32_t slot = 0; slot < 8; ++slot) {
-        if (((targetMask >> (4u * slot)) & 0xfu) == 0 || ((read(cx, 0x31c + slot * 0xfu) >> 2u) & 0x1fu) == 0) continue;
-        const auto target = DecodeColorBuffer(cx, slot);
-        Require((read(cx, 0x31c + slot * 0xfu) & 0x10000000u) == 0 || target.dccAddress != 0, "CB metadata pass over a mipmapped DCC color target, whose keys are not modeled");
+    const auto requireCovered = [&](const ColorTarget& target) {
         const auto width = static_cast<float>(target.extent.width);
         const auto height = static_cast<float>(target.extent.height);
         const bool viewportCovers = xo - xs <= 0.0f && xo + xs >= width && yo - ys <= 0.0f && yo + ys >= height;
         const bool scissorCovers = covered.offset.x == 0 && covered.offset.y == 0 && covered.extent.width >= target.extent.width && covered.extent.height >= target.extent.height;
         Require(viewportCovers && scissorCovers, "CB metadata pass over part of a color target");
+    };
+    if (pass.mode == Mode::Resolve) {
+        Require(((read(cx, 0x31c) >> 2u) & 0x1fu) != 0 && ((read(cx, 0x31c + 0xfu) >> 2u) & 0x1fu) != 0, "CB resolve without color formats in MRT0 (its source) and MRT1 (its destination)");
+        const auto source = DecodeColorBuffer(cx, 0);
+        const auto destination = DecodeColorBuffer(cx, 1);
+        Require(destination.samples == 1u, "CB resolve into a multisampled color target is unsupported");
+        Require(source.format == destination.format && source.elementBytes == destination.elementBytes && source.componentMapping == destination.componentMapping && source.packing == destination.packing && source.extent.width == destination.extent.width && source.extent.height == destination.extent.height, "CB resolve between color targets of different formats, component orders or extents is unsupported");
+        Require(source.mipCount == 1u && source.depth == 1u && destination.mipCount == 1u && destination.depth == 1u, "CB resolve of mipmapped or 3D color targets is unsupported");
+        Require((read(cx, 0x31c) & 0x10000000u) == 0, "CB resolve from a DCC-compressed color target is unsupported");
+        Require(destination.cmaskAddress == 0, "CB resolve into a CMASK fast-clear color target is unsupported (the resolve does not update its CMASK)");
+        requireCovered(destination);
+        pass.source = source;
+        pass.targets.push_back(destination);
+        return pass;
+    }
+    const auto targetMask = read(cx, 0x8e);
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        if (((targetMask >> (4u * slot)) & 0xfu) == 0 || ((read(cx, 0x31c + slot * 0xfu) >> 2u) & 0x1fu) == 0) continue;
+        const auto target = DecodeColorBuffer(cx, slot);
+        Require(pass.mode != Mode::FmaskDecompress || target.samples > 1u, "CB FMASK decompress over a single-sample color target is unsupported");
+        Require((read(cx, 0x31c + slot * 0xfu) & 0x10000000u) == 0 || target.dccAddress != 0, "CB metadata pass over a mipmapped DCC color target, whose keys are not modeled");
+        requireCovered(target);
         pass.targets.push_back(target);
     }
     return pass;
@@ -1022,8 +1071,12 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x2dc, word) && word != AlphaToCoverageUndithered) {
         if (auto reason = nonzero(cx, 0x2dc, AlphaToCoverageMask, "dithered or rounded alpha-to-coverage"); !reason.empty()) return reason;
     }
-    if (auto reason = nonzero(cx, 0x2f8, ~0u, "multisampling or coverage conversion"); !reason.empty()) return reason;
-    if (auto reason = nonzero(cx, 0x292, ScanModeMask, "scan conversion mode"); !reason.empty()) return reason;
+    if (value(cx, 0x2f8, word)) {
+        if (auto reason = multisampleMessage(0x2f8, word, ~0u, AaConfigSingleSample, aaConfigName()); !reason.empty()) return reason;
+    }
+    if (value(cx, 0x292, word)) {
+        if (auto reason = multisampleMessage(0x292, word, ScanModeMask, 1u, "scan conversion mode"); !reason.empty()) return reason;
+    }
     if (auto reason = nonzero(cx, 0x293, ScanControlMask, "sample iteration, primitive discard or out-of-order rasterization"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x80, ~0u, "window offset"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits"); !reason.empty()) return reason;
@@ -1120,6 +1173,17 @@ void appendRegister(std::string& line, const Registers& registers, std::uint32_t
     line += text;
 }
 
+}
+
+bool SingleSampleMultisamplingRequested(const char* value) {
+    if (value == nullptr) return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::runtime_error(std::string("APS5_MSAA_SINGLE_SAMPLE=") + value + ": expected 1");
+}
+
+bool SingleSampleMultisampling() {
+    static const bool single = SingleSampleMultisamplingRequested(std::getenv("APS5_MSAA_SINGLE_SAMPLE"));
+    return single;
 }
 
 bool MultisampleTraceRequested(const char* value) {

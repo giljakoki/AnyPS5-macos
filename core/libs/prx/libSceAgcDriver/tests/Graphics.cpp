@@ -1331,8 +1331,13 @@ void metadataPassTests() {
     queue.context[0x202] = 0xcc0030;
     queue.context[0x1c5] = 9;
     queue.context[0x8f] = 0xf;
-    Require(!DecodeColorMetadataPass(queue).has_value(), "resolve decoded as a metadata pass");
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("mode resolve") != std::string::npos, "the resolve rejection does not name the mode");
+    if (AgcDriver::Graphics::SingleSampleMultisampling()) {
+        queue.context[0x31c + 0xfu] = 0;
+        expectFailure([&] { DecodeColorMetadataPass(queue); }, "CB resolve without color formats");
+    } else {
+        Require(!DecodeColorMetadataPass(queue).has_value(), "resolve decoded as a metadata pass");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("mode resolve") != std::string::npos, "the resolve rejection does not name the mode");
+    }
 
     queue = makeState();
     queue.context[0x0] = 0;
@@ -1576,6 +1581,248 @@ void cmaskTests() {
     cmaskMemory.fill(0);
     expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "DCC color target");
     Require(texels(0x5a5a5a5au), "a refused pass changed the texels of a DCC target");
+}
+
+template<typename TAction>
+std::string failureOf(TAction action) {
+    try {
+        action();
+    } catch (const std::runtime_error& error) {
+        return error.what();
+    }
+    throw std::runtime_error("expected a graphics rejection");
+}
+
+constexpr std::string_view SingleSampleHint = "; APS5_MSAA_SINGLE_SAMPLE=1 renders multisampled targets with one sample";
+
+AgcDriver::QueueState multisampledState() {
+    auto queue = makeState();
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    queue.context[0x2f8] = 0x0020c002u;
+    queue.context[0x292] = 3;
+    queue.context[0x31d] = (2u << 12u) | (2u << 15u);
+    queue.context[0x31c] |= 0x4000u;
+    return queue;
+}
+
+void bindMultisampledDepth(AgcDriver::QueueState& queue) {
+    queue.context[0x000] = 0;
+    queue.context[0x002] = 0;
+    queue.context[0x007] = (1u << 16u) | 3u;
+    queue.context[0x00a] = 0;
+    queue.context[0x00b] = 0;
+    queue.context[0x010] = 0x22900983u | (2u << 2u);
+    queue.context[0x011] = 0x20000181;
+    for (const auto offset : {0x012u, 0x014u}) queue.context[offset] = 0x100;
+    for (const auto offset : {0x013u, 0x015u}) queue.context[offset] = 0x200;
+    queue.context[0x200] = 0x00700711;
+    queue.context[0x10b] = 0x00050050;
+    queue.context[0x10c] = 0x01ffff01;
+    queue.context[0x10d] = 0x01000001;
+}
+
+void bindResolveDestination(AgcDriver::QueueState& queue) {
+    queue.context[0x0] = 0;
+    for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du}) queue.context[offset + 0xfu] = queue.context.at(offset);
+    for (const auto offset : {0x390u, 0x3b0u, 0x3b8u}) queue.context[offset + 1u] = queue.context.at(offset);
+    const auto address = reinterpret_cast<std::uintptr_t>(sliceMemory.data());
+    queue.context[0x318 + 0xfu] = static_cast<std::uint32_t>(address >> 8u);
+    queue.context[0x391] = static_cast<std::uint32_t>(address >> 40u);
+    queue.context[0x31c + 0xfu] &= ~0x4000u;
+    queue.context[0x31d + 0xfu] = 0;
+    queue.context[0x202] = 0xcc0030;
+}
+
+void defaultMultisampleTests() {
+    using AgcDriver::Graphics::DecodeColorMetadataPass;
+    using AgcDriver::Graphics::DecodeState;
+    using AgcDriver::Graphics::DrawRejection;
+    auto queue = multisampledState();
+    const auto expected = "multisampling or coverage conversion is unsupported (register 0x2f8 = 0x0020c002)" + std::string(SingleSampleHint);
+    Require(DrawRejection(queue, false) == expected, "the precheck of a 4x draw did not name APS5_MSAA_SINGLE_SAMPLE: " + DrawRejection(queue, false));
+    Require(failureOf([&] { DecodeState(queue); }) == expected, "the decode of a 4x draw did not name APS5_MSAA_SINGLE_SAMPLE");
+    queue.context[0x2f8] = 0x0420c002u;
+    Require(DrawRejection(queue, false) == "multisampling or coverage conversion is unsupported (register 0x2f8 = 0x0420c002)", "coverage conversion named APS5_MSAA_SINGLE_SAMPLE, which does not accept it");
+    queue.context[0x2f8] = 0;
+    Require(DrawRejection(queue, false) == "scan conversion mode is unsupported (register 0x292 = 0x00000003)" + std::string(SingleSampleHint), "MSAA_ENABLE did not name APS5_MSAA_SINGLE_SAMPLE");
+    queue.context[0x292] = 6;
+    Require(DrawRejection(queue, false) == "scan conversion mode is unsupported (register 0x292 = 0x00000006)", "an unsupported scan mode named APS5_MSAA_SINGLE_SAMPLE");
+    queue.context[0x292] = 2;
+    Require(DrawRejection(queue, false).empty(), "a single-sample rasterizer was rejected before the color target was decoded");
+    Require(failureOf([&] { DecodeState(queue); }) == "color samples, fragments or destination alpha override is unsupported (register 0x31d = 0x00012000)" + std::string(SingleSampleHint), "a 4x color target did not name APS5_MSAA_SINGLE_SAMPLE");
+    queue.context[0x31d] |= 0x40000u;
+    Require(failureOf([&] { DecodeState(queue); }) == "color samples, fragments or destination alpha override is unsupported (register 0x31d = 0x00052000)", "a 4x color target with another CB_COLOR_ATTRIB mode named APS5_MSAA_SINGLE_SAMPLE");
+    queue.context[0x31c] &= ~0x4000u;
+    queue.context[0x31d] = 0x8000u;
+    Require(failureOf([&] { DecodeState(queue); }) == "color samples, fragments or destination alpha override is unsupported (register 0x31d = 0x00008000)", "fragments without samples changed their rejection");
+    queue.context[0x31d] = 0;
+    bindMultisampledDepth(queue);
+    Require(failureOf([&] { DecodeState(queue); }) == "multisampled, partially resident or mipmapped depth (DB_Z_INFO) is unsupported (register 0x10 = 0x2290098b)" + std::string(SingleSampleHint), "a 4x depth target did not name APS5_MSAA_SINGLE_SAMPLE");
+    queue = multisampledState();
+    bindResolveDestination(queue);
+    Require(!DecodeColorMetadataPass(queue).has_value(), "a CB resolve decoded without APS5_MSAA_SINGLE_SAMPLE");
+    queue.context[0x202] = 0xcc0050;
+    Require(!DecodeColorMetadataPass(queue).has_value(), "an FMASK decompress decoded without APS5_MSAA_SINGLE_SAMPLE");
+}
+
+void singleSampleMultisampleTests() {
+    using AgcDriver::Graphics::ColorMetadataPass;
+    using AgcDriver::Graphics::DecodeColorMetadataPass;
+    using AgcDriver::Graphics::DecodeState;
+    using AgcDriver::Graphics::DrawRejection;
+    Require(AgcDriver::Graphics::SingleSampleMultisampling(), "the single-sample multisampling tests need APS5_MSAA_SINGLE_SAMPLE=1");
+    auto plainQueue = makeState();
+    plainQueue.context[0x1b3] = 2;
+    plainQueue.context[0x1b4] = 2;
+    const auto plain = DecodeState(plainQueue);
+    auto queue = multisampledState();
+    std::vector<AgcDriver::Graphics::RegisterRead> log;
+    AgcDriver::Graphics::RegisterReadLog() = &log;
+    const auto rejection = DrawRejection(queue, false);
+    auto state = DecodeState(queue);
+    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    Require(rejection.empty(), "the single-sample fallback rejected a 4x draw: " + rejection);
+    for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the fallback reads: " + std::to_string(read.offset));
+    Require(state.color.samples == 4 && state.colors.size() == 1, "a 4x color target lost its sample count");
+    Require(state.color.address == plain.color.address && state.color.bytes == plain.color.bytes && state.color.extent.width == plain.color.extent.width && state.color.extent.height == plain.color.extent.height && state.color.format == plain.color.format && state.color.tileMode == plain.color.tileMode, "a 4x color target did not decode as the single-sample target at its address");
+    for (const auto config : {0x0420c002u, 0x0120c002u, 0x0020c00au}) {
+        queue.context[0x2f8] = config;
+        Require(DrawRejection(queue, false).find("coverage conversion, detail-to-exposed sample mapping or reserved PA_SC_AA_CONFIG bits") != std::string::npos, "the fallback accepted PA_SC_AA_CONFIG " + std::to_string(config));
+        expectFailure([&] { DecodeState(queue); }, "coverage conversion, detail-to-exposed sample mapping");
+    }
+    queue.context[0x2f8] = 0x0020c002u;
+    queue.context[0x293] = 0x00010000u;
+    Require(DrawRejection(queue, false).find("sample iteration") != std::string::npos, "the fallback accepted per-sample shading");
+    queue.context[0x293] = 0;
+    queue.context[0x292] = 7;
+    Require(DrawRejection(queue, false).find("scan conversion mode") != std::string::npos, "the fallback accepted another scan mode");
+    queue.context[0x292] = 3;
+    queue.context[0x31d] = (2u << 12u) | (2u << 15u) | 0x40000u;
+    expectFailure([&] { DecodeState(queue); }, "CB_COLOR_ATTRIB modes other than samples, fragments and destination alpha override");
+    queue.context[0x31d] = (1u << 12u) | (2u << 15u);
+    expectFailure([&] { DecodeState(queue); }, "more color fragments than samples");
+    queue.context[0x31d] = (2u << 12u) | (2u << 15u);
+    queue.context[0x31c] |= 0x10000000u;
+    queue.context[0x325] = 0x1234;
+    expectFailure([&] { DecodeState(queue); }, "DCC over a multisampled color target");
+    queue.context[0x31c] &= ~0x10000000u;
+    queue.context[0x3b0] |= 1u << 28u;
+    expectFailure([&] { DecodeState(queue); }, "mipmapped multisampled color targets");
+    queue.context[0x3b0] &= ~(1u << 28u);
+    queue.context[0x3b8] |= 1u;
+    queue.context[0x31b] = 1u | (1u << 13u);
+    expectFailure([&] { DecodeState(queue); }, "3D or array slices of multisampled color targets");
+    queue.context[0x3b8] &= ~1u;
+    queue.context[0x31b] = 0;
+    queue.context[0x31c] |= 0x0c000000u;
+    Require(DecodeState(queue).color.samples == 4, "FMASK_COMPRESSION_DISABLE or FMASK_COMPRESS_1FRAG_ONLY refused a 4x target");
+    queue.context[0x31c] &= ~0x0c000000u;
+    bindMultisampledDepth(queue);
+    Require(DrawRejection(queue, false).empty(), "the fallback rejected a 4x depth target");
+    state = DecodeState(queue);
+    Require(state.depth && state.depth->samples == 4 && state.depth->address == 0x10000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT, "a 4x depth target did not decode as its single-sample surface");
+    queue.context[0x002] = 1u | (1u << 13u);
+    expectFailure([&] { DecodeState(queue); }, "slices of a multisampled depth array");
+
+    queue = multisampledState();
+    bindResolveDestination(queue);
+    auto pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::Resolve && pass->source.has_value() && pass->targets.size() == 1, "a CB resolve did not decode");
+    Require(pass->source->samples == 4 && pass->source->address == reinterpret_cast<std::uintptr_t>(colorMemory.data()), "the CB resolve lost its MRT0 source");
+    Require(pass->targets[0].samples == 1 && pass->targets[0].address == reinterpret_cast<std::uintptr_t>(sliceMemory.data()), "the CB resolve lost its MRT1 destination");
+    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(AgcDriver::Graphics::Context{}, *pass); }, "needs resident images of both targets");
+    queue.context[0x2f8] = 0;
+    queue.context[0x292] = 2;
+    Require(DecodeColorMetadataPass(queue)->mode == ColorMetadataPass::Mode::Resolve, "a CB resolve with PA_SC_AA_CONFIG 0 did not decode");
+    auto variant = queue;
+    variant.context[0x31d] = 0;
+    variant.context[0x31c] &= ~0x4000u;
+    Require(DecodeColorMetadataPass(variant)->source->samples == 1, "a CB resolve of a single-sample source did not decode");
+    variant = queue;
+    variant.context[0x31d + 0xfu] = (2u << 12u) | (2u << 15u);
+    expectFailure([&] { DecodeColorMetadataPass(variant); }, "CB resolve into a multisampled color target");
+    variant = queue;
+    variant.context[0x31c + 0xfu] = (variant.context[0x31c + 0xfu] & ~0x700u) | 0x100u;
+    expectFailure([&] { DecodeColorMetadataPass(variant); }, "different formats, component orders or extents");
+    variant = queue;
+    variant.context[0x31c + 0xfu] = 0;
+    expectFailure([&] { DecodeColorMetadataPass(variant); }, "without color formats in MRT0 (its source) and MRT1 (its destination)");
+    variant = queue;
+    variant.context[0x10f] = std::bit_cast<std::uint32_t>(16.0f);
+    expectFailure([&] { DecodeColorMetadataPass(variant); }, "over part of a color target");
+    variant = queue;
+    const auto cmaskAddress = reinterpret_cast<std::uintptr_t>(cmaskMemory.data());
+    variant.context[0x31c + 0xfu] |= 0x2000u;
+    variant.context[0x31f + 0xfu] = static_cast<std::uint32_t>(cmaskAddress >> 8u);
+    variant.context[0x398 + 1u] = static_cast<std::uint32_t>(cmaskAddress >> 40u);
+    variant.context[0x3b8 + 1u] = 0x0dc00000u;
+    expectFailure([&] { DecodeColorMetadataPass(variant); }, "CB resolve into a CMASK fast-clear color target");
+    queue.context[0x202] = 0xcc0050;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::FmaskDecompress && pass->targets.size() == 1 && pass->targets[0].samples == 4 && !pass->source.has_value(), "an FMASK decompress did not decode");
+    queue.context[0x202] = 0xcc0020;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1 && pass->targets[0].samples == 4, "a fast-clear eliminate of a 4x target did not decode");
+    queue.context[0x202] = 0xcc0050;
+    queue.context[0x31d] = 0;
+    queue.context[0x31c] &= ~0x4000u;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "CB FMASK decompress over a single-sample color target");
+}
+
+void multisampleCmaskTests() {
+    using AgcDriver::Graphics::ColorMetadataPass;
+    auto queue = makeState();
+    queue.context[0x31c] |= 0x2000;
+    const auto cmaskAddress = reinterpret_cast<std::uintptr_t>(cmaskMemory.data());
+    queue.context[0x31f] = static_cast<std::uint32_t>(cmaskAddress >> 8u);
+    queue.context[0x398] = static_cast<std::uint32_t>(cmaskAddress >> 40u);
+    queue.context[0x323] = 0x11223344;
+    queue.context[0x324] = 0;
+    queue.context[0x3b8] = 0x0dc00000u;
+    auto target = AgcDriver::Graphics::DecodeColorBuffer(queue.context, 0);
+    target.samples = 4;
+    const AgcDriver::Graphics::Context context{};
+    const auto texels = [&](std::uint32_t value) {
+        for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
+            std::uint32_t texel = 0;
+            std::memcpy(&texel, colorMemory.data() + offset, 4);
+            if (texel != value) return false;
+        }
+        return true;
+    };
+    const auto cmaskIs = [&](std::uint8_t value) { return std::all_of(cmaskMemory.begin(), cmaskMemory.end(), [&](std::uint8_t byte) { return byte == value; }); };
+    for (const auto mode : {ColorMetadataPass::Mode::FmaskDecompress, ColorMetadataPass::Mode::EliminateFastClear}) {
+        const ColorMetadataPass pass{mode, {target}, std::nullopt};
+        std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+        cmaskMemory.fill(0);
+        AgcDriver::Graphics::RunColorMetadataPass(context, pass);
+        Require(texels(0x11223344) && cmaskIs(0xcc), "a fast-cleared 4x CMASK was not eliminated into the texels with every sample on fragment 0");
+        std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+        AgcDriver::Graphics::RunColorMetadataPass(context, pass);
+        Require(texels(0x5a5a5a5au) && cmaskIs(0xcc), "a pass over an expanded 4x CMASK changed the texels");
+        for (const std::uint8_t code : {0xeeu, 0xffu}) {
+            cmaskMemory.fill(code);
+            AgcDriver::Graphics::RunColorMetadataPass(context, pass);
+            Require(texels(0x5a5a5a5au) && cmaskIs(code), "a pass over an expanded 4x CMASK with uncompressed FMASK changed the texels or the CMASK");
+        }
+        cmaskMemory.fill(0xcc);
+        cmaskMemory[cmaskMemory.size() / 2] = 0x0c;
+        expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, pass); }, "fast-clears part of it");
+        cmaskMemory.fill(0x55);
+        expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, pass); }, "CMASK color codes 1 and 2");
+        Require(texels(0x5a5a5a5au), "a refused pass over a 4x CMASK changed the texels");
+    }
+}
+
+void multisampleTests() {
+    using AgcDriver::Graphics::SingleSampleMultisamplingRequested;
+    Require(!SingleSampleMultisamplingRequested(nullptr), "an unset APS5_MSAA_SINGLE_SAMPLE rendered multisampled targets with one sample");
+    Require(SingleSampleMultisamplingRequested("1"), "APS5_MSAA_SINGLE_SAMPLE=1 was not accepted");
+    for (const char* value : {"0", "", "yes", "11"}) expectFailure([&] { SingleSampleMultisamplingRequested(value); }, "APS5_MSAA_SINGLE_SAMPLE=");
+    if (AgcDriver::Graphics::SingleSampleMultisampling()) singleSampleMultisampleTests();
+    else defaultMultisampleTests();
+    multisampleCmaskTests();
 }
 
 void uint8x4TargetTests() {
@@ -4264,6 +4511,12 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--single-sample-msaa") {
+            singleSampleMultisampleTests();
+            multisampleCmaskTests();
+            std::cout << "Single-sample multisampling tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
             descriptorPoolResetFailureTest();
             std::cerr << "descriptor pool reset failure did not terminate\n";
@@ -4324,6 +4577,7 @@ int main(int argc, char** argv) {
         DualSourceBlendTests();
         metadataPassTests();
         cmaskTests();
+        multisampleTests();
         uint16ExportTests();
         uint8x4TargetTests();
         ShaderStageTests();

@@ -58,6 +58,7 @@ struct ColorTarget {
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
+    std::uint32_t samples = 1;
 };
 
 struct DepthTarget {
@@ -69,6 +70,7 @@ struct DepthTarget {
     std::uint8_t clearStencil;
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
+    std::uint32_t samples = 1;
 };
 
 struct State {
@@ -121,9 +123,10 @@ std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
 
 struct ColorMetadataPass {
-    enum class Mode { EliminateFastClear, DccDecompress };
+    enum class Mode { EliminateFastClear, DccDecompress, Resolve, FmaskDecompress };
     Mode mode;
     std::vector<ColorTarget> targets;
+    std::optional<ColorTarget> source;
 };
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
 std::string DepthMaintenanceRejection(const QueueState& queue);
@@ -133,6 +136,8 @@ std::string DepthMaintenanceRejection(const QueueState& queue);
 std::string DrawRejection(const QueueState& queue, bool indexed);
 bool PixelProgramSkipped(const QueueState& queue);
 std::string NullPixelProgramRejection(const QueueState& queue);
+bool SingleSampleMultisamplingRequested(const char* value);
+bool SingleSampleMultisampling();
 bool MultisampleTraceRequested(const char* value);
 bool TraceMultisampling();
 void TraceMultisampleState(const QueueState& queue);

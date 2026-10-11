@@ -210,6 +210,25 @@ std::string hexAddress(std::uint64_t address) {
     return text;
 }
 
+CmaskState multisampleCmask(const ColorTarget& color, std::span<const std::byte> mask) {
+    std::uint32_t colorCodes = 0;
+    for (const auto entry : mask) {
+        const auto value = std::to_integer<std::uint32_t>(entry);
+        colorCodes |= (1u << ((value >> 2u) & 3u)) | (1u << ((value >> 6u) & 3u));
+    }
+    Require((colorCodes & 6u) == 0, "CMASK color codes 1 and 2 of multisampled color target " + hexAddress(color.address) + " are not modeled (0 cleared, 3 expanded)");
+    Require(colorCodes != 9u, "the CMASK of multisampled color target " + hexAddress(color.address) + " fast-clears part of it, whose multisampled CMASK tile order is not modeled");
+    return colorCodes == 1u ? CmaskState::Cleared : CmaskState::Expanded;
+}
+
+void reportMultisampleTarget(std::uint64_t address, const char* what, std::uint32_t samples) {
+    static std::mutex mutex;
+    static std::set<std::uint64_t> reported;
+    std::lock_guard lock(mutex);
+    if (reported.size() >= 64 || !reported.insert(address).second) return;
+    std::fprintf(stderr, "[gpu] %ux multisampled %s 0x%llx is rendered with one sample (APS5_MSAA_SINGLE_SAMPLE)\n", samples, what, static_cast<unsigned long long>(address));
+}
+
 void requireCmaskCodes(std::uint32_t codes) {
     if (codes == 0) return;
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
@@ -239,6 +258,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
     }
     std::vector<std::byte> mask(bytes);
     GuestMemory::Read(address, mask, CmaskLayout::Alignment);
+    if (color.samples > 1u) return multisampleCmask(color, mask);
     const auto uniform = [&](std::byte value) { return std::all_of(mask.begin(), mask.end(), [&](std::byte entry) { return entry == value; }); };
     if (uniform(std::byte{0xff})) return CmaskState::Expanded;
     if (uniform(std::byte{0})) return CmaskState::Cleared;
@@ -297,7 +317,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
     if (cmaskProved(color.cmaskAddress, bytes)) return false;
     auto* recorder = Recorder::Active();
-    if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
+    if (color.samples == 1u && resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
         const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
         const auto view = import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
         if (view != VK_NULL_HANDLE) {
@@ -320,7 +340,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
         storeCmaskClearTexels(color, layout, state == CmaskState::Cleared ? nullptr : &cleared, texel);
         if (resident != nullptr) resident->Refresh();
     }
-    const std::vector<std::byte> expanded(bytes, std::byte{0xff});
+    const std::vector<std::byte> expanded(bytes, static_cast<std::byte>(color.samples > 1u ? 0xccu : 0xffu));
     GuestMemory::Write(color.cmaskAddress, expanded, CmaskLayout::Alignment);
     proveCmask(color.cmaskAddress, bytes, GuestMemory::CollectWrites(color.cmaskAddress, bytes));
     return filled;
@@ -1867,6 +1887,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
+        if (color.samples > 1u) reportMultisampleTarget(color.address, "color target", color.samples);
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
@@ -1929,6 +1950,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
+    if (state.depth && state.depth->samples > 1u) reportMultisampleTarget(state.depth->address != 0 ? state.depth->address : state.depth->stencilAddress, "depth target", state.depth->samples);
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -2475,9 +2497,26 @@ std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, con
     return resident != nullptr && resident->GuestBytes() == color.bytes ? resident : nullptr;
 }
 
+void resolveColorTarget(const Context& context, const ColorMetadataPass& pass) {
+    Require(pass.source.has_value() && pass.targets.size() == 1, "CB resolve without its source and destination");
+    const auto& source = *pass.source;
+    const auto& destination = pass.targets.front();
+    const auto what = "CB resolve " + hexAddress(source.address) + " -> " + hexAddress(destination.address);
+    const auto from = metadataPassResident(context, source);
+    const auto to = metadataPassResident(context, destination);
+    Require(from != nullptr && to != nullptr, what + " needs resident images of both targets (tiled targets with the GPU detiler)");
+    if (materializeCmaskClear(context, source, from)) from->MarkDirty();
+    const char* refusal = nullptr;
+    Require(to->CopyFrom(*from, refusal, true), what + " as an image copy was refused (" + (refusal != nullptr ? refusal : "unknown") + ")");
+}
+
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
+    if (pass.mode == ColorMetadataPass::Mode::Resolve) {
+        resolveColorTarget(context, pass);
+        return;
+    }
     for (const auto& color : pass.targets) {
         if (color.cmaskAddress != 0) {
             const auto resident = metadataPassResident(context, color);

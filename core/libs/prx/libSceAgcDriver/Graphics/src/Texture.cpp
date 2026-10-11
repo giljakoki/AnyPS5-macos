@@ -3625,12 +3625,14 @@ bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
     return guestBytes == other.guestBytes && mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && mine.format == theirs.format && storageFormat == other.storageFormat && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth;
 }
 
-bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
-    if (&source == this || !SameSurfaceShape(source)) {
+bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal, bool resolve) {
+    const auto& theirs = source.descriptor;
+    const bool singleImage = descriptor.mipCount == 1 && theirs.mipCount == 1 && descriptor.dimension == TextureDimension::k2D && theirs.dimension == TextureDimension::k2D && arrayLayers == 1 && source.arrayLayers == 1;
+    if (&source == this || !(resolve ? singleImage && descriptor.width == theirs.width && descriptor.height == theirs.height && storageFormat == source.storageFormat : SameSurfaceShape(source))) {
         refusal = "shape";
         return false;
     }
-    if (descriptor.dccAddress != 0 || source.descriptor.dccAddress != 0) {
+    if ((descriptor.dccAddress != 0 && !resolve) || theirs.dccAddress != 0) {
         refusal = "keys";
         return false;
     }
@@ -3638,7 +3640,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         refusal = "released";
         return false;
     }
-    if (HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
+    if (!resolve && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
         refusal = "not imported";
         return false;
     }
@@ -3712,6 +3714,11 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // given in FillClear).
     originalValid = false;
     uploadedKeys = DccKeys::Uncompressed;
+    if (descriptor.dccAddress != 0) {
+        filledKeys = DccKeys::Uncompressed;
+        keyProof = {};
+        MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
+    }
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
     refreshGeneration();
     forgetBorrowed(0, trackedLayers);

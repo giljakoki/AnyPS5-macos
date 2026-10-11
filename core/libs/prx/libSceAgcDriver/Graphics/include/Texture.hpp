@@ -296,7 +296,7 @@ public:
     // hook), and the source's pending results stay pending. The shapes must match, neither surface
     // may carry DCC metadata, and this surface must be host-imported (the write-back is GPU-direct).
     // False, naming why, when the copy must be a transfer.
-    bool CopyFrom(StorageTexture& source, const char*& refusal);
+    bool CopyFrom(StorageTexture& source, const char*& refusal, bool resolve = false);
     VkImage Image() const { return image; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
