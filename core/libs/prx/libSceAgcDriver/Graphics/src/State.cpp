@@ -136,6 +136,9 @@ bool IgnoreDepthTest() {
 }
 
 constexpr std::uint32_t AaConfigSingleSample = 0x7u | 0x10u | 0x1e000u | 0x700000u | 0x20000000u;
+constexpr std::uint32_t AaConfigSampleCounts = 0x7u | 0x700000u;
+constexpr std::uint32_t MaskExportEnable = 0x100u;
+constexpr const char* MultisampleMaskExport = "a pixel shader's sample-mask export in a multisampled draw is unsupported (one sample keeps only bit 0 of the mask)";
 constexpr const char* SingleSampleHint = "; APS5_MSAA_SINGLE_SAMPLE=1 renders multisampled targets with one sample";
 
 const char* aaConfigName() {
@@ -637,6 +640,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     Require((read(cx, 0x8c) & 0xfu) == 0xau, "nonstandard triangle edge rules are unsupported");
     Require(read(cx, 0x2f9) == 0x2du, "nonstandard pixel center or vertex quantization is unsupported");
     Require(read(cx, 0x30e) == 0xffffffffu && read(cx, 0x30f) == 0xffffffffu, "sample masks are unsupported");
+    Require(!SingleSampleMultisampling() || (read(cx, 0x2f8) & AaConfigSampleCounts) == 0 || (read(cx, 0x203) & MaskExportEnable) == 0, MultisampleMaskExport);
     const auto viewportControl = read(cx, 0x206);
     if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
     zero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags");
@@ -1086,6 +1090,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x313, word) && (word & ~0x001f6000u) != 0 && word != 0x6001u) return conservativeMessage(word);
     std::uint32_t other = 0;
     if (value(cx, 0x30e, word) && value(cx, 0x30f, other) && (word != 0xffffffffu || other != 0xffffffffu)) return require(false, "sample masks are unsupported");
+    if (SingleSampleMultisampling() && value(cx, 0x2f8, word) && (word & AaConfigSampleCounts) != 0 && value(cx, 0x203, other) && (other & MaskExportEnable) != 0) return require(false, MultisampleMaskExport);
     if (value(cx, 0x206, word) && word != 0x43fu) return vteMessage(word);
     if (auto reason = nonzero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;

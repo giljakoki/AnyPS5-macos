@@ -1642,6 +1642,11 @@ void defaultMultisampleTests() {
     const auto expected = "multisampling or coverage conversion is unsupported (register 0x2f8 = 0x0020c002)" + std::string(SingleSampleHint);
     Require(DrawRejection(queue, false) == expected, "the precheck of a 4x draw did not name APS5_MSAA_SINGLE_SAMPLE: " + DrawRejection(queue, false));
     Require(failureOf([&] { DecodeState(queue); }) == expected, "the decode of a 4x draw did not name APS5_MSAA_SINGLE_SAMPLE");
+    auto maskExport = queue;
+    maskExport.context[0x1c4] = 9;
+    maskExport.context[0x203] |= 0x100u;
+    Require(DrawRejection(maskExport, false) == expected, "a sample-mask export changed the default rejection of a 4x draw");
+    Require(failureOf([&] { DecodeState(maskExport); }) == expected, "a sample-mask export changed the default decode failure of a 4x draw");
     queue.context[0x2f8] = 0x0420c002u;
     Require(DrawRejection(queue, false) == "multisampling or coverage conversion is unsupported (register 0x2f8 = 0x0420c002)", "coverage conversion named APS5_MSAA_SINGLE_SAMPLE, which does not accept it");
     queue.context[0x2f8] = 0;
@@ -1692,6 +1697,17 @@ void singleSampleMultisampleTests() {
         expectFailure([&] { DecodeState(queue); }, "coverage conversion, detail-to-exposed sample mapping");
     }
     queue.context[0x2f8] = 0x0020c002u;
+    auto maskExport = queue;
+    maskExport.context[0x1c4] = 9;
+    maskExport.context[0x203] |= 0x100u;
+    for (const auto config : {0x0020c002u, 0x00000002u, 0x00200000u}) {
+        maskExport.context[0x2f8] = config;
+        Require(DrawRejection(maskExport, false) == "AGC graphics: a pixel shader's sample-mask export in a multisampled draw is unsupported (one sample keeps only bit 0 of the mask)", "the fallback accepted a sample-mask export with PA_SC_AA_CONFIG " + std::to_string(config) + ": " + DrawRejection(maskExport, false));
+        expectFailure([&] { DecodeState(maskExport); }, "sample-mask export in a multisampled draw");
+    }
+    maskExport.context[0x2f8] = 0;
+    maskExport.context[0x292] = 2;
+    Require(DrawRejection(maskExport, false).empty() && DecodeState(maskExport).color.samples == 4, "the fallback rejected a sample-mask export of a one-sample rasterizer");
     queue.context[0x293] = 0x00010000u;
     Require(DrawRejection(queue, false).find("sample iteration") != std::string::npos, "the fallback accepted per-sample shading");
     queue.context[0x293] = 0;
