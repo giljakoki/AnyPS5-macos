@@ -41,10 +41,13 @@ jobs:
           key: macos-x86_64
           save: true
           evict-old-files: job
+      # Line tables let a failing test's backtrace name file and line; -S keeps them out of the libraries.
       - name: Configure
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_C_FLAGS=-gline-tables-only -DCMAKE_CXX_FLAGS=-gline-tables-only
+          -DCMAKE_SHARED_LINKER_FLAGS=-Wl,-S -DCMAKE_MODULE_LINKER_FLAGS=-Wl,-S
       # -k 0 keeps going after a failure, so one run reports every file that does not build; on a failure the
       # diagnostics are repeated at the end of the log, where a long build would otherwise bury them.
       - name: Build
@@ -68,7 +71,7 @@ jobs:
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
             --output-log ctest.log --output-junit ctest.xml -E 'agc_driver_lds_atomics64|flip|display' && exit 0
           echo "===== failed tests, run again one at a time ====="
-          ctest --test-dir build --rerun-failed --output-on-failure --timeout 120 || true
+          bash .github/scripts/diagnose_failed_tests.sh build || true
           exit 1
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
