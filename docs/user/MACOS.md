@@ -79,6 +79,15 @@ DOOM's release ships `eboot.bin` and `sce_module/libc.prx` as fake-signed SELF c
 
 The first commercial titles tried stop at their first draws on features MoltenVK lacks or the driver does not implement yet: 4x multisampled render targets, pixel shaders that need barycentrics without geometry shaders, and a viewport depth range outside [0, 1] without `VK_EXT_depth_range_unrestricted`.
 
+The bundle's launcher passes its own environment to the title, so a runtime variable from [USAGE.md](USAGE.md#runtime-layout), such as [`APS5_MSAA_SINGLE_SAMPLE=1`](USAGE.md#multisampled-render-targets) for titles that stop on multisampled render targets, is set when the bundle is started while the title is not running:
+
+```sh
+open --env APS5_MSAA_SINGLE_SAMPLE=1 Title.app
+APS5_MSAA_SINGLE_SAMPLE=1 Title.app/Contents/MacOS/launch
+```
+
+Repeat `--env` for each variable. The second form starts the launcher from Terminal and waits until the title exits; either way the output still goes to the log.
+
 ## Limitations
 
 - Metal has no 64-bit floats and no 64-bit atomics, and MoltenVK has no `VK_KHR_shader_clock`. Shaders that need them fail; the affected tests are listed in [technical debt](../dev/TechnicalDebt.md).

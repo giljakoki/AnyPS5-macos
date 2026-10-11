@@ -135,6 +135,12 @@ The game runs on the first Vulkan 1.1 device with graphics and compute queues an
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. Any other value stops the title at its first flip.
 
+### Multisampled render targets
+
+Multisampled (MSAA) rendering is not implemented, and a title that uses it stops at its first such draw with a message that names `APS5_MSAA_SINGLE_SAMPLE` when the variable would accept the state, such as `multisampling or coverage conversion is unsupported (register 0x2f8 = 0x0020c002); APS5_MSAA_SINGLE_SAMPLE=1 renders multisampled targets with one sample`. `APS5_MSAA_SINGLE_SAMPLE=1` renders multisampled color and depth targets with one sample instead: edges are not anti-aliased, and a CB resolve becomes a copy. Multisampled textures, per-sample shading and the other cases listed in [TechnicalDebt](../dev/TechnicalDebt.md) still stop the title.
+
+`APS5_TRACE_MSAA=1` prints `[msaa]` lines to stderr, each distinct one once: the register state of every draw that uses multisampling or a CB metadata pass, the descriptors of multisampled and FMASK textures, and uniform fills of up to 4 MiB, where CMASK, FMASK and HTILE clears show. The log of one run with both variables shows how a title uses multisampling and what it still needs. Any other value of either variable stops the title at its first draw.
+
 ## Exit codes
 
 `0`: conversion succeeded. `1`: invalid arguments. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.
