@@ -69,6 +69,16 @@ With the prebuilt package, run these commands inside `anyps5-macos-x86_64` and p
 
 The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, and starts without the SDK. The title runs in `~/Library/Application Support/AnyPS5/<title id>`, where its saves are written. Shaders are cached in `~/Library/Caches/<bundle id>`; the first start of a title compiles them and is slower. Output goes to `~/Library/Logs/AnyPS5/<title id>.log`. [Input mapping](INPUT_MAPPING.md) applies unchanged; pass `--input-config anyps5-input.ini` to the packager to put a mapping file in the bundle.
 
+## Tested on macOS
+
+| Title | ID | Result | Mac |
+|-------|----|--------|-----|
+| DOOM Shareware (homebrew, [lowbit/ps5-doom](https://github.com/lowbit/ps5-doom) v1.1.1) | PPSA99666 | In game: stable frame rate, keyboard input without noticeable latency | M5 Pro, `main` after #2 plus `dde80ad1` |
+
+DOOM's release ships `eboot.bin` and `sce_module/libc.prx` as fake-signed SELF containers. Unpack the executable with `python3 tools/unfself.py eboot.bin eboot.elf`, set `eboot.bin` and the bundled `libc.prx` aside (the title runs on AnyPS5's libc, as on [Linux and Windows](COMPATIBILITY.md)), then convert `eboot.elf` as above.
+
+The first commercial titles tried stop at their first draws on features MoltenVK lacks or the driver does not implement yet: 4x multisampled render targets, pixel shaders that need barycentrics without geometry shaders, and a viewport depth range outside [0, 1] without `VK_EXT_depth_range_unrestricted`.
+
 ## Limitations
 
 - Metal has no 64-bit floats and no 64-bit atomics, and MoltenVK has no `VK_KHR_shader_clock`. Shaders that need them fail; the affected tests are listed in [technical debt](../dev/TechnicalDebt.md).
