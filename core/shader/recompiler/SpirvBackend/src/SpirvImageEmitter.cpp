@@ -1346,7 +1346,8 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
         constexpr std::array<spv::Op, 6> operations{spv::OpFOrdLessThan, spv::OpFOrdEqual, spv::OpFOrdLessThanEqual, spv::OpFOrdGreaterThan, spv::OpFOrdNotEqual, spv::OpFOrdGreaterThanEqual};
         auto result = Select(state, f32, equal(parameter(0u), 7u), one, zero);
         for (std::uint32_t index = 0; index < operations.size(); ++index) {
-            const auto compared = Select(state, f32, Binary(state, operations[index], TypeBool(state), reference, red), one, zero);
+            const auto test = operations[index] == spv::OpFOrdNotEqual ? EmitFPOrdNotEqual32(state, reference, red) : Binary(state, operations[index], TypeBool(state), reference, red);
+            const auto compared = Select(state, f32, test, one, zero);
             result = Select(state, f32, equal(parameter(0u), index + 1u), compared, result);
         }
         return result;
