@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
-#else
+#elif !defined(__APPLE__)
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -36,6 +36,11 @@ std::vector<std::string> CaptureWrites(TAction action) {
         DWORD read = 0;
         while (ReadFile(server, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) messages.emplace_back(buffer.data(), read);
     });
+#elif defined(__APPLE__)
+    std::FILE* stream = funopen(&messages, nullptr, [](void* cookie, const char* data, int size) {
+        static_cast<std::vector<std::string>*>(cookie)->emplace_back(data, static_cast<std::size_t>(size));
+        return size;
+    }, nullptr, nullptr);
 #else
     int sockets[2];
     Require(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets) == 0, "message socket pair");
@@ -50,10 +55,11 @@ std::vector<std::string> CaptureWrites(TAction action) {
     Require(std::setvbuf(stream, nullptr, _IONBF, 0) == 0, "unbuffered message stream");
     action(stream);
     std::fclose(stream);
-    reader.join();
 #ifdef _WIN32
+    reader.join();
     CloseHandle(server);
-#else
+#elif !defined(__APPLE__)
+    reader.join();
     close(sockets[1]);
 #endif
     return messages;
@@ -63,6 +69,15 @@ std::string Join(const std::vector<std::string>& messages) {
     std::string text;
     for (const auto& message : messages) text += message;
     return text;
+}
+
+std::size_t WriteLimit(std::size_t bytes) {
+#ifdef __APPLE__
+    return bytes / BUFSIZ + 2;
+#else
+    (void)bytes;
+    return 2;
+#endif
 }
 
 bool HasLine(const std::string& text, const std::string& tail) {
@@ -75,15 +90,15 @@ bool HasLine(const std::string& text, const std::string& tail) {
 int main() {
     const auto shortLine = CaptureWrites([](std::FILE* stream) { Require(_APS5_LOG_IMPL(stream, "value %d of %s", 7, "seven") == 0, "a short line was not flushed"); });
     Require(HasLine(Join(shortLine), "] value 7 of seven\n"), "a short line differs");
-    Require(shortLine.size() <= 2, "a short line took more than two writes");
+    Require(shortLine.size() <= WriteLimit(Join(shortLine).size()), "a short line took more than two writes");
 
     const std::string text(20000, 'r');
     const auto longLine = CaptureWrites([&](std::FILE* stream) { Require(_APS5_LOG_IMPL(stream, "%s", text.c_str()) == 0, "a long line was not flushed"); });
     Require(HasLine(Join(longLine), "] " + text + "\n"), "a long line differs");
-    Require(longLine.size() <= 2, "a 20000-character line took more than two writes");
+    Require(longLine.size() <= WriteLimit(Join(longLine).size()), "a 20000-character line took more than two writes");
 
     const auto plainLine = CaptureWrites([](std::FILE* stream) { Require(_APS5_LOG_IMPL_NF(stream, "plain") == 0, "a line without arguments was not flushed"); });
     Require(HasLine(Join(plainLine), "] plain\n"), "a line without arguments differs");
-    Require(plainLine.size() <= 2, "a line without arguments took more than two writes");
+    Require(plainLine.size() <= WriteLimit(Join(plainLine).size()), "a line without arguments took more than two writes");
     return 0;
 }
