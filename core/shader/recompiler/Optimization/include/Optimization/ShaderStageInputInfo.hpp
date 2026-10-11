@@ -195,6 +195,11 @@ struct ShaderPixelInputInfo {
         return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x400u) != 0u && !InputIsCustom(input);
     }
 
+    [[nodiscard]] bool InputIsFlat(std::uint32_t input, std::uint32_t vertexZeroReads, std::uint32_t otherReads) const {
+        const auto bit = input < 32u ? 1u << input : 0u;
+        return InputIsFlat(input) || ((vertexZeroReads & ~otherReads & bit) != 0u && input < inputNum && !InputIsDefault(input) && !InputIsCustom(input) && !InputIsFp16(input));
+    }
+
     [[nodiscard]] std::uint32_t InputSlot(std::uint32_t input) const {
         return input < 32u ? interpolatorSettings[input] & 0x1fu : input;
     }

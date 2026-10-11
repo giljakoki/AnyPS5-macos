@@ -36,11 +36,11 @@ ShaderRecompiler::RecompileResult Shader(std::span<const std::uint32_t> words, s
     return result;
 }
 
-ShaderRecompiler::RecompileResult GuestPixel(const ShaderRecompiler::SpirvTarget& target) {
+ShaderRecompiler::RecompileResult GuestPixel(const ShaderRecompiler::SpirvTarget& target, std::uint32_t inputSetting) {
     alignas(256) static constexpr std::array<std::uint32_t, 7> code{0xc8120002u, 0xc8160102u, 0xc81a0202u, 0xc81e0302u, 0xf800180fu, 0x07060504u, 0xbf810000u};
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     pixel.interpolatorCount = 1;
-    pixel.interpolatorSettings[0] = 0x400u;
+    pixel.interpolatorSettings[0] = inputSetting;
     pixel.inputAddr = 2;
     pixel.hasPerspectiveCenterVgpr = true;
     pixel.targetOutputMode[0] = 9;
@@ -54,7 +54,8 @@ ShaderRecompiler::RecompileResult GuestPixel(const ShaderRecompiler::SpirvTarget
     request.useCache = false;
     auto result = ShaderRecompiler::Recompile(request);
     result.variantId = 3;
-    Require(result.fragmentParameters.size() == 1 && result.fragmentParameters[0].flat && !result.fragmentParameters[0].perVertex, "guest P0 shader did not produce a flat input");
+    const bool flat = (inputSetting & 0x400u) != 0u || !target.fragmentShaderBarycentricEnabled;
+    Require(result.fragmentParameters.size() == 1 && result.fragmentParameters[0].flat == flat && result.fragmentParameters[0].perVertex != flat, "guest P0 shader of input setting " + std::to_string(inputSetting) + (flat ? " did not produce a flat input" : " did not read its input per vertex"));
     return result;
 }
 
@@ -111,6 +112,20 @@ int main() {
             {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
             {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}
         }};
+        const auto flatPixel = GuestPixel(device->Target(), 0x400u);
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> flatShaders{{
+            {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
+            {ShaderRecompiler::ShaderStage::Fragment, &flatPixel, 0}
+        }};
+        const auto vertexZeroPixel = GuestPixel(device->Target(), 0x0u);
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> vertexZeroShaders{{
+            {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
+            {ShaderRecompiler::ShaderStage::Fragment, &vertexZeroPixel, 0}
+        }};
+        for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) {
+            Run(*device, topology, flatShaders, false, "guest P0 of a flat input");
+            Run(*device, topology, vertexZeroShaders, false, "guest P0 of an interpolated input");
+        }
         if (!device->ProvokingVertexLast()) {
             for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, shaders, false);
             bool rejected = false;
@@ -127,12 +142,10 @@ int main() {
             return VulkanTestSkipped;
         }
         for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, shaders);
-        const auto guestPixel = GuestPixel(device->Target());
-        const std::array<AgcDriver::Graphics::CompiledShader, 2> guestShaders{{
-            {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
-            {ShaderRecompiler::ShaderStage::Fragment, &guestPixel, 0}
-        }};
-        for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, guestShaders, true, "guest P0");
+        for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, flatShaders, true, "guest P0 of a flat input");
+        if (!device->Target().fragmentShaderBarycentricEnabled) {
+            for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, vertexZeroShaders, true, "guest P0 of an interpolated input");
+        }
         std::puts("provoking vertex rendering tests passed: GLSL and guest P0, triangle list and strip, first/last/first");
         return 0;
     } catch (const std::exception& error) {

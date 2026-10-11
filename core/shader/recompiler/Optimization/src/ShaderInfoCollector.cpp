@@ -228,11 +228,6 @@ bool IsPixelParameterCustom(const ShaderPixelInputInfo& pixel, std::uint32_t inp
     return pixel.InputIsCustom(input);
 }
 
-bool IsPixelParameterFlat(const ShaderPixelInputInfo& pixel, std::uint32_t input) {
-    constexpr std::uint32_t flatShadeBit = 0x00000400u;
-    return input < pixel.inputNum && (pixel.interpolatorSettings[input] & flatShadeBit) != 0u && !IsPixelParameterCustom(pixel, input);
-}
-
 void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
     if (pixel->HasPositionInput()) {
         AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
@@ -240,6 +235,10 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
     if (pixel->psFrontFace) {
         AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
     }
+    const auto& metadata = program.Metadata();
+    const auto flat = [&](std::uint32_t input) {
+        return pixel->InputIsFlat(input, metadata.pixelVertexZeroReads, metadata.pixelOtherReads);
+    };
     std::array<bool, 32> read {};
     std::array<bool, 32> perVertex {};
     std::array<bool, 32> interpolated {};
@@ -257,7 +256,7 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const auto mode = inst->Argument(2)->Resolve()->ImmediateU32();
                 read[input] = true;
-                perVertex[input] = perVertex[input] || mode < 2u || !IsPixelParameterFlat(*pixel, input);
+                perVertex[input] = perVertex[input] || mode < 2u || !flat(input);
             } else if (inst->Opcode() == IrOpcode::GetInterpolationParameterF16) {
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const bool high = inst->Argument(3)->Resolve()->ImmediateU32() != 0u;
@@ -269,12 +268,11 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
             }
         }
     }
-    const auto& metadata = program.Metadata();
     const auto linear = [&](std::uint32_t input) {
         return pixel->InputIsLinear(input, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs);
     };
     const auto interpolation = [&](std::uint32_t input) {
-        return IsPixelParameterFlat(*pixel, input) ? 2u : linear(input) ? 1u : 0u;
+        return flat(input) ? 2u : linear(input) ? 1u : 0u;
     };
     constexpr std::uint32_t unassigned = std::numeric_limits<std::uint32_t>::max();
     std::array<std::uint32_t, 32> slotInterpolation {};
@@ -300,7 +298,7 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
         }
         const bool vertexInput = slotPerVertex[pixel->InputSlot(input)];
         AddInput(info, StageInputKind::Parameter, input, 4, "in_param_" + std::to_string(input), vertexInput);
-        if (vertexInput && interpolated[input] && !IsPixelParameterFlat(*pixel, input)) {
+        if (vertexInput && interpolated[input] && !flat(input)) {
             (linear(input) ? noPerspective : smooth) = true;
         }
     }

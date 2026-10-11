@@ -26,6 +26,7 @@
 #include <array>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -41,6 +42,11 @@
 #include <type_traits>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 extern "C" std::terminate_handler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(std::terminate_handler handler);
 
@@ -3434,6 +3440,45 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     return words;
 }
 
+template<typename TAction>
+std::string capturedStderr(const TAction& action) {
+    std::fflush(stderr);
+    auto* file = std::tmpfile();
+    Require(file != nullptr, "cannot open a temporary file for stderr");
+#ifdef _WIN32
+    const auto saved = _dup(_fileno(stderr));
+    _dup2(_fileno(file), _fileno(stderr));
+#else
+    const auto saved = dup(fileno(stderr));
+    dup2(fileno(file), fileno(stderr));
+#endif
+    const auto restore = [&] {
+        std::fflush(stderr);
+#ifdef _WIN32
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+#else
+        dup2(saved, fileno(stderr));
+        close(saved);
+#endif
+    };
+    try {
+        action();
+    } catch (...) {
+        restore();
+        std::fclose(file);
+        throw;
+    }
+    restore();
+    std::rewind(file);
+    std::string text;
+    char buffer[4096];
+    for (std::size_t bytes = 0; (bytes = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, bytes);
+    std::fclose(file);
+    std::fwrite(text.data(), 1, text.size(), stderr);
+    return text;
+}
+
 void barycentricEmulationTests() {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::Graphics;
@@ -3445,7 +3490,7 @@ void barycentricEmulationTests() {
     for (std::uint32_t location = 0; location < 11u; ++location) crowded.push_back({location, location, false, true});
     expectFailure([&] { static_cast<void>(LayoutBarycentricEmulation(crowded, {true, false, false})); }, "exceed 32 locations");
 
-    const auto compile = [&](std::span<const std::uint32_t> code, bool barycentric, std::uint32_t secondInput = 0xffffffffu) {
+    const auto compile = [&](std::span<const std::uint32_t> code, bool barycentric, std::uint32_t secondInput = 0xffffffffu, std::uint64_t address = 0x30000u) {
         auto queue = makeState();
         queue.context[0x1b3] = 0x2u;
         queue.context[0x1b4] = 0x2u;
@@ -3453,7 +3498,7 @@ void barycentricEmulationTests() {
         queue.context[0x191] = 0u;
         if (secondInput != 0xffffffffu) queue.context[0x192] = secondInput;
         RecompileRequest request{};
-        request.shader = {ShaderStage::Fragment, 0x30000u, code, 0, {}};
+        request.shader = {ShaderStage::Fragment, address, code, 0, {}};
         request.context.waveSize = 64;
         request.context.pixel = DecodePixelStageInfo(queue.context, IdentityExports);
         request.target.vulkanVersion = 0x00401000u;
@@ -3507,6 +3552,31 @@ void barycentricEmulationTests() {
     static constexpr std::array<std::uint32_t, 6> sharedSlot{0xc8080000u, 0xc8090001u, 0xc80e0402u, 0xf800180fu, 0x03030202u, 0xbf810000u};
     const auto shared = compile(sharedSlot, false, 0x400u);
     Require(shared.barycentricEmulation.active && !barycentricCapability(shared), "inputs sharing a slot with different interpolation did not emulate per-vertex parameters");
+    const auto sharedVertexZero = compile(sharedSlot, false, 0x0u);
+    Require(sharedVertexZero.barycentricEmulation.active && !barycentricCapability(sharedVertexZero), "an input read only as P0 that shares a slot with an interpolated input did not emulate per-vertex parameters");
+    static constexpr std::array<std::uint32_t, 4> readsVertexZero{0xc80a0002u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    const auto vertexZero = compile(readsVertexZero, false);
+    Require(!vertexZero.barycentricEmulation.active && vertexZero.fragmentParameters.size() == 1u && vertexZero.fragmentParameters[0].flat && !vertexZero.fragmentParameters[0].perVertex, "an input read only as P0 did not become a flat input");
+    Require(!decorations(vertexZero, spv::DecorationFlat).empty() && decorations(vertexZero, spv::DecorationPerVertexKHR).empty() && !barycentricCapability(vertexZero), "an input read only as P0 was not declared Flat");
+    const auto nativeVertexZero = compile(readsVertexZero, true);
+    Require(!nativeVertexZero.barycentricEmulation.active && nativeVertexZero.fragmentParameters.size() == 1u && !nativeVertexZero.fragmentParameters[0].flat && nativeVertexZero.fragmentParameters[0].perVertex && !decorations(nativeVertexZero, spv::DecorationPerVertexKHR).empty() && barycentricCapability(nativeVertexZero), "a device with the extension stopped reading P0 per vertex");
+    static constexpr std::array<std::uint32_t, 6> interpolatesAndReadsVertexZero{0xc8080000u, 0xc8090001u, 0xc80e0102u, 0xf800180fu, 0x03020302u, 0xbf810000u};
+    Require(compile(interpolatesAndReadsVertexZero, false).barycentricEmulation.active, "an input read as P0 and through v_interp_p1/p2 lost exact barycentrics");
+    static constexpr std::array<std::uint32_t, 7> copiesIj{0x7e0c0300u, 0x7e0e0301u, 0xc8080006u, 0xc8090007u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    static constexpr std::array<std::uint32_t, 10> copiesIjInWholeQuads{0xbe80047eu, 0xbefe0a7eu, 0x7e0c0300u, 0x7e0e0301u, 0xc8080006u, 0xc8090007u, 0x87fe007eu, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    for (const auto& code : {std::span<const std::uint32_t>(copiesIj), std::span<const std::uint32_t>(copiesIjInWholeQuads)}) {
+        const auto copied = compile(code, false);
+        Require(!copied.barycentricEmulation.active && !barycentricCapability(copied), "I/J copied under the EXEC of v_interp_p2_f32 lost host interpolation");
+    }
+    static constexpr std::array<std::uint32_t, 8> copiesIUnderOtherExec{0x7e0c0300u, 0xbefe0481u, 0xc8080006u, 0xc8090001u, 0xbefe04c1u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    Require(compile(copiesIUnderOtherExec, false).barycentricEmulation.active, "I copied under another EXEC than its v_interp_p2_f32 lost exact barycentrics");
+    const auto logged = capturedStderr([&] {
+        for (int repeat = 0; repeat < 2; ++repeat) static_cast<void>(compile(readsVertex, false, 0xffffffffu, 0x7b30000u));
+    });
+    const std::string emulationLine = "[recompile] pixel shader 0x7b30000 emulates barycentrics: v_interp_mov_f32 p10 attr0.x (block pc 0x0..";
+    const auto reported = logged.find(emulationLine);
+    Require(reported != std::string::npos && logged.find(emulationLine, reported + 1) == std::string::npos, "the recompiler did not report a P10 read once as the reason for emulating barycentrics");
+    Require(logged.find("reads a difference of two vertex values of input 0, which host interpolation does not provide (SPI_PS_INPUT_CNTL_0=0x0)\n", reported) != std::string::npos, "the reason for emulating barycentrics did not name the P10 read of input 0");
     fragment = compile(readsVertex, false);
     Require(fragment.barycentricEmulation.active && !fragment.barycentricEmulation.smooth && fragment.fragmentParameters.size() == 1u && fragment.fragmentParameters[0].perVertex, "v_interp_mov of P10 did not emulate per-vertex parameters");
     Require(decorations(fragment, spv::DecorationLocation) == std::vector<std::uint32_t>{0u} && decorations(fragment, spv::DecorationPerVertexKHR).empty() && !decorations(fragment, spv::DecorationFlat).empty() && !barycentricCapability(fragment), "the emulated per-vertex parameter was not a flat array at the first free location");

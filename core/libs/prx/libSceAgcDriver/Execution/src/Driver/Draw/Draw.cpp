@@ -4,7 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -259,8 +262,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     if (graphics.rectList) buildRectList();
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active) {
-        require(!graphics.rectList && graphics.stages.path == Graphics::ShaderPath::Vertex && programs.size() == 2 && programResults[0] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric needs a vertex shader before it");
-        results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits()));
+        const auto described = [&] {
+            static constexpr const char* paths[] = {"vertex", "geometry", "tessellation", "tessellation and geometry"};
+            char text[320];
+            std::snprintf(text, sizeof(text), " (pixel shader 0x%llx, first shader 0x%llx, %s path, %zu stages, topology %d, %s, color target 0x%llx, %s provoking vertex)", static_cast<unsigned long long>(programs.back().binary.codeAddress), static_cast<unsigned long long>(programs.front().binary.codeAddress), graphics.stages.mesh ? "mesh" : paths[static_cast<std::size_t>(graphics.stages.path)], programs.size(), static_cast<int>(graphics.topology), graphics.rectList ? "rect list" : "not a rect list", static_cast<unsigned long long>(graphics.hasColorTarget ? graphics.color.address : 0u), graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? "last" : "first");
+            return std::string(text);
+        };
+        if (graphics.rectList || graphics.stages.path != Graphics::ShaderPath::Vertex || programs.size() != 2 || programResults[0] == nullptr || stages.size() != 2) {
+            throw std::runtime_error("AGC driver: a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric needs a vertex shader before it" + described());
+        }
+        try {
+            results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits()));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(error.what() + described());
+        }
         stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});
     }
     std::vector<Graphics::GuestMemorySnapshot> snapshots;

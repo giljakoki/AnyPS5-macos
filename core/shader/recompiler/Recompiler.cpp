@@ -18,6 +18,7 @@
 #include <new>
 #include <shared_mutex>
 #include <unordered_map>
+#include <utility>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -111,6 +112,14 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
     if (!request.context.compute.has_value()) return 0u;
     const auto bytes = static_cast<std::uint64_t>(request.context.compute->ldsSizeDwords) * 4u;
     return bytes + 4u > request.target.maxWorkgroupSharedMemoryBytes ? static_cast<std::uint32_t>(bytes) : 0u;
+}
+
+void ReportBarycentricEmulation(std::uint64_t address, const std::string& reason) {
+    static std::mutex mutex;
+    static std::set<std::pair<std::uint64_t, std::string>> reported;
+    const std::lock_guard lock(mutex);
+    if (!reported.emplace(address, reason).second) return;
+    std::fprintf(stderr, "[recompile] pixel shader 0x%llx emulates barycentrics: %s\n", static_cast<unsigned long long>(address), reason.c_str());
 }
 
 }
@@ -225,7 +234,9 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         }
     };
     simplify();
-    if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel)) {
+    std::string hostInterpolation;
+    if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel, hostInterpolation)) {
+        ReportBarycentricEmulation(request.shader.codeAddress, hostInterpolation);
         translateOptions.fragmentShaderBarycentricEnabled = true;
         program = translator.Translate(decoded, cfg, translateOptions);
         program.Metadata().barycentricEmulation = true;

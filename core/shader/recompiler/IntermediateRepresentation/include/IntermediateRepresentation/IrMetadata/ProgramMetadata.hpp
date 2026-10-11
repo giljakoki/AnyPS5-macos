@@ -19,6 +19,8 @@ struct IrProgramMetadata {
     std::vector<ExportInfo> exportInfo;
     std::uint32_t pixelLinearInputs = 0;
     std::uint32_t pixelPerspectiveInputs = 0;
+    std::uint32_t pixelVertexZeroReads = 0;
+    std::uint32_t pixelOtherReads = 0;
     bool barycentricEmulation = false;
     bool invalidatesCaches = false;
     std::vector<IrValue*> dynamicReads;

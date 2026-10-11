@@ -79,6 +79,8 @@ DOOM's release ships `eboot.bin` and `sce_module/libc.prx` as fake-signed SELF c
 
 The first commercial titles tried stop at their first draws on features MoltenVK lacks or the driver does not implement yet: 4x multisampled render targets, pixel shaders that need barycentrics without geometry shaders, and a viewport depth range outside [0, 1] without `VK_EXT_depth_range_unrestricted`.
 
+The driver does not use fragment shader barycentrics on MoltenVK, whose translation to Metal rejects per-vertex inputs, so pixel shaders interpolate through Metal's own interpolation. That covers `v_interp_p1_f32`/`v_interp_p2_f32` of an I/J pair that is unchanged or copied under the EXEC of the `v_interp_p2_f32`, and inputs read only as P0 through `v_interp_mov_f32`, which read the provoking vertex. Other patterns, such as P10/P20 reads, an input read both as P0 and interpolated, or arithmetic on the I/J VGPRs, need a geometry stage that Metal does not have: the draw stops with `geometry shaders are unavailable`, or with `needs a vertex shader before it` for rect-list, mesh and tessellation draws. The log then contains a `[recompile] pixel shader 0x… emulates barycentrics:` line that names the instruction, and the error names the draw's shaders, topology and colour target; include both when reporting the title.
+
 The bundle's launcher passes its own environment to the title, so a runtime variable from [USAGE.md](USAGE.md#runtime-layout), such as [`APS5_MSAA_SINGLE_SAMPLE=1`](USAGE.md#multisampled-render-targets) for titles that stop on multisampled render targets, is set when the bundle is started while the title is not running:
 
 ```sh

@@ -33,6 +33,11 @@ ExportTargetKind exportTargetKindFromTarget(std::uint32_t target, std::uint32_t&
     return ExportTargetKind::Unknown;
 }
 
+void recordPixelRead(IrProgramMetadata& metadata, std::uint32_t input, bool vertexZero) {
+    if (input >= 32u) return;
+    (vertexZero ? metadata.pixelVertexZeroReads : metadata.pixelOtherReads) |= 1u << input;
+}
+
 }
 
 void TranslateAttributeInstruction(IrBuilder& builder, const RdnaInstruction& instruction, const TranslateOptions& options) {
@@ -54,6 +59,7 @@ ExportFlags TranslationContext::addExportInfo(const RdnaInstruction& inst) {
 
 void TranslationContext::vInterpP1F32(const RdnaInstruction& inst) {
     if (!fragmentShaderBarycentricEnabled) {
+        recordPixelRead(program.Metadata(), inst.source1.value, false);
         writeOperand(inst.destination, &ir.Emit(IrOpcode::InterpolateHostP1, IrType::F32, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value), readOperand(inst.source0, IrType::F32)}));
         return;
     }
@@ -72,6 +78,7 @@ void TranslationContext::vInterpP2F32(const RdnaInstruction& inst) {
         writeOperand(inst.destination, &result);
         return;
     }
+    recordPixelRead(program.Metadata(), inst.source1.value, false);
     if (pixelInput != nullptr && inst.source0.kind == RdnaOperandKind::VectorRegister && inst.source1.value < 32u) {
         const auto readsPair = [&](PixelInput input) {
             const auto base = pixelInput->psInputVgpr[static_cast<std::size_t>(input)];
@@ -93,6 +100,7 @@ void TranslationContext::vInterpMovF32(const RdnaInstruction& inst) {
     if (inst.source0.value >= 3u) {
         throw std::runtime_error("v_interp_mov_f32 mode is reserved");
     }
+    if (!fragmentShaderBarycentricEnabled) recordPixelRead(program.Metadata(), inst.source1.value, inst.source0.value == 2u);
     IrValue& value = ir.Emit(IrOpcode::GetInterpolationParameter, IrType::U32, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value), &ir.Constant(inst.source0.value)});
     writeOperand(inst.destination, &value);
 }

@@ -17,7 +17,6 @@ namespace ShaderRecompiler
 {
     namespace {
 
-        constexpr std::uint32_t PsInputFlatShade = 0x00000400u;
         constexpr std::uint32_t PixelParameterLimit = 32u;
 
         bool IsVertexLikeStage(const SpirvEmitterState& state) {
@@ -38,8 +37,9 @@ namespace ShaderRecompiler
             return info.InputIsCustom(input);
         }
 
-        bool PixelInputIsFlat(const ShaderPixelInputInfo& info, std::uint32_t input) {
-            return input < info.inputNum && input < PixelParameterLimit && (info.interpolatorSettings[input] & PsInputFlatShade) != 0u && !PixelInputIsCustom(info, input);
+        bool PixelInputIsFlat(const IrProgram& program, const ShaderPixelInputInfo& info, std::uint32_t input) {
+            const auto& metadata = program.Metadata();
+            return info.InputIsFlat(input, metadata.pixelVertexZeroReads, metadata.pixelOtherReads);
         }
 
     }
@@ -52,7 +52,7 @@ namespace ShaderRecompiler
             if (input.kind != StageInputKind::Parameter) continue;
             const auto location = PixelInputLocation(pixel, input.location);
             if (std::any_of(result.begin(), result.end(), [&](const auto& parameter) { return parameter.location == location; })) continue;
-            result.push_back({location, location, PixelInputIsFlat(pixel, input.location), input.perVertex, PixelInputIsCustom(pixel, input.location)});
+            result.push_back({location, location, PixelInputIsFlat(program, pixel, input.location), input.perVertex, PixelInputIsCustom(pixel, input.location)});
         }
         return result;
     }
@@ -65,7 +65,7 @@ namespace ShaderRecompiler
     }
 
     bool PixelParameterIsFlat(const SpirvEmitterState& state, std::uint32_t attr) {
-        return StageOf(state) == IrShaderStage::Pixel && PixelInputIsFlat(PixelInfo(state), attr);
+        return StageOf(state) == IrShaderStage::Pixel && PixelInputIsFlat(state.program, PixelInfo(state), attr);
     }
 
     bool PixelParameterIsCustom(const SpirvEmitterState& state, std::uint32_t attr) {
