@@ -36,9 +36,6 @@ jobs:
           brew install llvm lld
           echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
           echo "ANYPS5_LLVM_BIN=$(brew --prefix llvm)/bin" >> "$GITHUB_ENV"
-          # lldb reports failing tests; without debugger permission it waits for an authorization prompt.
-          sudo DevToolsSecurity -enable || true
-          sudo dseditgroup -o edit -a "$(id -un)" -t user _developer || true
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: macos-x86_64
@@ -70,11 +67,13 @@ jobs:
           exit 1
       # No Vulkan loader is installed yet, so the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
       - name: Test
+        timeout-minutes: 40
         run: |
+          touch "$RUNNER_TEMP/tests-started"
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
             --output-log ctest.log --output-junit ctest.xml -E 'agc_driver_lds_atomics64|flip|display' && exit 0
           echo "===== failed tests, run again one at a time ====="
-          bash .github/scripts/diagnose_failed_tests.sh build || true
+          bash .github/scripts/diagnose_failed_tests.sh build "$RUNNER_TEMP/tests-started" || true
           exit 1
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
