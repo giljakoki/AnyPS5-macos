@@ -24,13 +24,17 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - name: Install Rosetta and Ninja
+      - name: Install Rosetta, Ninja and the guest toolchain
         run: |
           if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
             sudo softwareupdate --install-rosetta --agree-to-license
           fi
           /usr/bin/arch -x86_64 /usr/bin/true
           command -v ninja >/dev/null || brew install ninja
+          # LLVM and lld build the guest test programs and the Breakout demo (relinker/tests/macos/guesttools.py).
+          brew install llvm lld
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          echo "ANYPS5_LLVM_BIN=$(brew --prefix llvm)/bin" >> "$GITHUB_ENV"
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: macos-x86_64
@@ -44,25 +48,9 @@ jobs:
       - name: Build
         run: cmake --build build -- -k 0
       - name: Build the system libraries
+        id: libs
         run: cmake --build build --target libs -- -k 0
-      - name: Package
-        run: |
-          set -euo pipefail
-          out=dist/anyps5-macos-x86_64
-          mkdir -p "$out/libs" "$out/docs"
-          cp build/core/relinker/relinker "$out/"
-          cp build/core/libs/libs/*.prx "$out/libs/"
-          cp tools/package_macos_app.py "$out/"
-          cp docs/user/MACOS.md docs/user/USAGE.md docs/user/INPUT_MAPPING.md docs/user/COMPATIBILITY.md "$out/docs/"
-          git rev-parse HEAD > "$out/COMMIT"
-          file "$out/relinker" "$out/libs/libkernel.prx"
-          tar -czf dist/anyps5-macos-x86_64.tar.gz -C dist anyps5-macos-x86_64
-      - uses: actions/upload-artifact@v7
-        with:
-          name: anyps5-macos-x86_64
-          path: dist/anyps5-macos-x86_64.tar.gz
-          retention-days: 30
-      # Without a Vulkan loader the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
+      # No Vulkan loader is installed yet, so the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
       - name: Test
         run: >-
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3
@@ -75,6 +63,91 @@ jobs:
           [ -f ctest.log ] || exit 0
           awk '/Test +#[0-9]+: / && $NF == "sec" { for (i = 1; i <= NF; i++) if ($i ~ /^#[0-9]+:$/) name = $(i + 1); t = $(NF - 1) + 0; if (t > max[name]) max[name] = t }
             END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on macOS\n", name, max[name] }' ctest.log
+      # The Vulkan loader and MoltenVK for the package and the demo; installed after the tests so they keep skipping the GPU.
+      - name: Install the Vulkan SDK
+        id: vulkan
+        if: ${{ !cancelled() && steps.libs.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/vulkan"
+          mkdir -p "$work"
+          if curl -fsSL -o "$work/sdk.zip" https://sdk.lunarg.com/sdk/download/latest/mac/vulkan_sdk.zip; then
+            unzip -q "$work/sdk.zip" -d "$work/unpacked"
+            source="$work/unpacked"
+          else
+            curl -fsSL -o "$work/sdk.dmg" https://sdk.lunarg.com/sdk/download/latest/mac/vulkan_sdk.dmg
+            hdiutil attach -nobrowse -readonly -mountpoint "$work/mount" "$work/sdk.dmg"
+            source="$work/mount"
+          fi
+          app=$(find "$source" -maxdepth 2 -name '*.app' -type d | head -n 1)
+          installer=$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -u+x | head -n 1)
+          sudo "$installer" --root "$work/sdk" --accept-licenses --default-answer --confirm-command install
+          moltenvk=$(find "$work/sdk" -path '*/macOS/lib/libMoltenVK.dylib' | head -n 1)
+          sdk=$(cd "$(dirname "$moltenvk")/.." && pwd)
+          ls -l "$sdk/lib/libvulkan.1.dylib" "$sdk/share/vulkan/icd.d/MoltenVK_icd.json"
+          for library in "$sdk/lib/libvulkan.1.dylib" "$moltenvk"; do
+            lipo -archs "$library"
+            lipo -archs "$library" | grep -qw x86_64
+          done
+          echo "dir=$sdk" >> "$GITHUB_OUTPUT"
+      - name: Package
+        if: ${{ !cancelled() && steps.libs.outcome == 'success' }}
+        env:
+          VULKAN_SDK_DIR: ${{ steps.vulkan.outputs.dir }}
+        run: |
+          set -euo pipefail
+          out=dist/anyps5-macos-x86_64
+          mkdir -p "$out/libs" "$out/docs"
+          cp build/core/relinker/relinker "$out/"
+          cp build/core/libs/libs/*.prx "$out/libs/"
+          cp tools/package_macos_app.py "$out/"
+          cp docs/user/MACOS.md docs/user/USAGE.md docs/user/INPUT_MAPPING.md docs/user/COMPATIBILITY.md "$out/docs/"
+          if [ -n "$VULKAN_SDK_DIR" ]; then
+            mkdir -p "$out/vulkan/lib" "$out/vulkan/share/vulkan/icd.d" "$out/vulkan/licenses"
+            cp -L "$VULKAN_SDK_DIR/lib/libvulkan.1.dylib" "$VULKAN_SDK_DIR/lib/libMoltenVK.dylib" "$out/vulkan/lib/"
+            cp "$VULKAN_SDK_DIR/share/vulkan/icd.d/MoltenVK_icd.json" "$out/vulkan/share/vulkan/icd.d/"
+            find "$(dirname "$VULKAN_SDK_DIR")" -maxdepth 3 -iname '*licen[cs]e*' -type f -exec cp {} "$out/vulkan/licenses/" \; || true
+            printf '%s\n' "libvulkan.1.dylib (Khronos Vulkan-Loader) and libMoltenVK.dylib (KhronosGroup/MoltenVK) from the LunarG Vulkan SDK, both under the Apache License 2.0." > "$out/vulkan/README.txt"
+          fi
+          git rev-parse HEAD > "$out/COMMIT"
+          file "$out/relinker" "$out/libs/libkernel.prx"
+          tar -czf dist/anyps5-macos-x86_64.tar.gz -C dist anyps5-macos-x86_64
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.libs.outcome == 'success' }}
+        with:
+          name: anyps5-macos-x86_64
+          path: dist/anyps5-macos-x86_64.tar.gz
+          retention-days: 30
+      # Breakout (relinker/tests/macos/breakout.cpp) is a small homebrew title: relinked and packaged like a game.
+      - name: Build the Breakout demo
+        id: demo
+        if: ${{ !cancelled() && steps.vulkan.outputs.dir != '' }}
+        continue-on-error: true
+        env:
+          VULKAN_SDK_DIR: ${{ steps.vulkan.outputs.dir }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/breakout"
+          mkdir -p "$work/source" "$work/input" "$work/relinked"
+          python3 - "$work/source" <<'EOF'
+          import pathlib, sys
+          here = pathlib.Path("core/relinker/relinker/tests/macos").resolve()
+          sys.path[:0] = [str(here), str(here.parent)]
+          import run_macos_fixtures
+          run_macos_fixtures.compiled_breakout(pathlib.Path(sys.argv[1]))
+          EOF
+          cp "$work/source/eboot.elf" "$work/input/"
+          build/core/relinker/relinker --macos --to-rosetta --skip-sce-module "$work/input/eboot.elf" "$work/relinked/eboot"
+          python3 tools/package_macos_app.py --relinked "$work/relinked" --game "$work/source/app0" --libs build/core/libs/libs \
+            --vulkan "$VULKAN_SDK_DIR" --input-config "$work/source/anyps5-input.ini" "dist/AnyPS5 Breakout.app"
+          ditto -c -k --keepParent "dist/AnyPS5 Breakout.app" dist/anyps5-breakout-demo.zip
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.demo.outcome == 'success' }}
+        with:
+          name: anyps5-breakout-demo
+          path: dist/anyps5-breakout-demo.zip
+          retention-days: 30
 
   report:
     needs: build
