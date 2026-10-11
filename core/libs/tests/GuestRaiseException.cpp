@@ -1,4 +1,5 @@
 #include "SceTypes.hpp"
+#include "prx/libc/include/general/AsmMacros.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -104,8 +105,8 @@ static_assert(offsetof(SpinState, r12) == 8 && offsetof(SpinState, xmm8) == 16 &
 
 extern "C" void APS5_VABI RaiseTestSpinUntilR12(SpinState* state);
 asm(".text\n"
-    ".globl RaiseTestSpinUntilR12\n"
-    "RaiseTestSpinUntilR12:\n"
+    ".globl " APS5_ASM_SYMBOL("RaiseTestSpinUntilR12") "\n"
+    APS5_ASM_SYMBOL("RaiseTestSpinUntilR12") ":\n"
     "    pushq %r12\n"
     "    pushq %r13\n"
     "    subq $8, %rsp\n"
