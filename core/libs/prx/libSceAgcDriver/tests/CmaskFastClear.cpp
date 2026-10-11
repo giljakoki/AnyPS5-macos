@@ -264,9 +264,25 @@ void resolve(AgcDriver::VulkanDevice& device) {
     Require(std::all_of(Keys.begin(), Keys.begin() + static_cast<std::ptrdiff_t>(keys), [](std::uint8_t key) { return key == 0xffu; }), "a CB resolve left the destination's DCC keys compressed");
 }
 
+void refusedResolve(AgcDriver::VulkanDevice& device) {
+    const auto source = multisampled();
+    auto destination = resolveDestination();
+    destination.format = VK_FORMAT_R32_UINT;
+    prepareUniform(source, 0xcc);
+    fillDestination(destination);
+    try {
+        metadataPass(device, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()).find("as an image copy was refused (shape)") != std::string::npos, std::string("a CB resolve between storage formats was refused without its reason: ") + error.what());
+        return;
+    }
+    throw std::runtime_error("a CB resolve between storage formats was not refused");
+}
+
 void multisampleTests(AgcDriver::VulkanDevice& device) {
     multisampledCmask(device);
     resolve(device);
+    refusedResolve(device);
 }
 
 int main(int argc, char** argv) {

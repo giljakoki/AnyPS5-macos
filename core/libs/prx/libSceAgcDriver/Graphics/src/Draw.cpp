@@ -2507,7 +2507,7 @@ void resolveColorTarget(const Context& context, const ColorMetadataPass& pass) {
     Require(from != nullptr && to != nullptr, what + " needs resident images of both targets (tiled targets with the GPU detiler)");
     if (materializeCmaskClear(context, source, from)) from->MarkDirty();
     const char* refusal = nullptr;
-    Require(to->CopyFrom(*from, refusal, true), what + " as an image copy was refused (" + (refusal != nullptr ? refusal : "unknown") + ")");
+    if (!to->CopyFrom(*from, refusal, true)) Require(false, what + " as an image copy was refused (" + (refusal != nullptr ? refusal : "unknown") + ")");
 }
 
 }
