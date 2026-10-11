@@ -235,6 +235,13 @@ void multisampledCmask(AgcDriver::VulkanDevice& device) {
     throw std::runtime_error("a partly fast-cleared 4x CMASK did not throw");
 }
 
+void requireKeysUncompressed(AgcDriver::VulkanDevice& device, const ColorTarget& color, const std::string& what) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    device.WaitIdle();
+    const auto keys = AgcDriver::Graphics::DccKeyBytes(color.bytes);
+    Require(std::all_of(Keys.begin(), Keys.begin() + static_cast<std::ptrdiff_t>(keys), [](std::uint8_t key) { return key == 0xffu; }), what + " left the destination's DCC keys compressed");
+}
+
 void resolve(AgcDriver::VulkanDevice& device) {
     const auto source = multisampled();
     auto destination = resolveDestination();
@@ -259,9 +266,22 @@ void resolve(AgcDriver::VulkanDevice& device) {
     }
     draw(device, source, {{0, 0}, {Width, 4}});
     metadataPass(device, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+    requireKeysUncompressed(device, destination, "a CB resolve into a DCC target with cleared keys, before its flush,");
     expect(device, destination, [](std::uint32_t, std::uint32_t y) { return y < 4 ? Drawn : Stale; }, "CB resolve into a DCC target with cleared keys", std::nullopt);
-    const auto keys = AgcDriver::Graphics::DccKeyBytes(destination.bytes);
-    Require(std::all_of(Keys.begin(), Keys.begin() + static_cast<std::ptrdiff_t>(keys), [](std::uint8_t key) { return key == 0xffu; }), "a CB resolve left the destination's DCC keys compressed");
+    requireKeysUncompressed(device, destination, "a CB resolve into a DCC target with cleared keys");
+    prepareUniform(source, 0xcc);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const auto keys = AgcDriver::Graphics::DccKeyBytes(destination.bytes);
+        const std::vector<std::byte> clear(keys, std::byte{0x00});
+        AgcDriver::GuestMemory::Write(destination.dccAddress, clear);
+        Require(StorageTexture::NoteKeysFill(destination.dccAddress, keys, 0x00) != 0, "the DCC fast clear did not reach the resolve destination's image");
+    }
+    draw(device, source, {{0, 0}, {Width, 6}});
+    metadataPass(device, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+    requireKeysUncompressed(device, destination, "a CB resolve into a DCC fast-cleared target, before its flush,");
+    expect(device, destination, [](std::uint32_t, std::uint32_t y) { return y < 6 ? Drawn : Stale; }, "CB resolve into a DCC fast-cleared target", std::nullopt);
+    requireKeysUncompressed(device, destination, "a CB resolve into a DCC fast-cleared target");
 }
 
 void refusedResolve(AgcDriver::VulkanDevice& device) {
