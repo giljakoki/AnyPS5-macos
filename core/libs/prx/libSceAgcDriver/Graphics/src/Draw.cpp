@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -84,6 +85,17 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     surface.dccAddress = color.dccAddress;
     surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
     surface.dccPipeAligned = color.dccPipeAligned;
+    return surface;
+}
+
+GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color) {
+    Require(color.arrayLastSlice != 0, "the color target is not a view of a 2D array");
+    auto surface = SurfaceForTarget(color);
+    surface.baseAddress = color.arrayAddress;
+    surface.width = color.surfaceExtent.width;
+    surface.height = color.surfaceExtent.height;
+    surface.depthOrLastArray = color.arrayLastSlice;
+    surface.dimension = TextureDimension::k2DArray;
     return surface;
 }
 
@@ -258,7 +270,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
     }
     std::vector<std::byte> mask(bytes);
     GuestMemory::Read(address, mask, CmaskLayout::Alignment);
-    if (color.samples > 1u) return multisampleCmask(color, mask);
+    if (color.guestSamples > 1u) return multisampleCmask(color, mask);
     const auto uniform = [&](std::byte value) { return std::all_of(mask.begin(), mask.end(), [&](std::byte entry) { return entry == value; }); };
     if (uniform(std::byte{0xff})) return CmaskState::Expanded;
     if (uniform(std::byte{0})) return CmaskState::Cleared;
@@ -317,7 +329,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
     if (cmaskProved(color.cmaskAddress, bytes)) return false;
     auto* recorder = Recorder::Active();
-    if (color.samples == 1u && resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
+    if (color.guestSamples == 1u && resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
         const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
         const auto view = import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
         if (view != VK_NULL_HANDLE) {
@@ -340,7 +352,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
         storeCmaskClearTexels(color, layout, state == CmaskState::Cleared ? nullptr : &cleared, texel);
         if (resident != nullptr) resident->Refresh();
     }
-    const std::vector<std::byte> expanded(bytes, static_cast<std::byte>(color.samples > 1u ? 0xccu : 0xffu));
+    const std::vector<std::byte> expanded(bytes, static_cast<std::byte>(color.guestSamples > 1u ? 0xccu : 0xffu));
     GuestMemory::Write(color.cmaskAddress, expanded, CmaskLayout::Alignment);
     proveCmask(color.cmaskAddress, bytes, GuestMemory::CollectWrites(color.cmaskAddress, bytes));
     return filled;
@@ -1045,7 +1057,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
-    if (state.rectList) Require(draw.indexCount % 3 == 0, "incomplete rect-list primitive");
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
@@ -1710,7 +1721,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             if (args->countIndirect) reads.emplace_back(args->countAddress, args->countAddress + 4);
         }
         auto images = resources.StorageImages();
-        for (const auto& target : record.targets) images.emplace_back(target->Image(), true);
+        for (const auto& target : record.targets) {
+            if (target != nullptr) images.emplace_back(target->Image(), true);
+        }
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
@@ -1875,6 +1888,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         std::vector<std::byte> original;
         TileMipLayout mip{};
         std::unique_ptr<RenderTarget> target;
+        bool multisampled = false;
         // APS5_DUMP_TARGETS: the rendered linear pixels, read back for target_<address>_<n>.raw.
         std::unique_ptr<Buffer> dump;
     };
@@ -1887,8 +1901,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
-        if (color.samples > 1u) reportMultisampleTarget(color.address, "color target", color.samples);
+        if (color.guestSamples > color.samples) reportMultisampleTarget(color.address, "color target", color.guestSamples);
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+        if (color.samples > 1) {
+            binding.multisampled = true;
+            timer.phase(PhaseSetup);
+            targetViews.push_back(MultisampleTargetView(context, color));
+            timer.phase(PhaseReadTarget);
+            continue;
+        }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1903,6 +1924,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                if (color.arrayLastSlice != 0) {
+                    Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
+                    const auto array = ArraySurfaceForTarget(color);
+                    Require(color.surfaceAddress == color.arrayAddress + color.arraySlice * DescribeSurface(array).layerBytes, "the array image's layer pitch differs from the color view's slice offset");
+                    auto resident = CachedStorageSurface(context, array);
+                    Require(resident->Attachable(), "storage format cannot be a color attachment");
+                    return resident;
+                }
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
@@ -1912,12 +1941,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice));
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
         Require(!color.mipTail, "rendering into a packed mip tail needs the resident image of its surface");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
+        Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
         if (binding.gpuTiling) {
             binding.mip = ColorTargetMip(color, colorLayout);
             binding.tiled = std::make_unique<Buffer>(context, colorLayout.Bytes(), copies);
@@ -1950,12 +1980,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
-    if (state.depth && state.depth->samples > 1u) reportMultisampleTarget(state.depth->address != 0 ? state.depth->address : state.depth->stencilAddress, "depth target", state.depth->samples);
+    if (state.depth && state.depth->guestSamples > state.depth->samples) reportMultisampleTarget(state.depth->address != 0 ? state.depth->address : state.depth->stencilAddress, "depth target", state.depth->guestSamples);
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
-    const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
+    const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
     auto& resources = resolved.resources;
     const auto& contentKey = resolved.contentKey;
@@ -2066,6 +2096,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // transitions of every target and one pass per draw, as before.
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     const bool lean = recorded && !drawTransitions;
+    const bool multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
+    Require(lean || !multisampled, "multisampled draws are only rendered as recorded draws");
     if (!lean && !resolved.moved.empty()) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
@@ -2086,8 +2118,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
     owners.reserve(targets.size());
-    for (const auto& binding : targets) owners.push_back(binding.resident);
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent);
+    std::vector<std::uint8_t> persistent;
+    persistent.reserve(targets.size());
+    for (const auto& binding : targets) {
+        owners.push_back(binding.resident);
+        persistent.push_back(binding.multisampled ? 1u : 0u);
+    }
+    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2111,7 +2148,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty()) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2498,7 +2535,6 @@ std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, con
 }
 
 void resolveColorTarget(const Context& context, const ColorMetadataPass& pass) {
-    Require(pass.source.has_value() && pass.targets.size() == 1, "CB resolve without its source and destination");
     const auto& source = *pass.source;
     const auto& destination = pass.targets.front();
     const auto what = "CB resolve " + hexAddress(source.address) + " -> " + hexAddress(destination.address);
@@ -2514,7 +2550,16 @@ void resolveColorTarget(const Context& context, const ColorMetadataPass& pass) {
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
     if (pass.mode == ColorMetadataPass::Mode::Resolve) {
-        resolveColorTarget(context, pass);
+        Require(pass.source.has_value() && pass.targets.size() == 1, "CB resolve without its source and destination");
+        if (pass.source->samples == 1u) {
+            resolveColorTarget(context, pass);
+            return;
+        }
+        const auto& destination = pass.targets.front();
+        Require(destination.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr, "CB resolve into a target without a resident image is not implemented");
+        const auto resident = CachedStorageSurface(context, SurfaceForTarget(destination));
+        Require(resident->Attachable(), "storage format cannot be a color attachment");
+        ResolveMultisampleTarget(context, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip));
         return;
     }
     for (const auto& color : pass.targets) {

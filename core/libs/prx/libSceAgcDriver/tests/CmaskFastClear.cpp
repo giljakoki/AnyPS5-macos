@@ -177,7 +177,7 @@ void invalidCode(AgcDriver::VulkanDevice& device) {
 
 ColorTarget multisampled() {
     auto color = target(ColorTileMode::RenderTarget);
-    color.samples = 4;
+    color.guestSamples = 4;
     return color;
 }
 

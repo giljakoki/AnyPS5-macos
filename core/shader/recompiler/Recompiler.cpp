@@ -173,6 +173,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
     translateOptions.sharedMemoryBytes = DeviceMemoryLdsBytes(request);
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
+    const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
+    translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
 

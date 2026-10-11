@@ -333,7 +333,9 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        std::vector<std::uint8_t> pages((end - begin) / _page, static_cast<std::uint8_t>(Written | Fresh));
+        std::vector<std::uint8_t> pages((end - begin) / _page, Written | Fresh);
+        std::vector<bool> queried(pages.size(), false);
+        const Lock lock(_lock);
         for (auto cursor = begin; cursor < end;) {
             mach_vm_address_t address = cursor;
             mach_vm_size_t size = 0;
@@ -344,12 +346,18 @@ public:
             const auto first = std::max<std::uintptr_t>(cursor, address);
             const auto last = std::min<std::uintptr_t>(end, address + size);
             const std::uint8_t protection = ((info.protection & VM_PROT_READ) ? PROT_READ : 0) | ((info.protection & VM_PROT_WRITE) ? PROT_WRITE : 0) | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
-            for (auto page = first; page < last; page += _page) pages[(page - begin) / _page] = Written | Fresh | protection;
+            for (auto page = first; page < last; page += _page) {
+                pages[(page - begin) / _page] = Written | Fresh | protection;
+                queried[(page - begin) / _page] = true;
+            }
             cursor = last;
         }
-        const Lock lock(_lock);
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            if ((state & Protected) != 0) pages[(page - begin) / _page] = static_cast<std::uint8_t>(Written | Fresh | (state & ProtectionMask));
+            auto& entry = pages[(page - begin) / _page];
+            const std::uint8_t recorded = state & ProtectionMask;
+            const bool armed = (state & Protected) != 0 && (entry & ProtectionMask) == (recorded & ~PROT_WRITE);
+            if (armed || !queried[(page - begin) / _page]) entry = static_cast<std::uint8_t>(Written | Fresh | recorded);
+            else state = static_cast<std::uint8_t>(state & ~Protected);
         });
         erase(begin, end);
         _ranges.emplace(begin, Range{end, std::move(pages)});
@@ -369,7 +377,9 @@ public:
         return covers(begin, end);
     }
 
-    bool Collect(std::uintptr_t begin, std::uintptr_t end, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context, int mode = 0) {
+    enum class Take { All, Armed, Fresh };
+
+    bool Collect(std::uintptr_t begin, std::uintptr_t end, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context, Take take = Take::All) {
         if (!_available) return false;
         begin = pageStart(begin);
         end = pageEnd(end);
@@ -377,14 +387,17 @@ public:
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
         {
             const Lock lock(_lock);
-            if (!covers(begin, end)) return false;
+            if (take != Take::Fresh && !covers(begin, end)) return false;
             forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-                if ((state & Written) == 0 || (mode == 1 && (state & Fresh) != 0) || (mode == 2 && (state & Fresh) == 0)) return;
+                if ((state & Written) == 0) return;
+                const bool fresh = (state & Fresh) != 0;
+                if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) return;
+                state &= static_cast<std::uint8_t>(~Fresh);
                 if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
                 else runs.emplace_back(page, page + _page);
                 for (const auto& [first, last] : _hostWrites)
                     if (page >= first && page < last) return;
-                state &= static_cast<std::uint8_t>(~(Written | Fresh));
+                state &= static_cast<std::uint8_t>(~Written);
                 if ((state & PROT_WRITE) != 0) state |= Protected;
             });
             for (const auto& [first, last] : runs) protect(first, last);
@@ -399,7 +412,7 @@ public:
         if (!_available || end <= begin) return;
         const Lock lock(_lock);
         forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
-            state = static_cast<std::uint8_t>((state & Fresh) | Written | (protection & ProtectionMask));
+            state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
         });
     }
 
@@ -505,7 +518,7 @@ private:
         if (page >= it->second.end) return false;
         auto& state = it->second.pages[(page - it->first) / _page];
         if ((state & Protected) != 0) {
-            state = static_cast<std::uint8_t>((state & ProtectionMask) | Written);
+            state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
             ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
             return true;
         }
@@ -702,7 +715,7 @@ bool GuestWriteWatchCollectFresh_nid_postfix(std::uintptr_t address, std::size_t
     return Watch::Get().CollectFresh(address, address + bytes, written, context);
 #elif defined(__APPLE__)
     if (bytes == 0 || address + bytes < address) return false;
-    return Watch::Get().Collect(address, address + bytes, written, context, 2);
+    return Watch::Get().Collect(address, address + bytes, written, context, Watch::Take::Fresh);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
@@ -718,7 +731,7 @@ bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t
     return Watch::Get().CollectArmed(address, address + bytes, written, context);
 #elif defined(__APPLE__)
     if (bytes == 0 || address + bytes < address) return false;
-    return Watch::Get().Collect(address, address + bytes, written, context, 1);
+    return Watch::Get().Collect(address, address + bytes, written, context, Watch::Take::Armed);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

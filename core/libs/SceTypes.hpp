@@ -95,6 +95,14 @@ struct KernelAioRwRequest {
     std::int32_t fd;
 };
 
+struct KernelAioSchedulingParam {
+    std::int32_t schedulingWindowSize;
+    std::int32_t delayedCountLimit;
+    std::uint32_t enableSplit;
+    std::uint32_t splitSize;
+    std::uint32_t splitChunkSize;
+};
+
 struct KernelBatchMapEntry {
     void* start;
     std::uint64_t offset;
@@ -1253,7 +1261,7 @@ union NetCtlInfo { std::uint8_t opaque[256]; };
 
 using NetCtlCallback = void (*)(int, void*);
 
-struct HttpEpoll {};
+struct HttpEpoll;
 using HttpEpollHandle = HttpEpoll*;
 using HttpsCallback = int (*)(int, unsigned int, void* const*, int, void*);
 using HttpRedirectCallback = int (*)(int, std::int32_t, std::int32_t*, const char*, void*);

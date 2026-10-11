@@ -365,7 +365,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         }
     } else if (options.stage == ShaderStageKind::Vertex) {
         if (options.userDataBaseRegister >= 8u) {
-            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(options.waveSize | (options.waveSize << 8u)));
+            const std::uint32_t lanes = options.waveSize == 64u && options.inputInfo.vertex->hostSubgroupSize == 32u ? 32u : options.waveSize;
+            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(lanes | (lanes << 8u)));
         }
         entryIr.SetVectorReg(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
@@ -396,6 +397,32 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
 
     IrProgram program;
     program.SetWaveSize(options.waveSize);
+    std::uint32_t windowBase = NumVectorRegs;
+    for (const auto& cfgBlock : cfg.blocks) {
+        for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
+            const auto& instruction = decoded.instructions[index];
+            if (isCodeTableLoad(cfg, instruction.programCounter)) continue;
+            switch (instruction.op) {
+                case RdnaOpcode::VMovrelsB32:
+                    windowBase = std::min(windowBase, instruction.source0.reg);
+                    break;
+                case RdnaOpcode::VMovreldB32:
+                    windowBase = std::min(windowBase, instruction.destination.reg);
+                    break;
+                case RdnaOpcode::VMovrelsdB32:
+                case RdnaOpcode::VMovrelsd2B32:
+                case RdnaOpcode::VSwaprelB32:
+                    windowBase = std::min({windowBase, instruction.source0.reg, instruction.destination.reg});
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    if (windowBase < vectorLimit) {
+        program.Metadata().vectorWindowBase = windowBase;
+        program.Metadata().vectorWindowSize = vectorLimit - windowBase;
+    }
     program.Resources().stage = toIrShaderStage(options.stage);
     program.Resources().shaderHash = options.shaderHash;
     program.Resources().userDataBase = options.userDataBaseRegister;
@@ -461,6 +488,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
         context.SetFloatMode(options.floatMode);
+        context.SetNativeFloat16(options.nativeFloat16);
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {

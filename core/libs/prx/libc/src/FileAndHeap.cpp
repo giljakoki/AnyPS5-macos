@@ -13,6 +13,7 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 
 struct GuestFileMode {
@@ -83,7 +84,15 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
     const auto parsed = ParseFileMode(mode);
     if (!parsed) { errno = 22; return nullptr; }
     try {
-        const std::filesystem::path path = *filename ? ResolvePath_nid_no_patch(filename) : std::filesystem::path{};
+        std::filesystem::path path;
+        if (*filename) {
+            if (const int error = ResolvePathError_nid_no_patch(filename, path)) {
+                stream->Close();
+                if (stream->IsDynamic()) delete stream;
+                errno = error;
+                return nullptr;
+            }
+        }
         if (stream->Reopen(path, parsed->native.c_str())) {
             if (!path.empty() && parsed->writes) RecordWrittenPath_nid_no_patch(path);
             return stream;
@@ -103,7 +112,8 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
         errno = EINVAL;
         return nullptr;
     }
-    const std::filesystem::path fpath = ResolvePath_nid_no_patch(filename);
+    std::filesystem::path fpath;
+    if (const int error = ResolvePathError_nid_no_patch(filename, fpath)) { errno = error; return nullptr; }
     const auto abs_path = fpath.string();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(OpenNative(fpath, parsed->native), std::fclose);
     if (!handle) {
