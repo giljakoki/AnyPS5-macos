@@ -39,24 +39,37 @@ jobs:
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: macos-x86_64
-          save: ${{ github.event_name == 'push' }}
+          save: true
           evict-old-files: job
       - name: Configure
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-      # -k 0 keeps going after a failure, so one run reports every file that does not build.
+      # -k 0 keeps going after a failure, so one run reports every file that does not build; on a failure the
+      # diagnostics are repeated at the end of the log, where a long build would otherwise bury them.
       - name: Build
-        run: cmake --build build -- -k 0
+        run: |
+          set -o pipefail
+          cmake --build build -- -k 0 2>&1 | tee build.log && exit 0
+          echo "===== build errors ====="
+          grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' build.log | grep -v -E '^\[[0-9]+/[0-9]+\] ' | head -n 2000
+          exit 1
       - name: Build the system libraries
         id: libs
-        run: cmake --build build --target libs -- -k 0
+        run: |
+          set -o pipefail
+          cmake --build build --target libs -- -k 0 2>&1 | tee libs.log && exit 0
+          echo "===== build errors ====="
+          grep -E -A8 'error:|FAILED:|Undefined symbols|duplicate symbol|^ld: ' libs.log | grep -v -E '^\[[0-9]+/[0-9]+\] ' | head -n 2000
+          exit 1
       # No Vulkan loader is installed yet, so the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
       - name: Test
-        run: >-
-          ctest --test-dir build --output-on-failure --timeout 120 --parallel 3
-          --output-log ctest.log --output-junit ctest.xml
-          -E 'agc_driver_lds_atomics64|flip|display'
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
+            --output-log ctest.log --output-junit ctest.xml -E 'agc_driver_lds_atomics64|flip|display' && exit 0
+          echo "===== failed tests, run again one at a time ====="
+          ctest --test-dir build --rerun-failed --output-on-failure --timeout 120 || true
+          exit 1
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
         shell: bash
