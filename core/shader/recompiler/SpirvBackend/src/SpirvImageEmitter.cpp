@@ -1036,6 +1036,9 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     }
     const auto value = ctx.Arg(access.inst, 2);
     ctx.Define(access.inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
+        // The invocation's earlier image stores come first: Vulkan orders them by program order,
+        // Metal only after a texture fence, so an atomic read back the value from before the store.
+        state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsImageMemoryMask));
         const auto pointer = state.module.AllocateId();
         const auto pointerType = TypePointer(state, spv::StorageClassImage, TypeU32(state));
         state.module.AddFunction(spv::OpImageTexelPointer, pointerType, pointer, StorageImageDescriptorPointer(state, access.mem.resource), CoordU32(ctx, access), ImageSampleIndex(ctx, access));
@@ -1343,7 +1346,8 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
         constexpr std::array<spv::Op, 6> operations{spv::OpFOrdLessThan, spv::OpFOrdEqual, spv::OpFOrdLessThanEqual, spv::OpFOrdGreaterThan, spv::OpFOrdNotEqual, spv::OpFOrdGreaterThanEqual};
         auto result = Select(state, f32, equal(parameter(0u), 7u), one, zero);
         for (std::uint32_t index = 0; index < operations.size(); ++index) {
-            const auto compared = Select(state, f32, Binary(state, operations[index], TypeBool(state), reference, red), one, zero);
+            const auto test = operations[index] == spv::OpFOrdNotEqual ? EmitFPOrdNotEqual32(state, reference, red) : Binary(state, operations[index], TypeBool(state), reference, red);
+            const auto compared = Select(state, f32, test, one, zero);
             result = Select(state, f32, equal(parameter(0u), index + 1u), compared, result);
         }
         return result;

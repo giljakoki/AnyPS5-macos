@@ -124,7 +124,11 @@ struct PthreadPrivate {
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
     int cpuClockThread = 0;
 #ifndef _WIN32
+#ifdef __APPLE__
+    unsigned hostMachThread = 0;
+#else
     clockid_t hostCpuClock{};
+#endif
     bool hostCpuClockBound = false;
 #endif
     std::mutex nameLock;

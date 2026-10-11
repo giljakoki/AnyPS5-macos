@@ -1,0 +1,91 @@
+# macOS on Apple silicon
+
+This fork is [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5) with the macOS runtime port from [mugurc/AnyPS5 `macos-port`](https://github.com/mugurc/AnyPS5/tree/macos-port) merged in, kept current with both by [Sync upstream](../../.github/workflows/sync-upstream.yml).
+
+## How it runs
+
+The relinker converts the title to an x86-64 Mach-O executable. The system libraries are built as x86-64 Mach-O libraries. Apple silicon (M1 to M5) runs both through Rosetta 2; GPU work goes through Vulkan and MoltenVK to Metal. Nothing is native arm64.
+
+## Requirements
+
+- An Apple silicon Mac. Prebuilt packages from CI need macOS 15 or newer.
+- Rosetta 2: `softwareupdate --install-rosetta --agree-to-license`.
+- For a source build: the [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#mac) for macOS. Its loader and MoltenVK are universal binaries. Homebrew's `vulkan-loader` and `molten-vk` are arm64 only and cannot be loaded by an x86-64 process. The prebuilt package already contains both.
+- To build: Xcode command-line tools (`xcode-select --install`), CMake 3.22.1 or newer, Ninja and Python 3 (`brew install cmake ninja python`).
+
+## Getting the binaries
+
+### Prebuilt
+
+Every push to `main` runs the [macOS workflow](../../.github/workflows/macos.yml). Open Actions > macOS > the latest successful run and download, under Artifacts:
+
+- `anyps5-macos-x86_64`: `relinker`, `libs/*.prx`, `vulkan/` (the Vulkan loader and MoltenVK), `package_macos_app.py` and these documents.
+- `anyps5-breakout-demo`: `AnyPS5 Breakout.app`, a small homebrew title converted and packaged by the same tools.
+
+GitHub wraps each artifact in a zip, which Safari may unpack by itself. Unpack the package and clear the download quarantine, without which macOS refuses to start the unsigned programs:
+
+```sh
+cd ~/Downloads
+unzip anyps5-macos-x86_64.zip
+tar -xzf anyps5-macos-x86_64.tar.gz
+xattr -dr com.apple.quarantine anyps5-macos-x86_64
+```
+
+### From source
+
+```sh
+git clone --recursive https://github.com/giljakoki/AnyPS5-macos
+cd AnyPS5-macos
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+cmake --build build --target libs --parallel
+```
+
+The full build selects x86-64 itself; do not set `CMAKE_OSX_ARCHITECTURES`. The relinker is `build/core/relinker/relinker` and the libraries are in `build/core/libs/libs`. See [BUILD.md](../dev/BUILD.md) for the other options.
+
+## Testing without a game
+
+Unpack `anyps5-breakout-demo.zip`, then double-click the `AnyPS5-Breakout.zip` inside it (Archive Utility keeps the bundle's links and permissions), and start the application:
+
+```sh
+cd ~/Downloads
+xattr -dr com.apple.quarantine "AnyPS5 Breakout.app"
+open "AnyPS5 Breakout.app"
+```
+
+A window with a Breakout game opens and plays a tone when the ball bounces. Left and Right move the paddle, Space (Cross) launches the ball and Escape (Options) quits; a controller works too. Without input the paddle plays by itself after three seconds. The demo goes through the relinker, Rosetta, the prx libraries, video out on Vulkan and MoltenVK, pad and audio out, as a title does. Its output is in `~/Library/Logs/AnyPS5/APS5TEST1.log`.
+
+## Converting and running a title
+
+The input is the same as on Linux and Windows: a decrypted ELF executable with its bundled modules, see [USAGE.md](USAGE.md#input-and-conversion).
+
+```sh
+relinker --macos --to-rosetta source/eboot.elf out/eboot
+python3 package_macos_app.py --relinked out --game source --libs libs --vulkan ~/VulkanSDK/<version>/macOS Title.app
+open Title.app
+```
+
+With the prebuilt package, run these commands inside `anyps5-macos-x86_64` and pass `--vulkan vulkan`. From a source build, the packager is `tools/package_macos_app.py`, `--libs` is `build/core/libs/libs` and `--vulkan` is the SDK's `macOS` directory. `--to-rosetta` lowers instructions Rosetta does not run (RDSEED, CLWB, RDPID); titles for Apple silicon always need it.
+
+The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, and starts without the SDK. The title runs in `~/Library/Application Support/AnyPS5/<title id>`, where its saves are written. Shaders are cached in `~/Library/Caches/<bundle id>`; the first start of a title compiles them and is slower. Output goes to `~/Library/Logs/AnyPS5/<title id>.log`. [Input mapping](INPUT_MAPPING.md) applies unchanged; pass `--input-config anyps5-input.ini` to the packager to put a mapping file in the bundle.
+
+## Limitations
+
+- Metal has no 64-bit floats and no 64-bit atomics, and MoltenVK has no `VK_KHR_shader_clock`. Shaders that need them fail; the affected tests are listed in [technical debt](../dev/TechnicalDebt.md).
+- An f16 multiply that should give -0.0 gives +0.0 under SPIRV-Cross; see [technical debt](../dev/TechnicalDebt.md).
+- `sceKernelGetModuleInfoFromAddr`, `sceKernelGetModuleList` and `sceKernelGetModuleInfo` are not implemented on macOS.
+- Every guest module keeps its own TLS block; initial-exec TLS access across modules fails the relink.
+- Everything runs translated by Rosetta. Apple has said that Rosetta stays generally available through macOS 27 and is then cut back to a subset for older games; macOS 26.4 and newer show a notice when a Rosetta app starts. A native arm64 path does not exist yet (upstream pull request [#1835](https://github.com/boykopovar/AnyPS5/pull/1835) is an experimental start).
+- Run the GPU tests one at a time with a timeout and without the flip and display tests, as [BUILD.md](../dev/BUILD.md) describes: a wedged GPU can stop WindowServer and restart the Mac.
+
+## Keeping the fork current
+
+- `main` is upstream `main` plus the macOS port and the fixes needed to build upstream's newer code on macOS.
+- [Sync upstream](../../.github/workflows/sync-upstream.yml) merges upstream `main` and `macos-port` every 6 hours and starts the macOS build. A conflict, or a push GitHub refuses, opens an issue labeled `upstream-sync`.
+- GitHub does not let the workflow's built-in token push changes to workflow files, which upstream makes often. Create a fine-grained personal access token for this repository with Contents and Workflows read and write access, and save it as the `SYNC_TOKEN` repository secret. Without it, such updates wait for **Sync fork** on the repository page.
+- A failing macOS build on `main` opens an issue labeled `macos-build`; the next passing build closes it.
+- Upstream maintenance workflows (labels, pull request intake, progress pages, conventions) run only in boykopovar/AnyPS5. `build.yml` runs here as upstream configured it.
+
+## Credits
+
+The macOS port is the work of mugurc and the contributors to the `macos-port` branch; AnyPS5 is the work of its upstream contributors. Licensed under the GNU General Public License version 2 only, as the project.

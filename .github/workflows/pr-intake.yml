@@ -12,6 +12,7 @@ concurrency:
 
 jobs:
   intake:
+    if: github.repository == 'boykopovar/AnyPS5'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

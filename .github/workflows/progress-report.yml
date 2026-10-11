@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   report:
+    if: github.repository == 'boykopovar/AnyPS5'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

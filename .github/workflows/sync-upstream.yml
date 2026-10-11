@@ -1,0 +1,120 @@
+name: Sync upstream
+
+# Merges boykopovar/AnyPS5 main and mugurc's macos-port branch into this fork's default branch,
+# then starts the macOS build. A merge that conflicts, or a push GitHub refuses, is reported in
+# an issue labeled "upstream-sync" instead; the issue is closed by the next clean sync.
+#
+# GITHUB_TOKEN cannot push commits that change .github/workflows, and upstream changes its
+# workflows often. Add a fine-grained token with Contents and Workflows write access on this
+# repository as the SYNC_TOKEN secret, or merge such updates with "Sync fork" on GitHub.
+# Set the repository variable SYNC_MACOS_PORT to false to stop following macos-port.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/boykopovar/AnyPS5.git
+  UPSTREAM_BRANCH: main
+  PORT_URL: https://github.com/mugurc/AnyPS5.git
+  PORT_BRANCH: macos-port
+
+jobs:
+  sync:
+    if: github.repository != 'boykopovar/AnyPS5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      FOLLOW_PORT: ${{ vars.SYNC_MACOS_PORT != 'false' }}
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Merge
+        id: merge
+        shell: bash
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          report=""
+          merged=""
+          merge_source() {
+            local name=$1 url=$2 branch=$3
+            if ! git fetch --no-tags "$url" "$branch"; then
+              report+=$'\n'"### $name"$'\n'"Fetching \`$branch\` from $url failed."$'\n'
+              return
+            fi
+            local head
+            head=$(git rev-parse FETCH_HEAD)
+            if git merge-base --is-ancestor "$head" HEAD; then
+              echo "$name ${head:0:12} is already merged"
+              return
+            fi
+            if git merge --no-edit -m "Merge $name ($branch) into $DEFAULT_BRANCH" FETCH_HEAD; then
+              merged+=" $name@${head:0:12}"
+            else
+              local files
+              files=$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')
+              git merge --abort
+              report+=$'\n'"### $name"$'\n'"Merging \`$branch\` at $head from $url conflicts in:"$'\n'"$files"$'\n'
+            fi
+          }
+          merge_source upstream "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          if [ "$FOLLOW_PORT" = "true" ]; then merge_source macos-port "$PORT_URL" "$PORT_BRANCH"; fi
+          pushed=false
+          if [ -n "$merged" ]; then
+            if git push origin "HEAD:$DEFAULT_BRANCH"; then
+              pushed=true
+              echo "Merged and pushed:$merged"
+            else
+              workflows=$(git diff --name-only "origin/$DEFAULT_BRANCH" HEAD -- .github/workflows | sed 's/^/- `/; s/$/`/')
+              report+=$'\n'"### Push refused"$'\n'"Merging$merged succeeded but the push was refused."
+              if [ -n "$workflows" ] && [ "$HAS_SYNC_TOKEN" != "true" ]; then
+                report+=" The merge changes workflow files, which GITHUB_TOKEN may not push:"$'\n'"$workflows"$'\n\n'"Add a SYNC_TOKEN secret (see the comment at the top of .github/workflows/sync-upstream.yml) or use **Sync fork** on the repository page."
+              fi
+              report+=$'\n'
+            fi
+          fi
+          echo "pushed=$pushed" >> "$GITHUB_OUTPUT"
+          { echo "report<<REPORT_END"; echo "$report"; echo "REPORT_END"; } >> "$GITHUB_OUTPUT"
+      # A push with SYNC_TOKEN starts it like any push; one with GITHUB_TOKEN starts nothing.
+      - name: Start the macOS build
+        if: steps.merge.outputs.pushed == 'true' && env.HAS_SYNC_TOKEN != 'true'
+        run: gh workflow run macos.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
+      - name: Report
+        shell: bash
+        env:
+          REPORT: ${{ steps.merge.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Upstream sync needs attention"
+          gh label create upstream-sync --repo "$GITHUB_REPOSITORY" --color D93F0B --description "Automatic upstream sync failed" 2>/dev/null || true
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync --state open --json number --jq '.[0].number // empty')
+          if [ -n "${REPORT//[[:space:]]/}" ]; then
+            body=$(printf '%s\n\nRun: %s\n\nResolve locally with `git fetch %s %s && git merge FETCH_HEAD`, or ask Claude to resolve it.\n' "$REPORT" "$RUN_URL" "$UPSTREAM_URL" "$UPSTREAM_BRANCH")
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label upstream-sync --body "$body"
+            fi
+            exit 1
+          elif [ -n "$issue" ]; then
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "Synced cleanly in $RUN_URL."
+          fi

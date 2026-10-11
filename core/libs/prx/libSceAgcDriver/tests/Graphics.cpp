@@ -2190,10 +2190,18 @@ void descriptorPoolResetFailureTest() {
     const VkDescriptorPoolSize size{binding.descriptorType, binding.descriptorCount};
     const auto allocation = cache.Allocate(layout, std::span(&size, 1));
     mock.descriptorResetResult = VK_ERROR_DEVICE_LOST;
-    const auto previous = _ZSt13set_terminatePFvvE_nid_postfix([] {
+    const std::terminate_handler exitOnTerminate = [] {
         std::_Exit(mock.descriptorResetResult == VK_SUCCESS ? 0 : 1);
-    });
+    };
+    const auto previous = _ZSt13set_terminatePFvvE_nid_postfix(exitOnTerminate);
+#ifdef __APPLE__
+    // Host code keeps libc++abi on macOS, so its std::terminate does not reach the guest runtime's handler.
+    const auto hostPrevious = std::set_terminate(exitOnTerminate);
+#endif
     cache.Free(allocation);
+#ifdef __APPLE__
+    std::set_terminate(hostPrevious);
+#endif
     _ZSt13set_terminatePFvvE_nid_postfix(previous);
 }
 

@@ -186,10 +186,8 @@ std::uint32_t EmitDsMaskedLaneRead(SpirvEmitterState& state, std::uint32_t sourc
         lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31u));
     }
     const auto physicalLane = EmitHostSubgroupLane(state, lane);
-    const auto shuffled = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled, ConstantU32(state, spv::ScopeSubgroup), source, physicalLane);
-    const auto sourceExec = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), sourceExec, ConstantU32(state, spv::ScopeSubgroup), exec, physicalLane);
+    const auto shuffled = EmitLaneShuffle(state, TypeU32(state), source, physicalLane);
+    const auto sourceExec = EmitLaneShuffle(state, TypeBool(state), exec, physicalLane);
     const auto sourceActive = Binary(state, spv::OpLogicalAnd, TypeBool(state), sourceExec, EmitSubgroupLaneActiveBool(state, lane));
     return Select(state, TypeU32(state), sourceActive, shuffled, ConstantU32(state, 0u));
 }
@@ -657,8 +655,12 @@ std::uint32_t EmitUGreaterThan64(SpirvEmitterState& state, std::uint32_t arg0, s
     return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThan);
 }
 
+// NaN from the bits, (bits & 0x7fffffff) > 0x7f800000, not x != x: through MoltenVK, Metal evaluated
+// x != x as false for a NaN converted from f16.
 std::uint32_t EmitFPIsNan32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitNative<spv::OpFUnordNotEqual, IrType::U1>(state, arg0, arg0);
+    const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), arg0);
+    const auto magnitude = Binary(state, spv::OpBitwiseAnd, TypeU32(state), bits, ConstantU32(state, 0x7fffffffu));
+    return Binary(state, spv::OpUGreaterThan, TypeBool(state), magnitude, ConstantU32(state, 0x7f800000u));
 }
 
 std::uint32_t EmitFPMin32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -1117,6 +1119,8 @@ std::uint32_t EmitFPUnordEqual32(SpirvEmitterState& state, std::uint32_t arg0, s
     return EmitNative<spv::OpFUnordEqual, IrType::U1>(state, arg0, arg1);
 }
 
+// Ordered not-equal as not (unordered or equal): SPIRV-Cross writes OpFOrdNotEqual as MSL's !=, which
+// is true when an operand is NaN, but translates OpFUnordEqual with isunordered.
 std::uint32_t EmitFPOrdNotEqual32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
     const auto ordered = [&](std::uint32_t value) {
         const auto magnitude = EmitNative<spv::OpBitwiseAnd, IrType::U32>(state, EmitNative<spv::OpBitcast, IrType::U32>(state, value), ConstantU32(state, 0x7fffffffu));

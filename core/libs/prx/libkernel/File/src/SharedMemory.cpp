@@ -15,6 +15,11 @@
 #include <random>
 #else
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <unistd.h>
+#include <filesystem>
+#endif
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
@@ -67,6 +72,13 @@ int CreateAnonymousFile() {
     }
     errno = EEXIST;
     return -1;
+#elif defined(__APPLE__)
+    auto path = (std::filesystem::temp_directory_path() / "anyps5-shm-XXXXXX").string();
+    const int descriptor = mkstemp(path.data());
+    if (descriptor < 0) return -1;
+    unlink(path.c_str());
+    fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    return descriptor;
 #else
     return memfd_create("anyps5 shm_open", MFD_CLOEXEC);
 #endif
