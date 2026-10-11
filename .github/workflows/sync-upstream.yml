@@ -2,7 +2,8 @@ name: Sync upstream
 
 # Merges boykopovar/AnyPS5 main and mugurc's macos-port branch into this fork's default branch,
 # then starts the macOS build. A merge that conflicts, or a push GitHub refuses, is reported in
-# an issue labeled "upstream-sync" instead; the issue is closed by the next clean sync.
+# an issue labeled "upstream-sync" instead, or in the run's summary when issues are turned off;
+# the issue is closed by the next clean sync.
 #
 # GITHUB_TOKEN cannot push commits that change .github/workflows, and upstream changes its
 # workflows often. Add a fine-grained token with Contents and Workflows write access on this
@@ -35,14 +36,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      # A scheduled run's event carries no repository; it runs on the default branch.
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
       FOLLOW_PORT: ${{ vars.SYNC_MACOS_PORT != 'false' }}
       HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN || github.token }}
       - name: Merge
@@ -105,6 +107,12 @@ jobs:
         run: |
           set -euo pipefail
           title="Upstream sync needs attention"
+          # With issues turned off on the repository, the report goes to the run's summary.
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != true ]; then
+            [ -n "${REPORT//[[:space:]]/}" ] || exit 0
+            printf '## %s\n\n%s\n' "$title" "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           gh label create upstream-sync --repo "$GITHUB_REPOSITORY" --color D93F0B --description "Automatic upstream sync failed" 2>/dev/null || true
           issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync --state open --json number --jq '.[0].number // empty')
           if [ -n "${REPORT//[[:space:]]/}" ]; then

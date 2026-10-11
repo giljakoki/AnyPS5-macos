@@ -191,6 +191,8 @@ jobs:
       - name: Open or close the macos-build issue
         run: |
           set -euo pipefail
+          # With issues turned off on the repository, the failed build job is the report.
+          [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" = true ] || exit 0
           gh label create macos-build --repo "$GITHUB_REPOSITORY" --color B60205 --description "The macOS build or tests fail on the default branch" 2>/dev/null || true
           issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label macos-build --state open --json number --jq '.[0].number // empty')
           if [ "$RESULT" = "success" ]; then
