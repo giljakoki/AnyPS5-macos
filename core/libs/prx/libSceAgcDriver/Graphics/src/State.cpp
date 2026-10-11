@@ -178,7 +178,7 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
     auto fixed = compare == 0 || compare == 7 ? 0u : face.compareMask;
     const auto convert = [&](std::uint32_t op) {
         if (face.writeMask == 0) return VK_STENCIL_OP_KEEP;
-        char detail[96];
+        char detail[128];
         switch (op) {
             case 0: return VK_STENCIL_OP_KEEP;
             case 1: return VK_STENCIL_OP_ZERO;
