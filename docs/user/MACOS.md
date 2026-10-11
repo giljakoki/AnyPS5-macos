@@ -10,21 +10,26 @@ The relinker converts the title to an x86-64 Mach-O executable. The system libra
 
 - An Apple silicon Mac. Prebuilt packages from CI need macOS 15 or newer.
 - Rosetta 2: `softwareupdate --install-rosetta --agree-to-license`.
-- The [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#mac) for macOS. Its loader and MoltenVK are universal binaries. Homebrew's `vulkan-loader` and `molten-vk` are arm64 only and cannot be loaded by an x86-64 process.
+- For a source build: the [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#mac) for macOS. Its loader and MoltenVK are universal binaries. Homebrew's `vulkan-loader` and `molten-vk` are arm64 only and cannot be loaded by an x86-64 process. The prebuilt package already contains both.
 - To build: Xcode command-line tools (`xcode-select --install`), CMake 3.22.1 or newer, Ninja and Python 3 (`brew install cmake ninja python`).
 
 ## Getting the binaries
 
 ### Prebuilt
 
-Every push to `main` runs the [macOS workflow](../../.github/workflows/macos.yml). Open Actions > macOS > the latest successful run and download `anyps5-macos-x86_64`. It holds `relinker`, `libs/*.prx`, `package_macos_app.py` and these documents.
+Every push to `main` runs the [macOS workflow](../../.github/workflows/macos.yml). Open Actions > macOS > the latest successful run and download, under Artifacts:
+
+- `anyps5-macos-x86_64`: `relinker`, `libs/*.prx`, `vulkan/` (the Vulkan loader and MoltenVK), `package_macos_app.py` and these documents.
+- `anyps5-breakout-demo`: `AnyPS5 Breakout.app`, a small homebrew title converted and packaged by the same tools.
+
+GitHub wraps each artifact in a zip, which Safari may unpack by itself. Unpack the package and clear the download quarantine, without which macOS refuses to start the unsigned programs:
 
 ```sh
+cd ~/Downloads
+unzip anyps5-macos-x86_64.zip
 tar -xzf anyps5-macos-x86_64.tar.gz
 xattr -dr com.apple.quarantine anyps5-macos-x86_64
 ```
-
-The second command removes the download quarantine; without it macOS refuses to start the unsigned `relinker`.
 
 ### From source
 
@@ -38,6 +43,18 @@ cmake --build build --target libs --parallel
 
 The full build selects x86-64 itself; do not set `CMAKE_OSX_ARCHITECTURES`. The relinker is `build/core/relinker/relinker` and the libraries are in `build/core/libs/libs`. See [BUILD.md](../dev/BUILD.md) for the other options.
 
+## Testing without a game
+
+Unpack `anyps5-breakout-demo.zip`, then double-click the `AnyPS5-Breakout.zip` inside it (Archive Utility keeps the bundle's links and permissions), and start the application:
+
+```sh
+cd ~/Downloads
+xattr -dr com.apple.quarantine "AnyPS5 Breakout.app"
+open "AnyPS5 Breakout.app"
+```
+
+A window with a Breakout game opens and plays a tone when the ball bounces. Left and Right move the paddle, Space (Cross) launches the ball and Escape (Options) quits; a controller works too. Without input the paddle plays by itself after three seconds. The demo goes through the relinker, Rosetta, the prx libraries, video out on Vulkan and MoltenVK, pad and audio out, as a title does. Its output is in `~/Library/Logs/AnyPS5/APS5TEST1.log`.
+
 ## Converting and running a title
 
 The input is the same as on Linux and Windows: a decrypted ELF executable with its bundled modules, see [USAGE.md](USAGE.md#input-and-conversion).
@@ -48,7 +65,7 @@ python3 package_macos_app.py --relinked out --game source --libs libs --vulkan ~
 open Title.app
 ```
 
-From a source build, the packager is `tools/package_macos_app.py` and `--libs` is `build/core/libs/libs`. `--to-rosetta` lowers instructions Rosetta does not run (RDSEED, CLWB, RDPID); titles for Apple silicon always need it.
+With the prebuilt package, run these commands inside `anyps5-macos-x86_64` and pass `--vulkan vulkan`. From a source build, the packager is `tools/package_macos_app.py`, `--libs` is `build/core/libs/libs` and `--vulkan` is the SDK's `macOS` directory. `--to-rosetta` lowers instructions Rosetta does not run (RDSEED, CLWB, RDPID); titles for Apple silicon always need it.
 
 The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, and starts without the SDK. The title runs in `~/Library/Application Support/AnyPS5/<title id>`, where its saves are written. Shaders are cached in `~/Library/Caches/<bundle id>`; the first start of a title compiles them and is slower. Output goes to `~/Library/Logs/AnyPS5/<title id>.log`. [Input mapping](INPUT_MAPPING.md) applies unchanged; pass `--input-config anyps5-input.ini` to the packager to put a mapping file in the bundle.
 

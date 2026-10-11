@@ -141,12 +141,12 @@ jobs:
           build/core/relinker/relinker --macos --to-rosetta --skip-sce-module "$work/input/eboot.elf" "$work/relinked/eboot"
           python3 tools/package_macos_app.py --relinked "$work/relinked" --game "$work/source/app0" --libs build/core/libs/libs \
             --vulkan "$VULKAN_SDK_DIR" --input-config "$work/source/anyps5-input.ini" "dist/AnyPS5 Breakout.app"
-          ditto -c -k --keepParent "dist/AnyPS5 Breakout.app" dist/anyps5-breakout-demo.zip
+          ditto -c -k --keepParent "dist/AnyPS5 Breakout.app" dist/AnyPS5-Breakout.zip
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() && steps.demo.outcome == 'success' }}
         with:
           name: anyps5-breakout-demo
-          path: dist/anyps5-breakout-demo.zip
+          path: dist/AnyPS5-Breakout.zip
           retention-days: 30
 
   report:
