@@ -71,7 +71,7 @@ jobs:
       - name: Test
         timeout-minutes: 40
         run: |
-          timed='^(guest_raise_exception|guest_avplayer)$'
+          timed='^(guest_raise_exception|guest_avplayer|guest_audio3d_port)$'
           failed="$RUNNER_TEMP/failed-tests.log"
           : > "$failed"
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
