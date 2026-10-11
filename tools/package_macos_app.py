@@ -68,13 +68,32 @@ def make_icon(png, resources):
 
 
 def package(relinked, game, libs, vulkan, input_config, bundle):
+    """Builds the bundle next to its destination and moves it there only when it is complete, so a failure
+    leaves no half-built application and keeps an earlier bundle of the same name."""
     executable = relinked / "eboot"
     if not executable.is_file():
         raise RuntimeError(f"No relinked executable: {executable}")
     if bundle.suffix != ".app":
         raise ValueError(f"The bundle name must end in .app: {bundle}")
+    folders = [folder for folder in (game, relinked / "app0") if folder is not None]
+    if not any((folder / "sce_sys" / "param.json").is_file() for folder in folders):
+        raise RuntimeError(f"No sce_sys/param.json in {folders[0]}: the title's id and name come from it, and the title reads it "
+                           "while it runs. Copy the complete sce_sys folder of the dump into the game folder.")
+    staging = bundle.with_name(bundle.name + ".partial")
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        result = fill(executable, relinked, game, libs, vulkan, input_config, staging)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     if bundle.exists():
         shutil.rmtree(bundle)
+    staging.rename(bundle)
+    return result
+
+
+def fill(executable, relinked, game, libs, vulkan, input_config, bundle):
     contents = bundle / "Contents"
     macos = contents / "MacOS"
     resources = contents / "Resources"
@@ -144,7 +163,10 @@ def main():
     parser.add_argument("--input-config", type=Path)
     parser.add_argument("bundle", type=Path)
     arguments = parser.parse_args()
-    name, identifier = package(arguments.relinked, arguments.game, arguments.libs, arguments.vulkan, arguments.input_config, arguments.bundle)
+    try:
+        name, identifier = package(arguments.relinked, arguments.game, arguments.libs, arguments.vulkan, arguments.input_config, arguments.bundle)
+    except (RuntimeError, ValueError) as error:
+        raise SystemExit(f"error: {error}")
     print(f"{arguments.bundle}: {name} ({identifier})")
 
 
