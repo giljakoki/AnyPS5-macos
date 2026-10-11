@@ -1,0 +1,102 @@
+name: macOS
+
+on:
+  push:
+    branches: [main, 'claude/**', 'macos/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test (x86-64 under Rosetta)
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Rosetta and Ninja
+        run: |
+          if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/true
+          command -v ninja >/dev/null || brew install ninja
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: macos-x86_64
+          save: ${{ github.event_name == 'push' }}
+          evict-old-files: job
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build
+      - name: Build the system libraries
+        run: cmake --build build --target libs
+      - name: Package
+        run: |
+          set -euo pipefail
+          out=dist/anyps5-macos-x86_64
+          mkdir -p "$out/libs" "$out/docs"
+          cp build/core/relinker/relinker "$out/"
+          cp build/core/libs/libs/*.prx "$out/libs/"
+          cp tools/package_macos_app.py "$out/"
+          cp docs/user/MACOS.md docs/user/USAGE.md docs/user/INPUT_MAPPING.md docs/user/COMPATIBILITY.md "$out/docs/"
+          git rev-parse HEAD > "$out/COMMIT"
+          file "$out/relinker" "$out/libs/libkernel.prx"
+          tar -czf dist/anyps5-macos-x86_64.tar.gz -C dist anyps5-macos-x86_64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: anyps5-macos-x86_64
+          path: dist/anyps5-macos-x86_64.tar.gz
+          retention-days: 30
+      # Without a Vulkan loader the GPU tests skip. Tests that open windows stay out, as BUILD.md asks.
+      - name: Test
+        run: >-
+          ctest --test-dir build --output-on-failure --timeout 120 --parallel 3
+          --output-log ctest.log --output-junit ctest.xml
+          -E 'agc_driver_lds_atomics64|flip|display'
+      - name: Report tests slower than 30 s
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          [ -f ctest.log ] || exit 0
+          awk '/Test +#[0-9]+: / && $NF == "sec" { for (i = 1; i <= NF; i++) if ($i ~ /^#[0-9]+:$/) name = $(i + 1); t = $(NF - 1) + 0; if (t > max[name]) max[name] = t }
+            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on macOS\n", name, max[name] }' ctest.log
+
+  report:
+    needs: build
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RESULT: ${{ needs.build.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or close the macos-build issue
+        run: |
+          set -euo pipefail
+          gh label create macos-build --repo "$GITHUB_REPOSITORY" --color B60205 --description "The macOS build or tests fail on the default branch" 2>/dev/null || true
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label macos-build --state open --json number --jq '.[0].number // empty')
+          if [ "$RESULT" = "success" ]; then
+            if [ -n "$issue" ]; then gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "Fixed: $RUN_URL passed at $GITHUB_SHA."; fi
+          elif [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "Still failing at $GITHUB_SHA: $RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label macos-build --title "macOS build fails on $GITHUB_REF_NAME" \
+              --body "The macOS build or tests failed at $GITHUB_SHA: $RUN_URL"
+          fi

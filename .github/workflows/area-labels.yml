@@ -9,6 +9,7 @@ permissions: {}
 
 jobs:
   label:
+    if: github.repository == 'boykopovar/AnyPS5'
     runs-on: ubuntu-latest
     permissions:
       contents: read

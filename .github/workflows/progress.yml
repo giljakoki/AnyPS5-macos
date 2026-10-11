@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   progress:
+    if: github.repository == 'boykopovar/AnyPS5'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
