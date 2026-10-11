@@ -4383,18 +4383,85 @@ void storeAtFlipTests() {
     for (const char* value : {"0", "", "true", "11"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1");
 }
 
+std::array<std::uint32_t, 8> multisampleDescriptor(std::uint32_t type, std::uint32_t format, std::uint32_t word6) {
+    return {0x100u, format << 20u, 0u, (type << 28u) | 0xfacu, 0u, 0u, word6, 0u};
+}
+
 void multisampleTraceTests() {
+    using AgcDriver::Graphics::MultisampleDescriptorLine;
+    using AgcDriver::Graphics::MultisampleFillLine;
+    using AgcDriver::Graphics::MultisampleStateLine;
     using AgcDriver::Graphics::MultisampleTraceRequested;
     Require(!MultisampleTraceRequested(nullptr), "an unset APS5_TRACE_MSAA traced");
     Require(MultisampleTraceRequested("1"), "APS5_TRACE_MSAA=1 did not trace");
     for (const char* value : {"0", "", "yes", "11"}) expectFailure([&] { MultisampleTraceRequested(value); }, "APS5_TRACE_MSAA=");
-    auto queue = makeState();
+    const auto plain = makeState();
+    Require(!MultisampleStateLine(plain), "a one-sample draw has a multisampling trace line");
+    auto queue = plain;
     queue.context[0x2f8] = 0x0020c002u;
     queue.context[0x31d] = (2u << 12u) | (2u << 15u);
+    auto line = MultisampleStateLine(queue);
+    Require(line && line->starts_with("[msaa] state 202=00cc0010 2f8=0020c002 292=00000002 293=00000000 "), "the trace of a 4x draw does not start with its AA registers: " + line.value_or("none"));
+    for (const char* part : {" 30e=ffffffff 30f=ffffffff 2fe=- 302=- 306=- 30a=- 8e=0000000f ", " ps=0x10000 cb0: 318=", " 31c=00028028 31d=00012000 "}) Require(line->find(part) != std::string::npos, std::string("the trace of a 4x draw lacks '") + part + "': " + *line);
+    Require(line->find(" cb1:") == std::string::npos, "the trace of a 4x draw lists a color slot without a format: " + *line);
+    queue = plain;
+    queue.context[0x31d] = 1u << 12u;
+    Require(MultisampleStateLine(queue).has_value(), "a 2x color target without PA_SC_AA_CONFIG has no trace line");
+    queue = plain;
+    queue.context[0x202] = 0xcc0020;
+    Require(MultisampleStateLine(queue).has_value(), "a CB metadata pass has no trace line");
+    queue = plain;
+    queue.context[0x010] = 8u;
+    Require(MultisampleStateLine(queue).has_value(), "a 4x depth target has no trace line");
+    queue = plain;
+    queue.context[0x202] = 0xcc0070;
+    Require(!MultisampleStateLine(queue), "CB_COLOR_CONTROL mode 7 has a trace line");
+
+    Require(MultisampleDescriptorLine(multisampleDescriptor(14, 56, 0), 0x23000) == "[msaa] texture descriptor 00000100 03800000 00000000 e0000fac 00000000 00000000 00000000 00000000 read by the shader at 0x23000", "the trace of a 2D MSAA descriptor: " + MultisampleDescriptorLine(multisampleDescriptor(14, 56, 0), 0x23000).value_or("none"));
+    Require(MultisampleDescriptorLine(multisampleDescriptor(15, 56, 0), 0) == "[msaa] texture descriptor 00000100 03800000 00000000 f0000fac 00000000 00000000 00000000 00000000", "the trace of a 2D MSAA array descriptor without its shader");
+    for (const auto format : {156u, 168u}) Require(MultisampleDescriptorLine(multisampleDescriptor(9, format, 0), 1).has_value(), "an FMASK-format descriptor has no trace line");
+    Require(MultisampleDescriptorLine(multisampleDescriptor(9, 56, 1u << 10u), 1).has_value(), "an ITERATE_256 descriptor has no trace line");
+    for (const auto format : {155u, 169u}) Require(!MultisampleDescriptorLine(multisampleDescriptor(9, format, 0), 1), "a 2D descriptor of format " + std::to_string(format) + " has a trace line");
+    Require(!MultisampleDescriptorLine(multisampleDescriptor(0, 160, 1u << 10u), 1), "a descriptor that is not an image has a trace line");
+    const auto msaa = multisampleDescriptor(14, 56, 0);
+    Require(!MultisampleDescriptorLine(std::span(msaa).first(4), 1), "a four-word descriptor has a trace line");
+
+    Require(MultisampleFillLine(0x10000, 0x1000, 0xccccccccu, "buffer fill") == "[msaa] buffer fill 0x10000+0x1000 with cccccccc", "the trace of a uniform fill");
+    Require(MultisampleFillLine(0x10000, 4u << 20u, 0, "DMA_DATA fill").has_value() && !MultisampleFillLine(0x10000, (4u << 20u) + 4u, 0, "DMA_DATA fill"), "uniform fills over 4 MiB are traced or 4 MiB ones are not");
+
+    if (AgcDriver::Graphics::TraceMultisampling()) return;
+    std::vector<std::string> log;
+    AgcDriver::Graphics::MultisampleTraceLog() = &log;
+    queue = plain;
+    queue.context[0x2f8] = 0x0020c002u;
     AgcDriver::Graphics::TraceMultisampleState(queue);
-    const std::array<std::uint32_t, 8> words{0x100u, 0, 0, 0xe0000000u, 0, 0, 0, 0};
-    AgcDriver::Graphics::TraceMultisampleDescriptor(words);
+    AgcDriver::Graphics::TraceMultisampleDescriptor(multisampleDescriptor(14, 56, 0), 0x23000);
     AgcDriver::Graphics::TraceMultisampleFill(0x10000, 0x1000, 0xccccccccu, "test fill");
+    AgcDriver::Graphics::MultisampleTraceLog() = nullptr;
+    Require(log.empty(), "the multisampling trace printed without APS5_TRACE_MSAA");
+}
+
+void multisampleTracePrintTests() {
+    using namespace AgcDriver::Graphics;
+    Require(TraceMultisampling(), "the multisampling trace print tests need APS5_TRACE_MSAA=1");
+    std::vector<std::string> log;
+    MultisampleTraceLog() = &log;
+    auto queue = makeState();
+    TraceMultisampleState(queue);
+    queue.context[0x2f8] = 0x0020c002u;
+    queue.context[0x31d] = (2u << 12u) | (2u << 15u);
+    TraceMultisampleState(queue);
+    TraceMultisampleState(queue);
+    const auto descriptor = multisampleDescriptor(14, 56, 0);
+    TraceMultisampleDescriptor(descriptor, 0x23000);
+    TraceMultisampleDescriptor(descriptor, 0x23000);
+    TraceMultisampleDescriptor(multisampleDescriptor(9, 56, 0), 0x23000);
+    TraceMultisampleFill(0x10000, 0x1000, 0xccccccccu, "buffer fill");
+    TraceMultisampleFill(0x10000, 0x1000, 0xccccccccu, "buffer fill");
+    TraceMultisampleFill(0x10000, 8u << 20u, 0, "buffer fill");
+    MultisampleTraceLog() = nullptr;
+    const std::vector<std::string> expected{*MultisampleStateLine(queue), *MultisampleDescriptorLine(descriptor, 0x23000), *MultisampleFillLine(0x10000, 0x1000, 0xccccccccu, "buffer fill")};
+    Require(log == expected, "APS5_TRACE_MSAA=1 did not print each multisampling line once (" + std::to_string(log.size()) + " lines)");
 }
 
 void nullVertexDescriptorTests() {
@@ -4527,6 +4594,11 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--msaa-trace") {
+            multisampleTracePrintTests();
+            std::cout << "Multisampling trace print tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--single-sample-msaa") {
             singleSampleMultisampleTests();
             multisampleCmaskTests();

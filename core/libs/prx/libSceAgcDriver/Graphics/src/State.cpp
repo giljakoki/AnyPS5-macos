@@ -1167,6 +1167,7 @@ void traceOnce(MultisampleTrace kind, const std::string& line) {
     auto& lines = seen[static_cast<std::size_t>(kind)];
     if (lines.size() >= MultisampleTraceLines || !lines.insert(line).second) return;
     std::fprintf(stderr, "%s\n", line.c_str());
+    if (auto* log = MultisampleTraceLog()) log->push_back(line);
     if (lines.size() == MultisampleTraceLines) std::fprintf(stderr, "[msaa] %zu distinct %s lines printed; further ones are not\n", MultisampleTraceLines, names[static_cast<std::size_t>(kind)]);
 }
 
@@ -1202,8 +1203,12 @@ bool TraceMultisampling() {
     return trace;
 }
 
-void TraceMultisampleState(const QueueState& queue) {
-    if (!TraceMultisampling()) return;
+std::vector<std::string>*& MultisampleTraceLog() {
+    static std::vector<std::string>* log = nullptr;
+    return log;
+}
+
+std::optional<std::string> MultisampleStateLine(const QueueState& queue) {
     const auto& cx = queue.context;
     const auto word = [&](std::uint32_t offset) {
         const auto it = cx.find(offset);
@@ -1217,7 +1222,7 @@ void TraceMultisampleState(const QueueState& queue) {
         slots |= 1u << slot;
         multisampledSlot = multisampledSlot || (word(0x31d + slot * 0xfu) & 0x1f000u) != 0;
     }
-    if (word(0x2f8) == 0 && (mode < 2u || mode > 6u) && !multisampledSlot && (word(0x010) & 0xcu) == 0) return;
+    if (word(0x2f8) == 0 && (mode < 2u || mode > 6u) && !multisampledSlot && (word(0x010) & 0xcu) == 0) return std::nullopt;
     std::string line = "[msaa] state";
     for (const auto offset : {0x202u, 0x2f8u, 0x292u, 0x293u, 0x201u, 0x2dcu, 0x203u, 0x30eu, 0x30fu, 0x2feu, 0x302u, 0x306u, 0x30au, 0x8eu, 0x8fu, 0x1c5u, 0x1b3u, 0x1b4u, 0x000u, 0x010u, 0x011u, 0x200u}) appendRegister(line, cx, offset);
     const auto low = queue.shader.find(0x008);
@@ -1233,21 +1238,45 @@ void TraceMultisampleState(const QueueState& queue) {
         for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du, 0x31fu, 0x321u, 0x323u, 0x324u, 0x325u}) appendRegister(line, cx, offset + slot * 0xfu);
         for (const auto offset : {0x390u, 0x398u, 0x3a0u, 0x3a8u, 0x3b0u, 0x3b8u}) appendRegister(line, cx, offset + slot);
     }
-    traceOnce(MultisampleTrace::State, line);
+    return line;
 }
 
-void TraceMultisampleDescriptor(std::span<const std::uint32_t> words) {
-    if (!TraceMultisampling() || words.size() != 8) return;
-    char text[160];
+std::optional<std::string> MultisampleDescriptorLine(std::span<const std::uint32_t> words, std::uint64_t program) {
+    if (words.size() != 8) return std::nullopt;
+    const auto type = (words[3] >> 28u) & 0xfu;
+    const auto format = (words[1] >> 20u) & 0x1ffu;
+    const bool iterate256 = ((words[6] >> 10u) & 1u) != 0;
+    if (type < 8u || (type != 14u && type != 15u && !iterate256 && (format < 156u || format > 168u))) return std::nullopt;
+    char text[192];
     std::snprintf(text, sizeof(text), "[msaa] texture descriptor %08x %08x %08x %08x %08x %08x %08x %08x", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
-    traceOnce(MultisampleTrace::Descriptor, text);
+    std::string line = text;
+    if (program != 0) {
+        std::snprintf(text, sizeof(text), " read by the shader at 0x%llx", static_cast<unsigned long long>(program));
+        line += text;
+    }
+    return line;
+}
+
+std::optional<std::string> MultisampleFillLine(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source) {
+    if (bytes > (4u << 20u)) return std::nullopt;
+    char text[160];
+    std::snprintf(text, sizeof(text), "[msaa] %s 0x%llx+0x%zx with %08x", source, static_cast<unsigned long long>(address), bytes, value);
+    return std::string(text);
+}
+
+void TraceMultisampleState(const QueueState& queue) {
+    if (!TraceMultisampling()) return;
+    if (const auto line = MultisampleStateLine(queue)) traceOnce(MultisampleTrace::State, *line);
+}
+
+void TraceMultisampleDescriptor(std::span<const std::uint32_t> words, std::uint64_t program) {
+    if (!TraceMultisampling()) return;
+    if (const auto line = MultisampleDescriptorLine(words, program)) traceOnce(MultisampleTrace::Descriptor, *line);
 }
 
 void TraceMultisampleFill(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source) {
-    if (!TraceMultisampling() || bytes > (4u << 20u)) return;
-    char text[160];
-    std::snprintf(text, sizeof(text), "[msaa] %s 0x%llx+0x%zx with %08x", source, static_cast<unsigned long long>(address), bytes, value);
-    traceOnce(MultisampleTrace::Fill, text);
+    if (!TraceMultisampling()) return;
+    if (const auto line = MultisampleFillLine(address, bytes, value, source)) traceOnce(MultisampleTrace::Fill, *line);
 }
 
 }

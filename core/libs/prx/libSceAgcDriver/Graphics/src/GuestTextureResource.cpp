@@ -1,7 +1,6 @@
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -92,7 +91,6 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     const auto dccAlphaPos = ((words[6] >> 22u) & 0x1u) != 0;
     const auto dccColorTransf = ((words[6] >> 23u) & 0x1u) != 0;
     const auto metaAddr = ((static_cast<std::uint64_t>(words[6]) >> 24u) & 0xffu) | (static_cast<std::uint64_t>(words[7]) << 8u);
-    if (typeRaw == 14u || typeRaw == 15u || msaaDepth || (format >= 156u && format <= 168u)) TraceMultisampleDescriptor(words);
 
     requireValidDstSel(dstSelX);
     requireValidDstSel(dstSelY);

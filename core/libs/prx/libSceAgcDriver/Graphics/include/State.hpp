@@ -140,8 +140,12 @@ bool SingleSampleMultisamplingRequested(const char* value);
 bool SingleSampleMultisampling();
 bool MultisampleTraceRequested(const char* value);
 bool TraceMultisampling();
+std::vector<std::string>*& MultisampleTraceLog();
+std::optional<std::string> MultisampleStateLine(const QueueState& queue);
+std::optional<std::string> MultisampleDescriptorLine(std::span<const std::uint32_t> words, std::uint64_t program);
+std::optional<std::string> MultisampleFillLine(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source);
 void TraceMultisampleState(const QueueState& queue);
-void TraceMultisampleDescriptor(std::span<const std::uint32_t> words);
+void TraceMultisampleDescriptor(std::span<const std::uint32_t> words, std::uint64_t program);
 void TraceMultisampleFill(std::uint64_t address, std::size_t bytes, std::uint32_t value, const char* source);
 
 // The recording facade of the draw decoders (design_cpu_final M8, step 8a): every register read
