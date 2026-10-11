@@ -69,11 +69,10 @@ jobs:
       - name: Test
         timeout-minutes: 40
         run: |
-          touch "$RUNNER_TEMP/tests-started"
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 3 \
             --output-log ctest.log --output-junit ctest.xml -E 'agc_driver_lds_atomics64|flip|display' && exit 0
           echo "===== failed tests, run again one at a time ====="
-          bash .github/scripts/diagnose_failed_tests.sh build "$RUNNER_TEMP/tests-started" || true
+          bash .github/scripts/diagnose_failed_tests.sh build || true
           exit 1
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
