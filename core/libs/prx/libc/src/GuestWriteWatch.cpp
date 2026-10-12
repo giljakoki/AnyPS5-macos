@@ -524,10 +524,23 @@ private:
         }
         if ((state & PROT_WRITE) != 0) {
             static std::atomic<unsigned> resumed{0};
-            if (resumed.fetch_add(1, std::memory_order_relaxed) < 4) reportFault("[write-watch] resuming a write to a page recorded writable and unprotected\n");
+            if (resumed.fetch_add(1, std::memory_order_relaxed) < 4) reportResume(address, state, it->first, it->second.end);
             return true;
         }
         return false;
+    }
+
+    static void reportResume(std::uintptr_t address, std::uint8_t state, std::uintptr_t rangeBegin, std::uintptr_t rangeEnd) {
+        mach_vm_address_t region = address;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const auto status = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        char text[256];
+        const int length = std::snprintf(text, sizeof(text), "[write-watch] resuming a write to 0x%llx: state 0x%02x, range 0x%llx..0x%llx, kernel region 0x%llx+0x%llx prot 0x%x max 0x%x status %d\n", static_cast<unsigned long long>(address), state, static_cast<unsigned long long>(rangeBegin), static_cast<unsigned long long>(rangeEnd), static_cast<unsigned long long>(region), static_cast<unsigned long long>(size), info.protection, info.max_protection, status);
+        const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+        static_cast<void>(written);
     }
 
     static void reportFault(const char* message) {
