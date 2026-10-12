@@ -151,11 +151,13 @@ Bool APS5_VABI sceAvPlayerIsActive(AvPlayerInternal* h) {
 
 int APS5_VABI sceAvPlayerJumpToTime(AvPlayerInternal* h, uint64_t time_ms) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] JumpToTime %llu", static_cast<unsigned long long>(time_ms));
     return ToPlayer(h)->JumpToTime(time_ms);
 }
 
 int APS5_VABI sceAvPlayerPause(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] Pause");
     return ToPlayer(h)->Pause();
 }
 
@@ -167,6 +169,7 @@ int APS5_VABI sceAvPlayerPostInit(AvPlayerInternal* h, const AvPlayerPostInitDat
 
 int APS5_VABI sceAvPlayerResume(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] Resume");
     return ToPlayer(h)->Resume();
 }
 
@@ -191,6 +194,7 @@ int APS5_VABI sceAvPlayerSetLogCallback(void* callback, void* user_data) {
 
 int APS5_VABI sceAvPlayerSetLooping(AvPlayerInternal* h, Bool loop) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] SetLooping %d", loop ? 1 : 0);
     return ToPlayer(h)->SetLooping(loop != 0);
 }
 

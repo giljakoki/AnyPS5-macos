@@ -115,8 +115,7 @@ private:
         const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint64_t>(size), self->size - self->position));
         const auto read = self->file.read_offset(self->file.object_ptr, buffer, self->position, length);
         if (TraceIo()) {
-            static unsigned count = 0;
-            if (++count <= 24 || read != static_cast<int>(length)) std::fprintf(stderr, "[avplayer] read offset %llu length %u -> %d (#%u)\n", static_cast<unsigned long long>(self->position), length, read, count);
+            if (++self->reads <= 6 || read != static_cast<int>(length)) std::fprintf(stderr, "[avplayer] read offset %llu length %u -> %d (#%u)\n", static_cast<unsigned long long>(self->position), length, read, self->reads);
         }
         if (read < 0) return AVERROR(EIO);
         if (read == 0) return AVERROR_EOF;
@@ -136,8 +135,7 @@ private:
         }
         const auto target = std::clamp<std::int64_t>(base + offset, 0, static_cast<std::int64_t>(self->size));
         if (TraceIo()) {
-            static unsigned count = 0;
-            if (++count <= 24) std::fprintf(stderr, "[avplayer] seek whence %d offset %lld -> %lld (#%u)\n", whence & ~AVSEEK_FORCE, static_cast<long long>(offset), static_cast<long long>(target), count);
+            if (++self->seeks <= 12) std::fprintf(stderr, "[avplayer] seek whence %d offset %lld -> %lld (#%u)\n", whence & ~AVSEEK_FORCE, static_cast<long long>(offset), static_cast<long long>(target), self->seeks);
         }
         self->position = static_cast<std::uint64_t>(target);
         return target;
@@ -147,6 +145,8 @@ private:
     bool opened = false;
     std::uint64_t size = 0;
     std::uint64_t position = 0;
+    unsigned reads = 0;
+    unsigned seeks = 0;
     AVIOContext* context = nullptr;
 };
 
