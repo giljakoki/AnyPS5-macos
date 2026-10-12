@@ -3716,6 +3716,9 @@ void barycentricEmulationTests() {
     static constexpr std::array<std::uint32_t, 10> killsThenWqm{0xbe92047eu, 0x7c080480u, 0x8a926a12u, 0xbefe0a12u, 0xc8000000u, 0xc8010001u, 0xbefe0412u, 0xf800180fu, 0x00000000u, 0xbf810000u};
     const auto killed = compile(killsThenWqm, false);
     Require(!killed.barycentricEmulation.active && !barycentricCapability(killed), "interpolating into the I VGPR under s_wqm_b64 of a narrowed EXEC and exporting under that EXEC lost host interpolation");
+    static constexpr std::array<std::uint32_t, 15> restoresExecCopy{0xbe90047eu, 0xbefe0a7eu, 0xbf071080u, 0xbf840004u, 0xbeea047eu, 0x7c3804f0u, 0x7e0402f2u, 0xbefe046au, 0xc8000000u, 0xc8010001u, 0x10000500u, 0xbefe0410u, 0xf800180fu, 0x00000000u, 0xbf810000u};
+    const auto restored = compile(restoresExecCopy, false);
+    Require(!restored.barycentricEmulation.active && !barycentricCapability(restored), "interpolating into the I VGPR after a branched v_cmpx region that restores EXEC from its copy lost host interpolation");
     static constexpr std::array<std::uint32_t, 7> widensExec{0xbefe0381u, 0xc8080000u, 0xbefe03c1u, 0xc8090001u, 0xf800180fu, 0x02020202u, 0xbf810000u};
     Require(compile(widensExec, false).barycentricEmulation.active, "v_interp_p2_f32 under a wider EXEC than its v_interp_p1_f32 lost exact barycentrics");
     static constexpr std::array<std::uint32_t, 6> sharedSlot{0xc8080000u, 0xc8090001u, 0xc80e0402u, 0xf800180fu, 0x03030202u, 0xbf810000u};
