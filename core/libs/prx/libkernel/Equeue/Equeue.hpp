@@ -72,6 +72,7 @@ public:
     int DeleteEvent(uintptr_t ident, int16_t filter);
     int GetTriggeredEvents(KernelEvent* ev, int num);
     int WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
+    std::string DescribeEvents();
     void RemoveDescriptorEvents(uintptr_t ident);
     void Close();
     static uint64_t MonotonicNs();

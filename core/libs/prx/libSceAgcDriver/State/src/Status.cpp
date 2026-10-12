@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "prx/libSceAgcDriver/State/include/Status.hpp"
 
 #include <cstdint>
@@ -16,6 +18,7 @@ bool APS5_VABI sceAgcDriverIsTraceInProgress(void) {
 }
 
 bool APS5_VABI sceAgcDriverIsSubmitValidationEnabled(void) {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s\n", __func__);
     return false;
 }
 

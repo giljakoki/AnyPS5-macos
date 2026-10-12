@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "prx/libSceAgcDriver/Resource/include/Registration.hpp"
 
 #include <cstdint>
@@ -37,6 +39,7 @@ int APS5_VABI sceAgcDriverRegisterMultipleResources(uint32_t* resourceHandle, ui
 }
 
 int APS5_VABI sceAgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s\n", __func__);
  (void)stream_id;
  (void)stream;
  return 0;

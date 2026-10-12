@@ -161,6 +161,7 @@ public:
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
         request->reserved = true;
+        if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] flip reserved index=%d arg=%lld width=%u height=%u pending=%u\n", request->index, static_cast<long long>(request->flipArg), cfg->width, cfg->height, static_cast<unsigned>(cfg->flipStatus.flipPendingNum));
         return request;
     }
 
@@ -183,6 +184,11 @@ private:
     std::shared_ptr<FlipQueue> queue;
 };
 
+}
+
+static unsigned long long TraceMillis() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
 FlipRequest::~FlipRequest() {
@@ -473,6 +479,7 @@ void VideoOutDriver::vblankEnd() {
 }
 
 void VideoOutDriver::processFlip(FlipRequest& req) {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %llu ms flip processing index=%d rate=%d width=%u height=%u ready=%d\n", TraceMillis(), req.index, req.flipRate, req.width, req.height, req.ready ? 1 : 0);
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
     {
@@ -490,6 +497,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         timing.Mark("validate");
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
+        if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %llu ms flip vblank reached index=%d\n", TraceMillis(), req.index);
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
@@ -526,6 +534,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
         }
         timing.Mark("present");
+        if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %llu ms flip presented index=%d\n", TraceMillis(), req.index);
         OnMainThread([&] { window.UpdateTitle(); });
         timing.Mark("window_title");
     }
@@ -539,6 +548,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
     require(req.cfg->flipStatus.count != std::numeric_limits<uint64_t>::max(), "flip counter overflow");
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %llu ms flip event delivered index=%d to %zu registrations\n", TraceMillis(), req.index, req.cfg->flipEvents.size());
     triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
     ++req.cfg->flipStatus.count;
     req.cfg->flipStatus.processTime = sceKernelGetProcessTime();

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -59,6 +60,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             } else if (reason == 1) {
                 wroteOnGpu = true;
             }
+            static const bool trace = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+            if (trace) std::fprintf(stderr, "[submit-trace] release_mem queue=%u int_sel=%u label=%d reason=%d deferred=%d\n", submission.queue, interruptSelect, label.has_value() ? 1 : 0, reason, interruptDeferred ? 1 : 0);
         }
     }
     if (opcode == 0x50 && packet.size() >= 7) {

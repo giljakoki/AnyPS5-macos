@@ -4,6 +4,10 @@
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <set>
 #include <chrono>
 #include <limits>
 #include <mutex>
@@ -236,6 +240,12 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
             return e.event.ident == ident && e.event.filter == filter;
         }
     );
+    static const bool trace = std::getenv("APS5_TRACE_WAITS") != nullptr;
+    if (trace) {
+        static std::atomic<unsigned> printed{0};
+        if (printed.fetch_add(1) < 200)
+            std::fprintf(stderr, "[waits] equeue \"%s\" trigger filter %d ident 0x%llx: %s\n", m_name.c_str(), static_cast<int>(filter), static_cast<unsigned long long>(ident), it == m_events.end() ? "not registered" : (it->triggered ? "already triggered" : "triggered"));
+    }
     if (it == m_events.end()) {
         return SCE_KERNEL_ERROR_ENOENT;
     }
@@ -355,6 +365,17 @@ int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq) {
     return EQUEUE_OK;
 }
 
+std::string KernelEqueuePrivate::DescribeEvents() {
+    std::lock_guard lock(m_mutex);
+    std::string text;
+    for (const auto& event : m_events) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%sfilter %d ident 0x%llx%s", text.empty() ? "" : ", ", static_cast<int>(event.event.filter), static_cast<unsigned long long>(event.event.ident), event.triggered ? " (triggered)" : "");
+        text += item;
+    }
+    return text.empty() ? std::string("none") : text;
+}
+
 int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out, const KernelUseconds* timo) {
     auto owner = EqueuePin_nid_postfix(eq);
     if (!owner) {
@@ -381,6 +402,13 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
         return SCE_KERNEL_ERROR_EBADF;
     }
     if (*out == 0) {
+        static const bool trace = std::getenv("APS5_TRACE_WAITS") != nullptr;
+        if (trace) {
+            static std::mutex mutex;
+            static std::set<std::pair<KernelEqueue, const void*>> reported;
+            std::lock_guard lock(mutex);
+            if (reported.emplace(eq, __builtin_return_address(0)).second) std::fprintf(stderr, "[waits] equeue \"%s\" at exe+0x%llx timed out after %llu us; events: %s\n", owner->GetName().c_str(), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))), static_cast<unsigned long long>(timo != nullptr ? *timo : 0), owner->DescribeEvents().c_str());
+        }
         return SCE_KERNEL_ERROR_ETIMEDOUT;
     }
     return EQUEUE_OK;

@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -123,6 +125,8 @@ void Player::controllerLoop() {
 }
 
 void Player::deliver(const Event& event) {
+    static const bool trace = std::getenv("APS5_TRACE_AVPLAYER") != nullptr;
+    if (trace) std::fprintf(stderr, "[avplayer] event id=%d warning=%d autoStart=%d error=%d state=%d\n", static_cast<int>(event.id), static_cast<int>(event.warning), event.autoStart ? 1 : 0, event.error ? 1 : 0, static_cast<int>(state));
     if (event.error) {
         std::lock_guard lock(mutex);
         if (source && state != State::Stop) {

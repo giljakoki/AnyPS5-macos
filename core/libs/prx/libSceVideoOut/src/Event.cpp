@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <mutex>
 #include <stdexcept>
@@ -188,6 +190,8 @@ int APS5_VABI sceVideoOutGetEventData(const KernelEvent* ev, int64_t* data) {
         eventData |= 0xffff000000000000ULL;
     }
     *data = static_cast<int64_t>(eventData);
+    static const bool trace = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+    if (trace) std::fprintf(stderr, "[submit-trace] %s ident=%d data=%lld\n", __func__, static_cast<int>(ev->ident), static_cast<long long>(*data));
     return 0;
 }
 

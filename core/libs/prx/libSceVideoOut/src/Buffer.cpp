@@ -176,6 +176,7 @@ int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) try {
 }
 
 int APS5_VABI sceVideoOutSubmitFlip(int handle, int index, int flipMode, int64_t flipArg) try {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] sceVideoOutSubmitFlip handle=%d index=%d mode=%d\n", handle, index, flipMode);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");

@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -10,6 +12,7 @@
 extern "C" {
 
 int APS5_VABI sceAgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s\n", __func__);
     if (queue < 0x20 || queue >= 0x58) {
         throw std::runtime_error(std::string(__func__) + ": unsupported compute queue");
     }
@@ -18,6 +21,7 @@ int APS5_VABI sceAgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 }
 
 int APS5_VABI sceAgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs, const uint32_t* sizes_in_dwords, uint32_t count) {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s\n", __func__);
     if (count == 0) return 0;
     if (queue < 0x20 || queue >= 0x58) {
         throw std::runtime_error(std::string(__func__) + ": unsupported compute queue");

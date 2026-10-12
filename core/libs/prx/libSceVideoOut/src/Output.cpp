@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -106,6 +108,7 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
     std::lock_guard lock(cfg->mutex);
     cfg->Check();
     cfg->flipRate = rate;
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s rate=%d\n", __func__, rate);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -122,6 +125,7 @@ int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) t
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     *status = cfg->flipStatus;
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s count=%llu pending=%u arg=%lld current=%d\n", __func__, static_cast<unsigned long long>(status->count), static_cast<unsigned>(status->flipPendingNum), static_cast<long long>(status->flipArg), status->currentBuffer);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -187,6 +191,7 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
 }
 
 int APS5_VABI sceVideoOutIsFlipPending(int handle) try {
+    if (std::getenv("APS5_TRACE_SUBMITS") != nullptr) std::fprintf(stderr, "[submit-trace] %s\n", __func__);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");

@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
@@ -31,6 +33,8 @@ void AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
         std::lock_guard lock(g_mutex);
         registrations = g_registrations;
     }
+    static const bool trace = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+    if (trace) std::fprintf(stderr, "[submit-trace] eop interrupt queue=%u registrations=%zu\n", queue, registrations.size());
     for (const auto& registration : registrations) {
         if (registration.id == static_cast<int>(queue)) {
             EqueueTriggerEvent_nid_postfix(registration.eq, static_cast<uintptr_t>(registration.id), EvfiltGraphicsCore, nullptr);
