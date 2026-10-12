@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/FrameHitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/HitchSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -107,6 +109,34 @@ void Driver::execute(const Submission& submission) {
     thread_local PacketProfile* packetProfileSlot = nullptr;
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
+
+    auto* hitches = submission.queue == 0 ? FrameHitches() : nullptr;
+    HitchWork hitchWork{};
+    hitchWork.serial = submission.serial;
+    auto* hitchSampler = hitches != nullptr ? HitchSampler::Get() : nullptr;
+    if (hitchSampler != nullptr) {
+        thread_local bool followed = false;
+        if (!followed) {
+            hitchSampler->Follow(SampledThread::Worker);
+            followed = true;
+        }
+    }
+    struct HitchReport {
+        FrameHitchTracker* hitches;
+        HitchSampler* sampler;
+        HitchWork& work;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        ~HitchReport() {
+            if (hitches == nullptr) return;
+            auto report = hitches->WorkFinished(work);
+            if (!report) return;
+            if (sampler != nullptr) {
+                report->pop_back();
+                *report += "; worker: " + sampler->Describe(SampledThread::Worker, started, std::chrono::steady_clock::now()) + "\n";
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("%s", report->c_str());
+        }
+    } hitchReport{hitches, hitchSampler, hitchWork};
 
     bumpEpoch(&EpochBumps::submissions);
     clearResolvedAhead();
@@ -312,6 +342,22 @@ void Driver::execute(const Submission& submission) {
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
+        if (hitches != nullptr) {
+            const auto packetMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - packetTimer.start).count();
+            if (waitPacket) {
+                hitchWork.waitMs += packetMs;
+                if (packetMs > hitchWork.longestWaitMs) {
+                    hitchWork.longestWaitMs = packetMs;
+                    hitchWork.longestWait = Pm4::Name(header);
+                }
+            } else {
+                hitchWork.busyMs += packetMs;
+                if (packetMs > hitchWork.slowestMs) {
+                    hitchWork.slowestMs = packetMs;
+                    hitchWork.slowest = header == FlipPacketHeader ? "flip" : Pm4::Name(header);
+                }
+            }
+        }
         cursor = nextCursor;
     }
 

@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/FrameHitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/HitchSampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -131,7 +134,21 @@ void Driver::run(std::uint32_t id) noexcept {
                         const bool storeIdleResults = id == 0 && allQueuesIdle() && !completionsPending();
                         lock.unlock();
                         if (storeIdleResults) {
-                            if (const auto localDevice = device.Load()) localDevice->StoreIdleResults();
+                            if (const auto localDevice = device.Load()) {
+                                auto* hitches = FrameHitches();
+                                const auto storeStart = hitches != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                                localDevice->StoreIdleResults();
+                                if (hitches != nullptr) {
+                                    const auto storeEnd = std::chrono::steady_clock::now();
+                                    if (auto report = hitches->IdleStoreFinished(std::chrono::duration<double, std::milli>(storeEnd - storeStart).count())) {
+                                        if (auto* sampler = HitchSampler::Get()) {
+                                            report->pop_back();
+                                            *report += "; worker: " + sampler->Describe(SampledThread::Worker, storeStart, storeEnd) + "\n";
+                                        }
+                                        AgcDriver::ProfilePrint_nid_no_patch("%s", report->c_str());
+                                    }
+                                }
+                            }
                         }
                         lock.lock();
                         if (ready()) break;
