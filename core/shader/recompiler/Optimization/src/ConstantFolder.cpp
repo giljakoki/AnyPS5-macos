@@ -76,6 +76,41 @@ bool foldConstantBitTest(IrBuilder& builder, IrValue& inst) {
     return true;
 }
 
+bool isPixelEntryExec(const IrValue& predicate) {
+    if (predicate.Opcode() != IrOpcode::IEqual32) return false;
+    for (const auto [helperIndex, zeroIndex] : {std::pair{0u, 1u}, std::pair{1u, 0u}}) {
+        auto& helper = resolveArg(predicate, helperIndex);
+        auto& zero = resolveArg(predicate, zeroIndex);
+        if (!isImmediate(zero, IrType::U32) || zero.ImmediateU32() != 0u || helper.Opcode() != IrOpcode::GetBuiltin) continue;
+        auto& kind = resolveArg(helper, 0);
+        if (isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::HelperInvocation) return true;
+    }
+    return false;
+}
+
+bool isAllLanesBallotWord(const IrValue& word, std::uint32_t half) {
+    if (word.Opcode() != IrOpcode::CompositeExtractU32x4) return false;
+    auto& index = resolveArg(word, 1);
+    auto& ballot = resolveArg(word, 0);
+    if (!isImmediate(index, IrType::U32) || index.ImmediateU32() != half || ballot.Opcode() != IrOpcode::Ballot) return false;
+    auto& predicate = resolveArg(ballot, 0);
+    return isImmediate(predicate, IrType::U1) && predicate.ImmediateBool();
+}
+
+bool isPixelEntryExecWord(const IrValue& rawWord, std::uint32_t half) {
+    const IrValue* word = &rawWord;
+    while (word->Opcode() == IrOpcode::BitwiseAnd32) {
+        if (isAllLanesBallotWord(resolveArg(*word, 1), half)) word = &resolveArg(*word, 0);
+        else if (isAllLanesBallotWord(resolveArg(*word, 0), half)) word = &resolveArg(*word, 1);
+        else return false;
+    }
+    if (word->Opcode() != IrOpcode::CompositeExtractU32x4) return false;
+    auto& index = resolveArg(*word, 1);
+    auto& ballot = resolveArg(*word, 0);
+    if (!isImmediate(index, IrType::U32) || index.ImmediateU32() != half || ballot.Opcode() != IrOpcode::Ballot) return false;
+    return isPixelEntryExec(resolveArg(ballot, 0));
+}
+
 template <typename TFunction> bool foldU32Compare(IrBuilder& builder, IrValue& inst, TFunction function) {
     auto& lhs = resolveArg(inst, 0);
     auto& rhs = resolveArg(inst, 1);
@@ -484,6 +519,10 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
         }
         case IrOpcode::WqmU64: {
             auto& operand = resolveArg(value, 0);
+            if (operand.Opcode() == IrOpcode::CompositeConstructU64 && isPixelEntryExecWord(resolveArg(operand, 0), 0u) && isPixelEntryExecWord(resolveArg(operand, 1), 1u)) {
+                replaceWith(value, builder.ConstantU64(~0ull));
+                return true;
+            }
             if (!isImmediate(operand, IrType::U64)) {
                 return false;
             }
