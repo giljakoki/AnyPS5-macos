@@ -519,10 +519,20 @@ private:
         auto& state = it->second.pages[(page - it->first) / _page];
         if ((state & Protected) != 0) {
             state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
-            ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
+            if (::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask) != 0) reportFault("[write-watch] unprotecting a watched page in the fault handler failed\n");
             return true;
         }
-        return (state & PROT_WRITE) != 0;
+        if ((state & PROT_WRITE) != 0) {
+            static std::atomic<unsigned> resumed{0};
+            if (resumed.fetch_add(1, std::memory_order_relaxed) < 4) reportFault("[write-watch] resuming a write to a page recorded writable and unprotected\n");
+            return true;
+        }
+        return false;
+    }
+
+    static void reportFault(const char* message) {
+        const auto written = ::write(STDERR_FILENO, message, std::strlen(message));
+        static_cast<void>(written);
     }
 
     std::uintptr_t pageStart(std::uintptr_t address) const {
