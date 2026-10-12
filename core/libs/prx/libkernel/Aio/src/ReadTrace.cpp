@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -117,8 +118,33 @@ void Report(std::chrono::steady_clock::time_point now) {
 
 }
 
+void Start(std::chrono::steady_clock::time_point now) {
+    if (g_started) return;
+    g_started = true;
+    g_start = now;
+    g_lastReport = now;
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(ReportInterval);
+            const auto tick = std::chrono::steady_clock::now();
+            std::lock_guard lock(g_mutex);
+            if (tick - g_lastReport >= ReportInterval) {
+                g_lastReport = tick;
+                Report(tick);
+            }
+        }
+    }).detach();
+}
+
 bool Enabled() {
-    static const bool enabled = std::getenv("APS5_TRACE_READS") != nullptr;
+    static const bool enabled = [] {
+        const bool value = std::getenv("APS5_TRACE_READS") != nullptr;
+        if (value) {
+            std::lock_guard lock(g_mutex);
+            Start(std::chrono::steady_clock::now());
+        }
+        return value;
+    }();
     return enabled;
 }
 
@@ -127,11 +153,7 @@ void Record(Kind kind, int descriptor, std::uint64_t bytes, std::uint64_t nanos)
     const auto now = std::chrono::steady_clock::now();
     const auto name = kind == Kind::AioWait ? std::string() : DescriptorName(descriptor);
     std::lock_guard lock(g_mutex);
-    if (!g_started) {
-        g_started = true;
-        g_start = now;
-        g_lastReport = now;
-    }
+    Start(now);
     auto& counter = g_counters[static_cast<std::size_t>(kind)];
     ++counter.calls;
     counter.bytes += bytes;
