@@ -1,3 +1,5 @@
+#include <cstdarg>
+#include <chrono>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -12,6 +14,19 @@
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 
 using namespace AvPlayer;
+static unsigned long long TraceMillis() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+static void TraceLine(const char* format, ...) {
+    std::fprintf(stderr, "[avplayer] %llu ms ", TraceMillis());
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+}
+
 
 namespace {
 
@@ -28,7 +43,7 @@ void TraceCount(const char* what, bool value) {
     static unsigned counts[2][2] = {};
     const unsigned which = what[0] == 'v' ? 0u : 1u;
     auto& count = counts[which][value ? 1 : 0];
-    if (++count <= 8 || count % 256 == 0) std::fprintf(stderr, "[avplayer] %s -> %d (#%u)\n", what, value ? 1 : 0, count);
+    if (++count <= 8 || count % 256 == 0) TraceLine("%s -> %d (#%u)\n", what, value ? 1 : 0, count);
 }
 
 std::uint32_t VideoBufferCount(std::int32_t requested) {
@@ -46,13 +61,13 @@ extern "C" {
 
 int APS5_VABI sceAvPlayerAddSource(AvPlayerInternal* h, const char* filename) {
     if (!h || !filename) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] AddSource %s\n", filename);
+    if (Trace()) TraceLine("AddSource %s\n", filename);
     return ToPlayer(h)->AddSource(filename, SourceTypeUnknown);
 }
 
 int APS5_VABI sceAvPlayerAddSourceEx(AvPlayerInternal* h, uint32_t uri_type, const AvPlayerSourceDetails* source_details) {
     if (!h || uri_type != 0 || !source_details || !source_details->uri.name) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] AddSourceEx %.*s type %u\n", static_cast<int>(source_details->uri.length), source_details->uri.name, source_details->source_type);
+    if (Trace()) TraceLine("AddSourceEx %.*s type %u\n", static_cast<int>(source_details->uri.length), source_details->uri.name, source_details->source_type);
     return ToPlayer(h)->AddSource(std::string_view(source_details->uri.name, source_details->uri.length), source_details->source_type);
 }
 
@@ -64,24 +79,29 @@ int APS5_VABI sceAvPlayerChangeStream(AvPlayerInternal* h, uint32_t old_stream_i
 int APS5_VABI sceAvPlayerClose(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
     delete ToPlayer(h);
-    if (Trace()) std::fprintf(stderr, "[avplayer] Close\n");
+    if (Trace()) TraceLine("Close\n");
     return SCE_OK;
 }
 
 uint64_t APS5_VABI sceAvPlayerCurrentTime(AvPlayerInternal* h) {
     if (!h) return static_cast<uint64_t>(static_cast<int64_t>(SCE_AVPLAYER_ERROR_INVALID_PARAMS));
-    return ToPlayer(h)->CurrentTime();
+    const auto time = ToPlayer(h)->CurrentTime();
+    if (Trace()) {
+        static unsigned count = 0;
+        if (++count <= 20 || count % 100 == 0) TraceLine("CurrentTime -> %llu (#%u)\n", static_cast<unsigned long long>(time), count);
+    }
+    return time;
 }
 
 int APS5_VABI sceAvPlayerDisableStream(AvPlayerInternal* h, uint32_t stream_id) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] DisableStream %u\n", stream_id);
+    if (Trace()) TraceLine("DisableStream %u\n", stream_id);
     return ToPlayer(h)->DisableStream(stream_id);
 }
 
 int APS5_VABI sceAvPlayerEnableStream(AvPlayerInternal* h, uint32_t stream_id) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] EnableStream %u\n", stream_id);
+    if (Trace()) TraceLine("EnableStream %u\n", stream_id);
     return ToPlayer(h)->EnableStream(stream_id);
 }
 
@@ -94,14 +114,15 @@ Bool APS5_VABI sceAvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* a
 
 int APS5_VABI sceAvPlayerGetStreamInfo(AvPlayerInternal* h, uint32_t stream_id, AvPlayerStreamInfo* info) {
     if (!h || !info) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] GetStreamInfo %u\n", stream_id);
+    if (Trace()) TraceLine("GetStreamInfo %u\n", stream_id);
     return ToPlayer(h)->GetStreamInfo(stream_id, *info);
 }
 
 int APS5_VABI sceAvPlayerGetStreamInfoEx(AvPlayerInternal* h, uint32_t stream_id, AvPlayerStreamInfoEx* info) {
     if (!h || !info) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] GetStreamInfoEx %u\n", stream_id);
-    return ToPlayer(h)->GetStreamInfoEx(stream_id, *info);
+    const int result = ToPlayer(h)->GetStreamInfoEx(stream_id, *info);
+    if (Trace()) TraceLine("GetStreamInfoEx %u -> %d type %u duration %llu video %ux%u\n", stream_id, result, info->type, static_cast<unsigned long long>(info->duration), info->details.video.width, info->details.video.height);
+    return result;
 }
 
 Bool APS5_VABI sceAvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* video_info) {
@@ -115,13 +136,13 @@ Bool APS5_VABI sceAvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfoE
     if (!h || !video_info) return false;
     const bool taken = ToPlayer(h)->GetVideoData(*video_info);
     if (Trace()) TraceCount("videoEx", taken);
-    if (Trace() && taken) std::fprintf(stderr, "[avplayer] frame %ux%u pitch %u ts %llu data %p\n", video_info->details.video.width, video_info->details.video.height, video_info->details.video.pitch, static_cast<unsigned long long>(video_info->timestamp), video_info->p_data);
+    if (Trace() && taken) TraceLine("frame %ux%u pitch %u ts %llu data %p\n", video_info->details.video.width, video_info->details.video.height, video_info->details.video.pitch, static_cast<unsigned long long>(video_info->timestamp), video_info->p_data);
     return taken;
 }
 
 AvPlayerInternal* APS5_VABI sceAvPlayerInit(AvPlayerInitData* init) {
     if (!init) return nullptr;
-    if (Trace()) std::fprintf(stderr, "[avplayer] Init buffers=%d autoStart=%d callback=%p\n", init->num_output_video_framebuffers, init->auto_start ? 1 : 0, reinterpret_cast<void*>(init->event_replacement.event_callback));
+    if (Trace()) TraceLine("Init buffers=%d autoStart=%d callback=%p\n", init->num_output_video_framebuffers, init->auto_start ? 1 : 0, reinterpret_cast<void*>(init->event_replacement.event_callback));
     return new Player(*init, VideoBufferCount(init->num_output_video_framebuffers));
 }
 
@@ -141,7 +162,7 @@ int APS5_VABI sceAvPlayerInitEx(const AvPlayerInitDataEx* init_ex, AvPlayerInter
         init.auto_start = init_ex->auto_start;
     }
     init.default_language = init_ex->default_language;
-    if (Trace()) std::fprintf(stderr, "[avplayer] InitEx size=%zu buffers=%d autoStart=%d callback=%p\n", static_cast<std::size_t>(init_ex->this_size), init.num_output_video_framebuffers, init.auto_start ? 1 : 0, reinterpret_cast<void*>(init.event_replacement.event_callback));
+    if (Trace()) TraceLine("InitEx size=%zu buffers=%d autoStart=%d callback=%p\n", static_cast<std::size_t>(init_ex->this_size), init.num_output_video_framebuffers, init.auto_start ? 1 : 0, reinterpret_cast<void*>(init.event_replacement.event_callback));
     *handle = new Player(init, VideoBufferCount(init.num_output_video_framebuffers));
     return SCE_OK;
 }
@@ -155,31 +176,31 @@ Bool APS5_VABI sceAvPlayerIsActive(AvPlayerInternal* h) {
 
 int APS5_VABI sceAvPlayerJumpToTime(AvPlayerInternal* h, uint64_t time_ms) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] JumpToTime %llu\n", static_cast<unsigned long long>(time_ms));
+    if (Trace()) TraceLine("JumpToTime %llu\n", static_cast<unsigned long long>(time_ms));
     return ToPlayer(h)->JumpToTime(time_ms);
 }
 
 int APS5_VABI sceAvPlayerPause(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] Pause\n");
+    if (Trace()) TraceLine("Pause\n");
     return ToPlayer(h)->Pause();
 }
 
 int APS5_VABI sceAvPlayerPostInit(AvPlayerInternal* h, const AvPlayerPostInitData* post_init) {
     if (!h || !post_init) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] PostInit\n");
+    if (Trace()) TraceLine("PostInit\n");
     return ToPlayer(h)->PostInit(*post_init);
 }
 
 int APS5_VABI sceAvPlayerResume(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] Resume\n");
+    if (Trace()) TraceLine("Resume\n");
     return ToPlayer(h)->Resume();
 }
 
 int APS5_VABI sceAvPlayerSetAvSyncMode(AvPlayerInternal* h, uint32_t sync_mode) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] SetAvSyncMode %u\n", sync_mode);
+    if (Trace()) TraceLine("SetAvSyncMode %u\n", sync_mode);
     return ToPlayer(h)->SetAvSyncMode(sync_mode);
 }
 
@@ -199,38 +220,38 @@ int APS5_VABI sceAvPlayerSetLogCallback(void* callback, void* user_data) {
 
 int APS5_VABI sceAvPlayerSetLooping(AvPlayerInternal* h, Bool loop) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] SetLooping %d\n", loop ? 1 : 0);
+    if (Trace()) TraceLine("SetLooping %d\n", loop ? 1 : 0);
     return ToPlayer(h)->SetLooping(loop != 0);
 }
 
 int APS5_VABI sceAvPlayerSetTrickSpeed(AvPlayerInternal* h, int32_t trick_speed) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] SetTrickSpeed %d\n", trick_speed);
+    if (Trace()) TraceLine("SetTrickSpeed %d\n", trick_speed);
     return ToPlayer(h)->SetTrickSpeed(trick_speed);
 }
 
 int APS5_VABI sceAvPlayerStart(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] Start\n");
+    if (Trace()) TraceLine("Start\n");
     return ToPlayer(h)->Start();
 }
 
 int APS5_VABI sceAvPlayerStartEx(AvPlayerInternal* h, const void* start_info_ex) {
     (void)start_info_ex;
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] StartEx\n");
+    if (Trace()) TraceLine("StartEx\n");
     return ToPlayer(h)->Start();
 }
 
 int APS5_VABI sceAvPlayerStop(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] Stop\n");
+    if (Trace()) TraceLine("Stop\n");
     return ToPlayer(h)->Stop();
 }
 
 int APS5_VABI sceAvPlayerStreamCount(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    if (Trace()) std::fprintf(stderr, "[avplayer] StreamCount\n");
+    if (Trace()) TraceLine("StreamCount\n");
     return ToPlayer(h)->StreamCount();
 }
 

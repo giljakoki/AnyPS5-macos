@@ -1,3 +1,4 @@
+#include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
@@ -10,6 +11,20 @@
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+
+
+static unsigned long long TraceMillis() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+static void TraceLine(const char* format, ...) {
+    std::fprintf(stderr, "[avplayer] %llu ms ", TraceMillis());
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+}
 
 namespace AvPlayer {
 
@@ -126,7 +141,7 @@ void Player::controllerLoop() {
 
 void Player::deliver(const Event& event) {
     static const bool trace = std::getenv("APS5_TRACE_AVPLAYER") != nullptr;
-    if (trace) std::fprintf(stderr, "[avplayer] event id=%d warning=%d autoStart=%d error=%d state=%d\n", static_cast<int>(event.id), static_cast<int>(event.warning), event.autoStart ? 1 : 0, event.error ? 1 : 0, static_cast<int>(state));
+    if (trace) TraceLine("event id=%d warning=%d autoStart=%d error=%d state=%d\n", static_cast<int>(event.id), static_cast<int>(event.warning), event.autoStart ? 1 : 0, event.error ? 1 : 0, static_cast<int>(state));
     if (event.error) {
         std::lock_guard lock(mutex);
         if (source && state != State::Stop) {

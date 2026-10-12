@@ -1,3 +1,4 @@
+#include <cstdarg>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -28,6 +29,20 @@ extern "C" {
 static bool TraceIo() {
     static const bool enabled = std::getenv("APS5_TRACE_AVPLAYER") != nullptr;
     return enabled;
+}
+
+
+static unsigned long long TraceMillis() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+static void TraceLine(const char* format, ...) {
+    std::fprintf(stderr, "[avplayer] %llu ms ", TraceMillis());
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
 }
 
 namespace AvPlayer {
@@ -88,7 +103,7 @@ public:
             av_freep(&context->buffer);
             avio_context_free(&context);
         }
-        if (TraceIo()) std::fprintf(stderr, "[avplayer] close opened=%d reads=%u furthest=%llu\n", opened ? 1 : 0, reads, static_cast<unsigned long long>(furthest));
+        if (TraceIo()) TraceLine("close opened=%d reads=%u furthest=%llu\n", opened ? 1 : 0, reads, static_cast<unsigned long long>(furthest));
         if (opened) file.close(file.object_ptr);
     }
 
@@ -97,11 +112,11 @@ public:
 
     bool Open(const std::string& path) {
         const int openResult = file.open(file.object_ptr, path.c_str());
-        if (TraceIo()) std::fprintf(stderr, "[avplayer] open %s -> %d\n", path.c_str(), openResult);
+        if (TraceIo()) TraceLine("open %s -> %d\n", path.c_str(), openResult);
         if (openResult < 0) return false;
         opened = true;
         size = file.size(file.object_ptr);
-        if (TraceIo()) std::fprintf(stderr, "[avplayer] file %s size %llu\n", path.c_str(), static_cast<unsigned long long>(size));
+        if (TraceIo()) TraceLine("file %s size %llu\n", path.c_str(), static_cast<unsigned long long>(size));
         auto* buffer = static_cast<std::uint8_t*>(av_malloc(AvioBufferSize));
         if (!buffer) return false;
         context = avio_alloc_context(buffer, AvioBufferSize, 0, this, &FileReplacementStream::read, nullptr, &FileReplacementStream::seek);
@@ -118,7 +133,7 @@ private:
         const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint64_t>(size), self->size - self->position));
         const auto read = self->file.read_offset(self->file.object_ptr, buffer, self->position, length);
         if (TraceIo()) {
-            if (++self->reads <= 6 || read != static_cast<int>(length)) std::fprintf(stderr, "[avplayer] read offset %llu length %u -> %d (#%u)\n", static_cast<unsigned long long>(self->position), length, read, self->reads);
+            if (++self->reads <= 6 || read != static_cast<int>(length)) TraceLine("read offset %llu length %u -> %d (#%u)\n", static_cast<unsigned long long>(self->position), length, read, self->reads);
         }
         if (read < 0) return AVERROR(EIO);
         if (read == 0) return AVERROR_EOF;
@@ -148,7 +163,7 @@ private:
         }
         const auto target = std::clamp<std::int64_t>(base + offset, 0, static_cast<std::int64_t>(self->size));
         if (TraceIo()) {
-            if (++self->seeks <= 12) std::fprintf(stderr, "[avplayer] seek whence %d offset %lld -> %lld (#%u)\n", whence & ~AVSEEK_FORCE, static_cast<long long>(offset), static_cast<long long>(target), self->seeks);
+            if (++self->seeks <= 12) TraceLine("seek whence %d offset %lld -> %lld (#%u)\n", whence & ~AVSEEK_FORCE, static_cast<long long>(offset), static_cast<long long>(target), self->seeks);
         }
         self->position = static_cast<std::uint64_t>(target);
         return target;
