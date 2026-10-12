@@ -6,6 +6,7 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,116 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+
+#ifdef __APPLE__
+#include <mach/mach_vm.h>
+#include <sys/ucontext.h>
+#include <signal.h>
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#include <thread>
+namespace {
+struct ThreadSampler {
+    static void probe(int, siginfo_t*, void* context) {
+        sigset_t mask;
+        sigemptyset(&mask);
+        pthread_sigmask(SIG_SETMASK, nullptr, &mask);
+        std::uint64_t tid = 0;
+        pthread_threadid_np(nullptr, &tid);
+        const auto* host = static_cast<ucontext_t*>(context);
+        char text[200];
+        const int length = std::snprintf(text, sizeof(text), "[probe] tid %llu interrupted at rip 0x%llx; mask blocks SIGBUS %d SIGSEGV %d SIGUSR1 %d\n", static_cast<unsigned long long>(tid), static_cast<unsigned long long>(host->uc_mcontext->__ss.__rip), sigismember(&mask, SIGBUS), sigismember(&mask, SIGSEGV), sigismember(&mask, SIGUSR1));
+        const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+        static_cast<void>(written);
+    }
+    static void dispositions() {
+        for (int signal : {SIGBUS, SIGSEGV}) {
+            struct sigaction current {};
+            sigaction(signal, nullptr, &current);
+            std::fprintf(stderr, "[sample] host disposition of signal %d: handler %p flags 0x%x\n", signal, reinterpret_cast<void*>(current.sa_sigaction), current.sa_flags);
+        }
+    }
+    ThreadSampler() {
+        if (std::getenv("APS5_SAMPLE_THREADS") == nullptr) return;
+        struct sigaction action {};
+        action.sa_sigaction = &ThreadSampler::probe;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGUSR2, &action, nullptr);
+        std::thread([] { for (;;) { std::this_thread::sleep_for(std::chrono::seconds(4)); sample(); } }).detach();
+    }
+    static std::uint64_t readWord(std::uint64_t address) {
+        std::uint64_t value = 0;
+        mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), address, sizeof(value), reinterpret_cast<mach_vm_address_t>(&value), &got) != KERN_SUCCESS || got != sizeof(value)) return 0;
+        return value;
+    }
+    static void sample() {
+        std::uintptr_t lastAddress = 0;
+        std::uint64_t lastThread = 0;
+        const auto faults = GuestWriteWatch::GuestWriteWatchFaultStatistics_nid_postfix(&lastAddress, &lastThread);
+        dispositions();
+        pthread_kill(pthread_self(), SIGUSR2);
+        std::fprintf(stderr, "[sample] write-watch faults %llu, last at 0x%llx on tid %llu\n", static_cast<unsigned long long>(faults), static_cast<unsigned long long>(lastAddress), static_cast<unsigned long long>(lastThread));
+        thread_act_array_t threads = nullptr;
+        mach_msg_type_number_t count = 0;
+        if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+        for (mach_msg_type_number_t i = 0; i < count; ++i) {
+            thread_basic_info_data_t basic{};
+            mach_msg_type_number_t basicCount = THREAD_BASIC_INFO_COUNT;
+            static unsigned round = 0;
+            if (i == 0) ++round;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic), &basicCount) == KERN_SUCCESS && basic.cpu_usage < TH_USAGE_SCALE / 5 && round % 4 == 0) {
+                thread_identifier_info_data_t ident{};
+                mach_msg_type_number_t identCount = THREAD_IDENTIFIER_INFO_COUNT;
+                thread_info(threads[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&ident), &identCount);
+                x86_thread_state64_t state{};
+                mach_msg_type_number_t stateCount = x86_THREAD_STATE64_COUNT;
+                x86_exception_state64_t exception{};
+                mach_msg_type_number_t exceptionCount = x86_EXCEPTION_STATE64_COUNT;
+                const bool suspended = thread_suspend(threads[i]) == KERN_SUCCESS;
+                const auto status = thread_get_state(threads[i], x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &stateCount);
+                thread_get_state(threads[i], x86_EXCEPTION_STATE64, reinterpret_cast<thread_state_t>(&exception), &exceptionCount);
+                if (suspended) thread_resume(threads[i]);
+                std::fprintf(stderr, "[sample-all] tid %llu cpu %d%% run %d susp %d status %d rip 0x%llx trap %u err %u fault 0x%llx\n", static_cast<unsigned long long>(ident.thread_id), basic.cpu_usage * 100 / TH_USAGE_SCALE, basic.run_state, basic.suspend_count, status, static_cast<unsigned long long>(state.__rip), static_cast<unsigned>(exception.__trapno), static_cast<unsigned>(exception.__err), static_cast<unsigned long long>(exception.__faultvaddr));
+            }
+            if (basicCount != 0 && basic.cpu_usage >= TH_USAGE_SCALE / 5) {
+                thread_identifier_info_data_t ident{};
+                mach_msg_type_number_t identCount = THREAD_IDENTIFIER_INFO_COUNT;
+                thread_info(threads[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&ident), &identCount);
+                x86_thread_state64_t state{};
+                mach_msg_type_number_t stateCount = x86_THREAD_STATE64_COUNT;
+                const bool suspended = thread_suspend(threads[i]) == KERN_SUCCESS;
+                const auto status = thread_get_state(threads[i], x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &stateCount);
+                x86_exception_state64_t exception{};
+                mach_msg_type_number_t exceptionCount = x86_EXCEPTION_STATE64_COUNT;
+                const auto exceptionStatus = thread_get_state(threads[i], x86_EXCEPTION_STATE64, reinterpret_cast<thread_state_t>(&exception), &exceptionCount);
+                if (suspended) thread_resume(threads[i]);
+                std::fprintf(stderr, "[sample] exception status %d trapno %u err %u faultvaddr 0x%llx\n", exceptionStatus, static_cast<unsigned>(exception.__trapno), static_cast<unsigned>(exception.__err), static_cast<unsigned long long>(exception.__faultvaddr));
+                std::fprintf(stderr, "[sample] tid %llu cpu %d%% status %d rip 0x%llx rsp 0x%llx rbp 0x%llx rdi 0x%llx rsi 0x%llx rdx 0x%llx rcx 0x%llx rax 0x%llx frames:", static_cast<unsigned long long>(ident.thread_id), basic.cpu_usage * 100 / TH_USAGE_SCALE, status, static_cast<unsigned long long>(state.__rip), static_cast<unsigned long long>(state.__rsp), static_cast<unsigned long long>(state.__rbp), static_cast<unsigned long long>(state.__rdi), static_cast<unsigned long long>(state.__rsi), static_cast<unsigned long long>(state.__rdx), static_cast<unsigned long long>(state.__rcx), static_cast<unsigned long long>(state.__rax));
+                std::uint64_t frame = state.__rbp;
+                for (int depth = 0; depth < 12 && frame != 0; ++depth) {
+                    const auto ret = readWord(frame + 8);
+                    if (ret == 0) break;
+                    std::fprintf(stderr, " 0x%llx", static_cast<unsigned long long>(ret));
+                    const auto next = readWord(frame);
+                    if (next <= frame) break;
+                    frame = next;
+                }
+                std::fprintf(stderr, "\n");
+                if (status == KERN_SUCCESS) {
+                    const auto pt = pthread_from_mach_thread_np(threads[i]);
+                    const int sent = pt != nullptr ? pthread_kill(pt, SIGUSR2) : -1;
+                    std::fprintf(stderr, "[sample] probe sent to tid %llu: pthread %p result %d\n", static_cast<unsigned long long>(ident.thread_id), static_cast<void*>(pt), sent);
+                }
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(threads), count * sizeof(thread_act_t));
+    }
+};
+const ThreadSampler threadSampler;
+}
+#endif
 
 static constexpr int GUEST_EINVAL = 22;
 static constexpr int GUEST_CLOCK_THREAD_CPUTIME_ID = 14;

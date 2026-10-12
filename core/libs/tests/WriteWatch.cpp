@@ -30,7 +30,7 @@ void Require(bool condition, const char* message) {
 }
 
 struct Region {
-    explicit Region(std::size_t pageCount) : page(static_cast<std::size_t>(::getpagesize())), bytes(pageCount * page) {
+    explicit Region(std::size_t pageCount) : page(GuestWriteWatch::GuestWriteWatchPageSize_nid_postfix()), bytes(pageCount * page) {
         base = static_cast<std::uint8_t*>(::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
         Require(base != MAP_FAILED, "cannot map the test region");
     }

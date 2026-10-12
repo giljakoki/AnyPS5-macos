@@ -155,6 +155,11 @@ void ApplicationHeapInitialize_nid_no_patch(const void* processParameters) {
             if (read<std::uint64_t>(replacement, 0) != 0x78 || read<std::uint64_t>(replacement, 8) != 2) throw std::runtime_error("application heap: unsupported allocator replacement table");
             std::array<void*, 10> api;
             std::memcpy(api.data(), static_cast<const std::byte*>(replacement) + 0x20, sizeof(api));
+            if (std::getenv("APS5_TRACE_MEMORY") != nullptr) {
+                std::fprintf(stderr, "[heap] allocator replacement table %p initialize %p finalize %p entries:", replacement, read<const void*>(replacement, 0x10), read<const void*>(replacement, 0x18));
+                for (const void* entry : api) std::fprintf(stderr, " %p", entry);
+                std::fputc('\n', stderr);
+            }
             ApplicationHeapRegister_nid_no_patch(api.data());
             const auto initialize = read<Initialize>(replacement, 0x10);
             if (initialize != nullptr) initialize();
@@ -179,6 +184,32 @@ void TraceLargeAllocation(const char* what, std::size_t bytes, const void* resul
     const auto count = calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (bytes >= (1u << 20) || result == nullptr || count % 100000 == 0)
         std::fprintf(stderr, "[heap] %s %zu bytes -> %p (caller %p, %llu calls, %llu MiB requested so far)\n", what, bytes, result, caller, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total.load(std::memory_order_relaxed) >> 20));
+    if (result == nullptr && heapApi[8] != nullptr) {
+        struct ManagedSize {
+            std::uint32_t size;
+            std::uint32_t version;
+            std::size_t reservedSize;
+            std::size_t reservedInuseSize;
+            std::size_t maxSystemSize;
+            std::size_t currentSystemSize;
+            std::size_t maxInuseSize;
+            std::size_t currentInuseSize;
+        } managed{};
+        using Stats = int (APS5_VABI*)(ManagedSize*);
+        for (const std::size_t entry : {std::size_t{7}, std::size_t{8}}) {
+            if (heapApi[entry] == nullptr) continue;
+            Stats stats;
+            std::memcpy(&stats, &heapApi[entry], sizeof(stats));
+            for (const std::uint32_t size : {0x30u, 0x38u, 0x40u, 0x48u}) {
+                std::memset(&managed, 0, sizeof(managed));
+                managed.size = size;
+                managed.version = 1;
+                const int status = stats(&managed);
+                std::fprintf(stderr, "[heap] title allocator statistics entry %zu size 0x%x -> %d: reserved %zu (in use %zu), system max %zu current %zu, in use max %zu current %zu\n", entry, size, status, managed.reservedSize, managed.reservedInuseSize, managed.maxSystemSize, managed.currentSystemSize, managed.maxInuseSize, managed.currentInuseSize);
+                if (status == 0) break;
+            }
+        }
+    }
 }
 
 void* ApplicationHeapAllocate_nid_no_patch(std::size_t bytes) {

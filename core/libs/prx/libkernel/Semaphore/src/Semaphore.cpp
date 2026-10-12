@@ -1,6 +1,9 @@
 #include "prx/libkernel/Semaphore/include/Semaphore.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <pthread.h>
 
 #include <stdexcept>
 #include <string>
@@ -76,7 +79,20 @@ int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time) 
  };
  const auto released = [&] { return sem->tokenCount >= need || sem->deleted || sem->cancelGeneration != generation; };
  if (time == nullptr) {
-  sem->condition.Wait(lock, released);
+  static const bool traceLong = std::getenv("APS5_TRACE_WAITS") != nullptr;
+  if (traceLong) {
+   bool reported = false;
+   while (!released()) {
+    if (sem->condition.WaitUntil(lock, TimedWait::DeadlineNanos(2000000), released)) break;
+    if (reported) continue;
+    reported = true;
+    std::uint64_t tid = 0;
+    pthread_threadid_np(nullptr, &tid);
+    std::fprintf(stderr, "[waits] sema \"%s\" pending >2 s: need %d have %d max %d waiters %d caller %p tid %llu\n", sem->name.c_str(), need, sem->tokenCount, sem->maxCount, sem->waiterCount, __builtin_return_address(0), static_cast<unsigned long long>(tid));
+   }
+  } else {
+   sem->condition.Wait(lock, released);
+  }
   traceWait(false);
   if (sem->deleted) {
    return SCE_KERNEL_ERROR_EACCES;

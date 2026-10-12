@@ -1,7 +1,10 @@
+#include <sys/ucontext.h>
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <pthread.h>
+#include <ctime>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -329,6 +332,10 @@ public:
         return _available;
     }
 
+    std::size_t PageSize() const {
+        return static_cast<std::size_t>(_page);
+    }
+
     void Register(std::uintptr_t begin, std::uintptr_t end) {
         begin = pageStart(begin);
         end = pageEnd(end);
@@ -494,8 +501,37 @@ private:
         _available = true;
     }
 
+public:
+    static inline std::atomic<std::uint64_t> faultCount{0};
+    static inline std::atomic<std::uintptr_t> lastFaultAddress{0};
+    static inline std::atomic<std::uint64_t> lastFaultThread{0};
+
+private:
     static void fault(int signal, siginfo_t* info, void* context) {
         auto& watch = Get();
+        {
+            static std::atomic<std::uint64_t> lastReportNanos{0};
+            const auto count = faultCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            lastFaultAddress.store(reinterpret_cast<std::uintptr_t>(info->si_addr), std::memory_order_relaxed);
+            {
+                std::uint64_t tid = 0;
+                pthread_threadid_np(nullptr, &tid);
+                lastFaultThread.store(tid, std::memory_order_relaxed);
+            }
+            if (count % 20000 == 0) {
+                timespec now{};
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                const std::uint64_t nanos = static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(now.tv_nsec);
+                const auto previous = lastReportNanos.exchange(nanos, std::memory_order_relaxed);
+                char text[200];
+                const int length = std::snprintf(text, sizeof(text), "[write-watch] %llu faults total, last 20000 in %.1f ms, at 0x%llx\n", static_cast<unsigned long long>(count), previous == 0 ? 0.0 : (nanos - previous) / 1e6, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
+                const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+                static_cast<void>(written);
+            }
+        }
+        lastFaultContext = context;
+        lastFaultCode = info->si_code;
+        lastFaultSignal = signal;
         if (watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
         const auto& previous = signal == SIGBUS ? watch._previousBus : watch._previousSegv;
         if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
@@ -511,23 +547,105 @@ private:
 
     bool record(std::uintptr_t address) {
         const auto page = pageStart(address);
+        static thread_local std::uintptr_t repeatedAddress = 0;
+        static thread_local unsigned repeatedCount = 0;
+        if (address == repeatedAddress) ++repeatedCount; else { repeatedAddress = address; repeatedCount = 0; }
         const Lock lock(_lock);
         auto it = _ranges.upper_bound(page);
         if (it == _ranges.begin()) return false;
         --it;
         if (page >= it->second.end) return false;
         auto& state = it->second.pages[(page - it->first) / _page];
+        if (repeatedCount == 50 || (repeatedCount > 0 && repeatedCount % 200000 == 0)) {
+            reportUnwritable("repeated fault at one address", address, state, it->first, it->second.end);
+            reportResume(address, state, it->first, it->second.end);
+            reportRegisters(true, repeatedCount);
+        }
         if ((state & Protected) != 0) {
             state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
             if (::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask) != 0) reportFault("[write-watch] unprotecting a watched page in the fault handler failed\n");
+            if ((state & PROT_WRITE) == 0) reportUnwritable("unprotected to a read-only recording", address, state, it->first, it->second.end);
             return true;
+        }
+        if ((state & PROT_WRITE) == 0) {
+            reportUnwritable("fault on a page recorded without write access", address, state, it->first, it->second.end);
         }
         if ((state & PROT_WRITE) != 0) {
             static std::atomic<unsigned> resumed{0};
-            if (resumed.fetch_add(1, std::memory_order_relaxed) < 4) reportResume(address, state, it->first, it->second.end);
+            static std::atomic<std::uintptr_t> previousAddress{0};
+            const auto count = resumed.fetch_add(1, std::memory_order_relaxed);
+            const bool same = previousAddress.exchange(address, std::memory_order_relaxed) == address;
+            if (count < 4 || count % 20000 == 0) {
+                reportResume(address, state, it->first, it->second.end);
+                reportInstruction();
+                reportRegisters(same, count);
+                if (count < 4) probeWrite(address);
+            }
+            if (::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask & ~PROT_WRITE) != 0 || ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask) != 0) reportFault("[write-watch] refreshing a resumed page's protection failed\n");
             return true;
         }
         return false;
+    }
+
+    static inline thread_local void* lastFaultContext = nullptr;
+    static inline thread_local int lastFaultCode = 0;
+    static inline thread_local int lastFaultSignal = 0;
+
+    static void reportInstruction() {
+        const auto* context = static_cast<const ucontext_t*>(lastFaultContext);
+        if (context == nullptr) return;
+        const auto rip = static_cast<std::uintptr_t>(context->uc_mcontext->__ss.__rip);
+        const auto* bytes = reinterpret_cast<const unsigned char*>(rip);
+        char text[200];
+        int length = std::snprintf(text, sizeof(text), "[write-watch]   at rip 0x%llx (signal %d si_code %d) bytes", static_cast<unsigned long long>(rip), lastFaultSignal, lastFaultCode);
+        for (int i = 0; i < 12 && length < 180; ++i) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %02x", bytes[i]);
+        text[length++] = '\n';
+        const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+        static_cast<void>(written);
+    }
+
+    static void reportRegisters(bool sameAsPrevious, unsigned count) {
+        const auto* context = static_cast<const ucontext_t*>(lastFaultContext);
+        if (context == nullptr) return;
+        const auto& ss = context->uc_mcontext->__ss;
+        char text[240];
+        const int length = std::snprintf(text, sizeof(text), "[write-watch]   resume #%u same-address-as-previous %d rax 0x%llx rbx 0x%llx rcx 0x%llx rdx 0x%llx rsi 0x%llx rdi 0x%llx r14 0x%llx\n", count, sameAsPrevious ? 1 : 0, static_cast<unsigned long long>(ss.__rax), static_cast<unsigned long long>(ss.__rbx), static_cast<unsigned long long>(ss.__rcx), static_cast<unsigned long long>(ss.__rdx), static_cast<unsigned long long>(ss.__rsi), static_cast<unsigned long long>(ss.__rdi), static_cast<unsigned long long>(ss.__r14));
+        const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+        static_cast<void>(written);
+    }
+
+    static void probeWrite(std::uintptr_t address) {
+        unsigned char byte = 0;
+        mach_vm_size_t outsize = 0;
+        vm_offset_t data = 0;
+        mach_msg_type_number_t count = 0;
+        const auto readStatus = mach_vm_read(mach_task_self(), address & ~std::uintptr_t{15}, 16, &data, &count);
+        if (readStatus == KERN_SUCCESS) {
+            byte = *reinterpret_cast<const unsigned char*>(data);
+            const auto writeStatus = mach_vm_write(mach_task_self(), address & ~std::uintptr_t{15}, data, count);
+            char text[160];
+            const int length = std::snprintf(text, sizeof(text), "[write-watch]   kernel read ok (first byte %02x), kernel write status %d\n", byte, writeStatus);
+            const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+            static_cast<void>(written);
+            mach_vm_deallocate(mach_task_self(), data, count);
+            static_cast<void>(outsize);
+        } else {
+            char text[120];
+            const int length = std::snprintf(text, sizeof(text), "[write-watch]   kernel read status %d\n", readStatus);
+            const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+            static_cast<void>(written);
+        }
+    }
+
+    static void reportUnwritable(const char* what, std::uintptr_t address, std::uint8_t state, std::uintptr_t rangeBegin, std::uintptr_t rangeEnd) {
+        static std::atomic<unsigned> reported{0};
+        const auto count = reported.fetch_add(1, std::memory_order_relaxed);
+        if (count >= 8 && count % 100000 != 0) return;
+        char text[256];
+        const int length = std::snprintf(text, sizeof(text), "[write-watch] %s #%u: 0x%llx state 0x%02x range 0x%llx..0x%llx\n", what, count, static_cast<unsigned long long>(address), state, static_cast<unsigned long long>(rangeBegin), static_cast<unsigned long long>(rangeEnd));
+        const auto written = ::write(STDERR_FILENO, text, static_cast<std::size_t>(length));
+        static_cast<void>(written);
+        reportInstruction();
     }
 
     static void reportResume(std::uintptr_t address, std::uint8_t state, std::uintptr_t rangeBegin, std::uintptr_t rangeEnd) {
@@ -625,7 +743,12 @@ private:
         return removed;
     }
 
-    const std::uintptr_t _page = static_cast<std::uintptr_t>(::getpagesize());
+    static std::uintptr_t watchPageSize() {
+        const auto page = static_cast<std::uintptr_t>(::getpagesize());
+        return std::getenv("APS5_WRITE_WATCH_KERNEL_PAGES") != nullptr ? std::max(page, static_cast<std::uintptr_t>(vm_kernel_page_size)) : page;
+    }
+
+    const std::uintptr_t _page = watchPageSize();
     bool _available = false;
     Turns _lock;
     std::map<std::uintptr_t, Range> _ranges;
@@ -645,6 +768,16 @@ bool GuestWriteWatchAvailable_nid_postfix() {
 #else
     return false;
 #endif
+}
+
+std::uint64_t GuestWriteWatchFaultStatistics_nid_postfix(std::uintptr_t* lastAddress, std::uint64_t* lastThread) {
+    if (lastAddress != nullptr) *lastAddress = Watch::lastFaultAddress.load(std::memory_order_relaxed);
+    if (lastThread != nullptr) *lastThread = Watch::lastFaultThread.load(std::memory_order_relaxed);
+    return Watch::faultCount.load(std::memory_order_relaxed);
+}
+
+std::size_t GuestWriteWatchPageSize_nid_postfix() {
+    return Watch::Get().PageSize();
 }
 
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes) {
