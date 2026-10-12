@@ -225,6 +225,8 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             }
         }
         phase(FillClearPhase);
+        static const bool traceSubmits = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+        if (traceSubmits && bytes >= 0x100000) std::fprintf(stderr, "[submit-trace] fill 0x%llx+0x%zx pattern %08x cover %d image %d discarded %zu cleared %d refusal %s\n", static_cast<unsigned long long>(base), bytes, pattern[0], static_cast<int>(coverage.cover), coverage.image != nullptr ? 1 : 0, discarded, cleared ? 1 : 0, refusal ? refusal : "-");
         fillClearCount(coverage, bytes, pattern, discarded, cleared, refusal);
         noteForeignWriter(base, base + bytes, queueId);
 
