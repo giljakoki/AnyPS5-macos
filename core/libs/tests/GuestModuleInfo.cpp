@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
     }
     Require(executable);
     Require(info.eh_frame_addr != 0 && info.eh_frame_size != 0);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     Require(info.eh_frame_hdr_addr != 0 && info.eh_frame_hdr_size != 0);
 #endif
     Require(info.init_proc_addr == 0 || info.init_proc_addr >= info.segments[0].address);
