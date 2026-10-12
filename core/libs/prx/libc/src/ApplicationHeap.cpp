@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <cstdio>
 #include <string>
 #include <mutex>
 #include <new>

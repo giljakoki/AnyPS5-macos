@@ -2555,6 +2555,8 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     if (cleared) ++clearPresents;
     auto& dumps = Dumps();
+    static const bool traceSubmits = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+    if (traceSubmits) std::fprintf(stderr, "[submit-trace] present #%llu address=0x%llx path=%s nextDump=%d\n", static_cast<unsigned long long>(dumps.presents + 1), static_cast<unsigned long long>(buffer.address), cleared ? "clear" : resident != nullptr ? "resident" : "guest", dumps.dumped);
     bool dumpFrame = false;
     if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
         if (dumps.cpu) {

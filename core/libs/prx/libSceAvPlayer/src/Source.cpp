@@ -122,6 +122,15 @@ private:
         }
         if (read < 0) return AVERROR(EIO);
         if (read == 0) return AVERROR_EOF;
+        if (const char* dumpDirectory = std::getenv("APS5_DUMP_AVPLAYER_FILES"); dumpDirectory != nullptr && read > 0) {
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/avplayer_%p_%llu.bin", dumpDirectory, static_cast<void*>(self), static_cast<unsigned long long>(self->size));
+            if (FILE* dump = std::fopen(name, "r+b"); dump != nullptr || (dump = std::fopen(name, "wb")) != nullptr) {
+                std::fseek(dump, static_cast<long>(self->position), SEEK_SET);
+                std::fwrite(buffer, 1, static_cast<std::size_t>(read), dump);
+                std::fclose(dump);
+            }
+        }
         self->position += static_cast<std::uint64_t>(read);
         self->furthest = std::max(self->furthest, self->position);
         return read;

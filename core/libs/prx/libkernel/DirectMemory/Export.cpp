@@ -36,6 +36,7 @@
 #include <mutex>
 
 extern "C" std::uint64_t GuestImageSegmentBytes_nid_no_patch();
+extern "C" const void* ApplicationProcessParameters_nid_no_patch();
 
 namespace {
 
@@ -179,6 +180,41 @@ int APS5_VABI sceKernelGetDirectMemoryType(int64_t offset, int* memory_type, int
 }
 
 size_t APS5_VABI sceKernelGetDirectMemorySize(void) {
+ static const bool traced = [] {
+  if (std::getenv("APS5_TRACE_MEMORY") == nullptr) return false;
+  try {
+   const auto* parameters = static_cast<const std::uint8_t*>(ApplicationProcessParameters_nid_no_patch());
+   std::uint64_t size = 0;
+   std::memcpy(&size, parameters, sizeof(size));
+   std::fprintf(stderr, "[memory] process parameters %p size 0x%llx:", static_cast<const void*>(parameters), static_cast<unsigned long long>(size));
+   for (std::uint64_t offset = 0; offset + 8 <= size && offset < 0x80; offset += 8) {
+    std::uint64_t word = 0;
+    std::memcpy(&word, parameters + offset, sizeof(word));
+    std::fprintf(stderr, " %llx", static_cast<unsigned long long>(word));
+   }
+   std::fputc('\n', stderr);
+   const std::uint8_t* memParam = nullptr;
+   if (size >= 0x48) std::memcpy(&memParam, parameters + 0x40, sizeof(memParam));
+   if (memParam != nullptr) {
+    std::uint64_t memSize = 0;
+    std::memcpy(&memSize, memParam, sizeof(memSize));
+    std::fprintf(stderr, "[memory] mem_param %p size 0x%llx:", static_cast<const void*>(memParam), static_cast<unsigned long long>(memSize));
+    for (std::uint64_t offset = 8; offset + 8 <= memSize && offset < 0x48; offset += 8) {
+     const std::uint64_t* pointer = nullptr;
+     std::memcpy(&pointer, memParam + offset, sizeof(pointer));
+     std::fprintf(stderr, " +0x%llx=%p", static_cast<unsigned long long>(offset), static_cast<const void*>(pointer));
+     if (pointer != nullptr) std::fprintf(stderr, "->0x%llx", static_cast<unsigned long long>(*pointer));
+    }
+    std::fputc('\n', stderr);
+   } else {
+    std::fprintf(stderr, "[memory] mem_param null\n");
+   }
+  } catch (const std::exception& error) {
+   std::fprintf(stderr, "[memory] process parameters unavailable: %s\n", error.what());
+  }
+  return true;
+ }();
+ static_cast<void>(traced);
  return DIRECT_MEMORY_SIZE;
 }
 
