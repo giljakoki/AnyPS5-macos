@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(__x86_64__)
+#if defined(__AVX__)
 #include <immintrin.h>
 #endif
 #include <mach/mach.h>
@@ -237,20 +237,14 @@ void CheckThreads() {
     Require(region.Collect().empty(), "writes are reported after the writers stopped");
 }
 
-#if defined(__x86_64__)
-__attribute__((target("avx"))) void StoreVector(std::uint8_t* destination, std::uint8_t value) {
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination), _mm256_set1_epi8(static_cast<char>(value)));
-}
-#endif
-
 void StoreThirtyTwo(std::uint8_t* destination, std::uint8_t value) {
-#if defined(__x86_64__)
-    if (__builtin_cpu_supports("avx")) return StoreVector(destination, value);
+#if defined(__AVX__)
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination), _mm256_set1_epi8(static_cast<char>(value)));
+#else
+    std::array<std::uint8_t, 32> vector;
+    vector.fill(value);
+    std::memcpy(destination, vector.data(), vector.size());
 #endif
-    typedef std::uint8_t Vector __attribute__((vector_size(32), aligned(1)));
-    Vector vector;
-    for (int lane = 0; lane < 32; ++lane) vector[lane] = value;
-    *reinterpret_cast<volatile Vector*>(destination) = vector;
 }
 
 void CheckVector() {

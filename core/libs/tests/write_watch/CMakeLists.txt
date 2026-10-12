@@ -11,6 +11,9 @@ add_executable(write_watch_tests ../WriteWatch.cpp ../../prx/libc/src/GuestWrite
 target_include_directories(write_watch_tests PRIVATE ../..)
 target_compile_features(write_watch_tests PRIVATE cxx_std_20)
 target_link_libraries(write_watch_tests PRIVATE Threads::Threads)
+if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64"))
+    target_compile_options(write_watch_tests PRIVATE -mavx)
+endif()
 set_target_properties(write_watch_tests PROPERTIES
     CXX_EXTENSIONS OFF
     RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
