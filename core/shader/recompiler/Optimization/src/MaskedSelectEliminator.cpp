@@ -316,11 +316,86 @@ bool withinWords(const IrValue* condition, const IrValue* low, const IrValue* hi
            (withinWords(condition, lowLeft, highRight, waveSize, uniform, depth + 1u) && withinWords(condition, lowRight, highLeft, waveSize, uniform, depth + 1u));
 }
 
-const IrValue* wholeQuadSource(const IrValue* mask, std::uint32_t waveSize) {
+bool allLanesWord(const IrValue* word, std::uint32_t half) {
+    word = word->Resolve();
+    if (word->Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediate(word->Argument(1)->Resolve(), half)) return false;
+    const IrValue* ballot = word->Argument(0)->Resolve();
+    if (ballot->Opcode() != IrOpcode::Ballot) return false;
+    const IrValue* predicate = ballot->Argument(0)->Resolve();
+    return predicate->HasImmediate() && predicate->Type() == IrType::Bool && predicate->ImmediateBool();
+}
+
+const IrValue* quadWordOfPredicate(const IrValue* predicate, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth);
+
+const IrValue* quadWord(const IrValue* word, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth) {
+    word = word->Resolve();
+    if (depth > DepthLimit) return nullptr;
+    if (word->IsPhi()) {
+        if (word->ArgumentCount() == 0u) return nullptr;
+        const IrValue* common = nullptr;
+        for (std::size_t index = 0; index < word->ArgumentCount(); ++index) {
+            const IrValue* incoming = word->Argument(index)->Resolve();
+            if (incoming == word) continue;
+            const IrValue* canonical = quadWord(incoming, half, waveSize, depth + 1u);
+            if (canonical == nullptr || (common != nullptr && canonical != common)) return nullptr;
+            common = canonical;
+        }
+        return common;
+    }
+    const IrValue* stripped = word;
+    while (stripped->Opcode() == IrOpcode::BitwiseAnd32) {
+        if (allLanesWord(stripped->Argument(1), half)) stripped = stripped->Argument(0)->Resolve();
+        else if (allLanesWord(stripped->Argument(0), half)) stripped = stripped->Argument(1)->Resolve();
+        else break;
+    }
+    if (stripped != word) return quadWord(stripped, half, waveSize, depth + 1u);
+    if (word->Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediate(word->Argument(1)->Resolve(), half)) {
+        const IrValue* ballot = word->Argument(0)->Resolve();
+        if (ballot->Opcode() != IrOpcode::Ballot) return nullptr;
+        return quadWordOfPredicate(ballot->Argument(0), half, waveSize, depth + 1u);
+    }
+    return word->Opcode() == IrOpcode::CompositeExtractU64 && isImmediate(word->Argument(1)->Resolve(), half) ? word : nullptr;
+}
+
+const IrValue* quadWordOfPredicate(const IrValue* predicate, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth) {
+    predicate = predicate->Resolve();
+    if (depth > DepthLimit) return nullptr;
+    if (predicate->IsPhi()) {
+        if (predicate->ArgumentCount() == 0u) return nullptr;
+        const IrValue* common = nullptr;
+        for (std::size_t index = 0; index < predicate->ArgumentCount(); ++index) {
+            const IrValue* incoming = predicate->Argument(index)->Resolve();
+            if (incoming == predicate) continue;
+            const IrValue* canonical = quadWordOfPredicate(incoming, half, waveSize, depth + 1u);
+            if (canonical == nullptr || (common != nullptr && canonical != common)) return nullptr;
+            common = canonical;
+        }
+        return common;
+    }
+    const auto bit = threadBit(predicate, waveSize);
+    if (!bit) return nullptr;
+    return quadWord(half == 0u ? bit->low : bit->high, half, waveSize, depth + 1u);
+}
+
+const IrValue* wholeQuadSource(const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth = 0) {
+    mask = mask->Resolve();
+    if (mask->IsPhi()) {
+        if (depth > 4u || mask->ArgumentCount() == 0u) return nullptr;
+        const IrValue* common = nullptr;
+        for (std::size_t index = 0; index < mask->ArgumentCount(); ++index) {
+            const IrValue* source = wholeQuadSource(mask->Argument(index), waveSize, depth + 1u);
+            if (source == nullptr || (common != nullptr && source != common)) return nullptr;
+            common = source;
+        }
+        return common;
+    }
     const auto bit = threadBit(mask, waveSize);
-    if (!bit || bit->low->Opcode() != IrOpcode::CompositeExtractU64 || !isImmediate(bit->low->Argument(1)->Resolve(), 0u)) return nullptr;
-    const IrValue* wqm = bit->low->Argument(0)->Resolve();
-    if (waveSize != 32u && (bit->high->Opcode() != IrOpcode::CompositeExtractU64 || bit->high->Argument(0)->Resolve() != wqm || !isImmediate(bit->high->Argument(1)->Resolve(), 1u))) return nullptr;
+    if (!bit) return nullptr;
+    const IrValue* low = quadWord(bit->low, 0u, waveSize, 0u);
+    const IrValue* high = waveSize == 32u ? nullptr : quadWord(bit->high, 1u, waveSize, 0u);
+    if (low == nullptr || (waveSize != 32u && high == nullptr)) return nullptr;
+    const IrValue* wqm = low->Argument(0)->Resolve();
+    if (waveSize != 32u && high->Argument(0)->Resolve() != wqm) return nullptr;
     if (wqm->Opcode() != IrOpcode::WqmU64) return nullptr;
     const IrValue* source = wqm->Argument(0)->Resolve();
     return source->Opcode() == IrOpcode::CompositeConstructU64 ? source : nullptr;
@@ -328,7 +403,11 @@ const IrValue* wholeQuadSource(const IrValue* mask, std::uint32_t waveSize) {
 
 bool withinQuadsOf(const IrValue* condition, const IrValue* mask, std::uint32_t waveSize, const BlockSet& uniform) {
     const IrValue* source = wholeQuadSource(mask, waveSize);
-    return source != nullptr && withinWords(condition, source->Argument(0)->Resolve(), source->Argument(1)->Resolve(), waveSize, uniform, 0u);
+    if (source == nullptr) return false;
+    const IrValue* low = source->Argument(0)->Resolve();
+    const IrValue* high = source->Argument(1)->Resolve();
+    if (const auto bit = threadBit(condition, waveSize); bit && bit->low == low && (waveSize == 32u || bit->high == high)) return true;
+    return withinWords(condition, low, high, waveSize, uniform, 0u);
 }
 
 enum class Region : std::uint8_t { Unreached, Once, Loop };
