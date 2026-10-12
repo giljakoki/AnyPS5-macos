@@ -3,10 +3,11 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 
-// PSN is not emulated: the user is reported as signed out and online queries fail.
 static constexpr int SCE_NP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80550003);
 static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
 static constexpr int SCE_NP_ERROR_USER_NOT_FOUND = static_cast<int>(0x80550007);
@@ -14,6 +15,10 @@ static constexpr int SCE_NP_ERROR_CALLBACK_ALREADY_REGISTERED = static_cast<int>
 static constexpr int SCE_NP_ERROR_CALLBACK_NOT_REGISTERED = static_cast<int>(0x80550009);
 static constexpr int SCE_NP_ERROR_REQUEST_NOT_FOUND = static_cast<int>(0x80550014);
 static constexpr uint32_t NP_STATE_SIGNED_OUT = 1;
+static constexpr uint32_t NP_STATE_SIGNED_IN = 2;
+static constexpr uint64_t NP_LOCAL_ACCOUNT_ID = 0x0100000000000001ull;
+static constexpr char NP_LOCAL_ONLINE_ID[] = "AnyPS5";
+static constexpr char NP_LOCAL_COUNTRY[4] = {'u', 's', '\0', '\0'};
 static constexpr int NP_POLL_ASYNC_FINISHED = 0;
 static constexpr uint32_t NP_REACHABILITY_STATE_UNAVAILABLE = 0;
 
@@ -31,6 +36,15 @@ int AddRequest() {
     std::lock_guard lock(requestMutex);
     liveRequests.insert(reqId);
     return reqId;
+}
+
+bool SignedIn() {
+    return std::getenv("APS5_NP_SIGNED_IN") != nullptr;
+}
+
+void FillOnlineId(NpOnlineId* online_id) {
+    std::memset(online_id, 0, sizeof(*online_id));
+    std::memcpy(online_id->data, NP_LOCAL_ONLINE_ID, sizeof(NP_LOCAL_ONLINE_ID));
 }
 }
 
@@ -88,20 +102,27 @@ int APS5_VABI sceNpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 
 int APS5_VABI sceNpGetAccountCountryA(int user_id, void* country_code) {
     (void)user_id;
-    (void)country_code;
-    return SCE_NP_ERROR_SIGNED_OUT;
+    if (!country_code) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!SignedIn()) return SCE_NP_ERROR_SIGNED_OUT;
+    std::memcpy(country_code, NP_LOCAL_COUNTRY, sizeof(NP_LOCAL_COUNTRY));
+    return 0;
 }
 
 int APS5_VABI sceNpGetAccountIdA(int user_id, uint64_t* account_id) {
     (void)user_id;
-    (void)account_id;
-    return SCE_NP_ERROR_SIGNED_OUT;
+    if (!account_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!SignedIn()) return SCE_NP_ERROR_SIGNED_OUT;
+    *account_id = NP_LOCAL_ACCOUNT_ID;
+    return 0;
 }
 
 int APS5_VABI sceNpGetNpId(int user_id, NpId* np_id) {
     (void)user_id;
     if (!np_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    return SCE_NP_ERROR_SIGNED_OUT;
+    if (!SignedIn()) return SCE_NP_ERROR_SIGNED_OUT;
+    std::memset(np_id, 0, sizeof(*np_id));
+    FillOnlineId(&np_id->online_id);
+    return 0;
 }
 
 int APS5_VABI sceNpGetNpReachabilityState(int user_id, uint32_t* state) {
@@ -113,21 +134,23 @@ int APS5_VABI sceNpGetNpReachabilityState(int user_id, uint32_t* state) {
 
 int APS5_VABI sceNpGetOnlineId(int user_id, NpOnlineId* online_id) {
     (void)user_id;
-    (void)online_id;
-    return SCE_NP_ERROR_SIGNED_OUT;
+    if (!online_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!SignedIn()) return SCE_NP_ERROR_SIGNED_OUT;
+    FillOnlineId(online_id);
+    return 0;
 }
 
 int APS5_VABI sceNpGetState(int user_id, uint32_t* state) {
     (void)user_id;
     if (!state) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    *state = NP_STATE_SIGNED_OUT;
+    *state = SignedIn() ? NP_STATE_SIGNED_IN : NP_STATE_SIGNED_OUT;
     return 0;
 }
 
 int APS5_VABI sceNpHasSignedUp(int user_id, bool* has_signed_up) {
     (void)user_id;
     if (!has_signed_up) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    *has_signed_up = false;
+    *has_signed_up = SignedIn();
     return 0;
 }
 
