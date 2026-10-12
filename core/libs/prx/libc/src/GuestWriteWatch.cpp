@@ -23,13 +23,10 @@
 #endif
 
 #if defined(__APPLE__)
-#include <atomic>
-#include <cerrno>
-#include <csignal>
 #include <cstring>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <sched.h>
+#include <new>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -335,7 +332,7 @@ public:
         if (!_available || end <= begin) return;
         std::vector<std::uint8_t> pages((end - begin) / _page, Written | Fresh);
         std::vector<bool> queried(pages.size(), false);
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         for (auto cursor = begin; cursor < end;) {
             mach_vm_address_t address = cursor;
             mach_vm_size_t size = 0;
@@ -352,28 +349,25 @@ public:
             }
             cursor = last;
         }
-        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            auto& entry = pages[(page - begin) / _page];
-            const std::uint8_t recorded = state & ProtectionMask;
-            const bool armed = (state & Protected) != 0 && (entry & ProtectionMask) == (recorded & ~PROT_WRITE);
-            if (armed || !queried[(page - begin) / _page]) entry = static_cast<std::uint8_t>(Written | Fresh | recorded);
-            else state = static_cast<std::uint8_t>(state & ~Protected);
+        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state, std::uint32_t&) {
+            if (!queried[(page - begin) / _page]) pages[(page - begin) / _page] = static_cast<std::uint8_t>(Written | Fresh | (state & ProtectionMask));
         });
         erase(begin, end);
-        _ranges.emplace(begin, Range{end, std::move(pages)});
+        const auto count = pages.size();
+        _ranges.emplace(begin, Range{end, std::move(pages), std::vector<std::uint32_t>(count, NoShadow)});
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return false;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         return erase(begin, end);
     }
 
     bool Covers(std::uintptr_t begin, std::uintptr_t end) {
         if (!_available) return false;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         return covers(begin, end);
     }
 
@@ -386,21 +380,26 @@ public:
         if (end <= begin) return true;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
         {
-            const Lock lock(_lock);
+            const std::lock_guard lock(_lock);
             if (take != Take::Fresh && !covers(begin, end)) return false;
-            forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-                if ((state & Written) == 0) return;
+            forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state, std::uint32_t& shadow) {
                 const bool fresh = (state & Fresh) != 0;
                 if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) return;
+                const bool compared = (state & Comparable) == Comparable;
+                if ((state & Written) == 0 && (!compared || shadow == NoShadow || !differs(page, _shadows.At(shadow)))) return;
                 state &= static_cast<std::uint8_t>(~Fresh);
                 if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
                 else runs.emplace_back(page, page + _page);
                 for (const auto& [first, last] : _hostWrites)
                     if (page >= first && page < last) return;
+                if (!compared) {
+                    state &= static_cast<std::uint8_t>(~Written);
+                    return;
+                }
+                if (shadow == NoShadow) shadow = _shadows.Allocate(_page);
+                std::memcpy(_shadows.At(shadow), reinterpret_cast<const void*>(page), _page);
                 state &= static_cast<std::uint8_t>(~Written);
-                if ((state & PROT_WRITE) != 0) state |= Protected;
             });
-            for (const auto& [first, last] : runs) protect(first, last);
         }
         for (const auto& [first, last] : runs) written(context, first, last);
         return true;
@@ -410,8 +409,8 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        const Lock lock(_lock);
-        forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
+        const std::lock_guard lock(_lock);
+        forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state, std::uint32_t&) {
             state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
         });
     }
@@ -420,11 +419,10 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         _hostWrites.emplace_back(begin, end);
-        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
-            state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
+        forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state, std::uint32_t&) {
+            state |= Written;
         });
     }
 
@@ -432,14 +430,14 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{begin, end});
         if (found != _hostWrites.end()) _hostWrites.erase(found);
     }
 
     int Protection(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
         const auto page = pageStart(address);
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         auto it = _ranges.upper_bound(page);
         if (_available && it != _ranges.begin() && page < std::prev(it)->second.end) {
             --it;
@@ -456,73 +454,64 @@ public:
 
 private:
     static constexpr std::uint8_t ProtectionMask = PROT_READ | PROT_WRITE | PROT_EXEC;
+    static constexpr std::uint8_t Comparable = PROT_READ | PROT_WRITE;
     static constexpr std::uint8_t Written = 0x10;
-    static constexpr std::uint8_t Protected = 0x20;
     static constexpr std::uint8_t Fresh = 0x40;
+    static constexpr std::uint32_t NoShadow = ~std::uint32_t{0};
 
     struct Range {
         std::uintptr_t end;
         std::vector<std::uint8_t> pages;
+        std::vector<std::uint32_t> shadows;
     };
 
-    struct Turns {
-        std::atomic<std::uint64_t> next{0};
-        std::atomic<std::uint64_t> serving{0};
-    };
+    class Shadows {
+    public:
+        std::uint32_t Allocate(std::uintptr_t page) {
+            if (!_free.empty()) {
+                const auto slot = _free.back();
+                _free.pop_back();
+                return slot;
+            }
+            if (_used == _chunks.size() * ChunkPages) {
+                void* chunk = ::mmap(nullptr, ChunkPages * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (chunk == MAP_FAILED) throw std::bad_alloc();
+                _chunks.push_back(static_cast<std::uint8_t*>(chunk));
+                _page = page;
+            }
+            return _used++;
+        }
 
-    struct Lock {
-        explicit Lock(Turns& turns) : _turns(turns), _turn(turns.next.fetch_add(1, std::memory_order_relaxed)) {
-            while (_turns.serving.load(std::memory_order_acquire) != _turn) ::sched_yield();
+        void Release(std::uint32_t slot) {
+            _free.push_back(slot);
         }
-        ~Lock() {
-            _turns.serving.store(_turn + 1, std::memory_order_release);
+
+        std::uint8_t* At(std::uint32_t slot) const {
+            return _chunks[slot / ChunkPages] + static_cast<std::size_t>(slot % ChunkPages) * _page;
         }
-        Turns& _turns;
-        std::uint64_t _turn;
+
+    private:
+        static constexpr std::uint32_t ChunkPages = 1024;
+        std::vector<std::uint8_t*> _chunks;
+        std::vector<std::uint32_t> _free;
+        std::uint32_t _used = 0;
+        std::uintptr_t _page = 0;
     };
 
     Watch() {
-        if (std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return;
-        struct sigaction action {};
-        action.sa_sigaction = &Watch::fault;
-        action.sa_flags = SA_SIGINFO | SA_RESTART;
-        sigemptyset(&action.sa_mask);
-        if (sigaction(SIGBUS, &action, &_previousBus) != 0 || sigaction(SIGSEGV, &action, &_previousSegv) != 0) {
-            std::fprintf(stderr, "[memory] write watch: cannot install the fault handler (%s); guest buffers are fully re-read every use\n", std::strerror(errno));
-            return;
-        }
-        _available = true;
+        _available = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
     }
 
-    static void fault(int signal, siginfo_t* info, void* context) {
-        auto& watch = Get();
-        if (watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
-        const auto& previous = signal == SIGBUS ? watch._previousBus : watch._previousSegv;
-        if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
-            previous.sa_sigaction(signal, info, context);
-            return;
+    bool differs(std::uintptr_t page, const std::uint8_t* shadow) const {
+        const auto* current = reinterpret_cast<const std::uint64_t*>(page);
+        const auto* previous = reinterpret_cast<const std::uint64_t*>(shadow);
+        const auto words = _page / sizeof(std::uint64_t);
+        for (std::size_t block = 0; block < words; block += 64) {
+            std::uint64_t difference = 0;
+            for (std::size_t word = block; word < block + 64; ++word) difference |= current[word] ^ previous[word];
+            if (difference != 0) return true;
         }
-        if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler != nullptr) {
-            previous.sa_handler(signal);
-            return;
-        }
-        ::signal(signal, SIG_DFL);
-    }
-
-    bool record(std::uintptr_t address) {
-        const auto page = pageStart(address);
-        const Lock lock(_lock);
-        auto it = _ranges.upper_bound(page);
-        if (it == _ranges.begin()) return false;
-        --it;
-        if (page >= it->second.end) return false;
-        auto& state = it->second.pages[(page - it->first) / _page];
-        if ((state & Protected) != 0) {
-            state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
-            ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
-            return true;
-        }
-        return (state & PROT_WRITE) != 0;
+        return false;
     }
 
     std::uintptr_t pageStart(std::uintptr_t address) const {
@@ -540,28 +529,11 @@ private:
         for (; it != _ranges.end() && it->first < end; ++it) {
             const auto first = std::max(begin, it->first);
             const auto last = std::min(end, it->second.end);
-            for (auto page = first; page < last; page += _page) function(page, it->second.pages[(page - it->first) / _page]);
-        }
-    }
-
-    void protect(std::uintptr_t begin, std::uintptr_t end) {
-        std::uintptr_t runStart = 0;
-        std::uintptr_t previous = begin;
-        int runProtection = -1;
-        const auto flush = [&](std::uintptr_t runEnd) {
-            if (runProtection >= 0) ::mprotect(reinterpret_cast<void*>(runStart), runEnd - runStart, runProtection);
-            runProtection = -1;
-        };
-        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            const int wanted = (state & Protected) != 0 ? (state & ProtectionMask & ~PROT_WRITE) : -1;
-            if (wanted != runProtection || page != previous) {
-                flush(previous);
-                runStart = page;
-                runProtection = wanted;
+            for (auto page = first; page < last; page += _page) {
+                const auto index = (page - it->first) / _page;
+                function(page, it->second.pages[index], it->second.shadows[index]);
             }
-            previous = page + _page;
-        });
-        flush(previous);
+        }
     }
 
     bool covers(std::uintptr_t begin, std::uintptr_t end) const {
@@ -589,26 +561,26 @@ private:
             }
             removed = true;
             auto pages = std::move(it->second.pages);
+            auto shadows = std::move(it->second.shadows);
             it = _ranges.erase(it);
             const auto cutBegin = std::max(begin, rangeBegin);
             const auto cutEnd = std::min(end, rangeEnd);
-            for (auto page = cutBegin; page < cutEnd; page += _page) {
-                const auto state = pages[(page - rangeBegin) / _page];
-                if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
-            }
-            if (rangeBegin < cutBegin) _ranges.emplace(rangeBegin, Range{cutBegin, std::vector<std::uint8_t>(pages.begin(), pages.begin() + (cutBegin - rangeBegin) / _page)});
-            if (cutEnd < rangeEnd) it = _ranges.emplace(cutEnd, Range{rangeEnd, std::vector<std::uint8_t>(pages.begin() + (cutEnd - rangeBegin) / _page, pages.end())}).first;
+            const auto cutFirst = (cutBegin - rangeBegin) / _page;
+            const auto cutLast = (cutEnd - rangeBegin) / _page;
+            for (auto index = cutFirst; index < cutLast; ++index)
+                if (shadows[index] != NoShadow) _shadows.Release(shadows[index]);
+            if (rangeBegin < cutBegin) _ranges.emplace(rangeBegin, Range{cutBegin, std::vector<std::uint8_t>(pages.begin(), pages.begin() + cutFirst), std::vector<std::uint32_t>(shadows.begin(), shadows.begin() + cutFirst)});
+            if (cutEnd < rangeEnd) it = _ranges.emplace(cutEnd, Range{rangeEnd, std::vector<std::uint8_t>(pages.begin() + cutLast, pages.end()), std::vector<std::uint32_t>(shadows.begin() + cutLast, shadows.end())}).first;
         }
         return removed;
     }
 
     const std::uintptr_t _page = static_cast<std::uintptr_t>(::getpagesize());
     bool _available = false;
-    Turns _lock;
+    std::mutex _lock;
     std::map<std::uintptr_t, Range> _ranges;
+    Shadows _shadows;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
-    struct sigaction _previousBus {};
-    struct sigaction _previousSegv {};
 };
 
 const bool g_opened = (Watch::Get(), true);

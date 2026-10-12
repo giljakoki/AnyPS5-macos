@@ -568,15 +568,9 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             cursor = gapEnd;
             continue;
         }
-        auto next = std::min<std::uintptr_t>(end, regionBase + regionSize);
-        bool readable = (info.protection & VM_PROT_READ) != 0;
-        bool writable = readable && (info.protection & VM_PROT_WRITE) != 0;
-        std::uintptr_t watchedEnd = next;
-        if (const int logical = GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(cursor, next, &watchedEnd); logical >= 0) {
-            next = std::min(next, watchedEnd);
-            readable = (logical & PROT_READ) != 0;
-            writable = readable && (logical & PROT_WRITE) != 0;
-        }
+        const auto next = std::min<std::uintptr_t>(end, regionBase + regionSize);
+        const bool readable = (info.protection & VM_PROT_READ) != 0;
+        const bool writable = readable && (info.protection & VM_PROT_WRITE) != 0;
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else

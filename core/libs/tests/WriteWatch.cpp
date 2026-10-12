@@ -3,6 +3,9 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -12,13 +15,17 @@
 #include <thread>
 #include <vector>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #if !defined(__APPLE__)
-#error The page protection write watch is the macOS backend
+#error The shadow comparison write watch is the macOS backend
 #endif
 
 using namespace GuestWriteWatch;
@@ -157,14 +164,16 @@ void CheckHostWrite() {
     Require(::pipe(descriptors) == 0, "cannot create a pipe");
     const std::array<char, 8> payload{'w', 'a', 't', 'c', 'h', 'e', 'd', '!'};
     Require(::write(descriptors[1], payload.data(), payload.size()) == static_cast<ssize_t>(payload.size()), "cannot fill the pipe");
-    errno = 0;
-    Require(::read(descriptors[0], region.base + region.page, payload.size()) == -1 && errno == EFAULT, "a system call wrote a protected page without a host write");
-    GuestWriteWatchBeginHostWrite_nid_postfix(region.base + region.page, payload.size());
-    Require(region.Collect() == std::set<std::size_t>({1}), "a page under a host write is not reported");
-    Require(::read(descriptors[0], region.base + region.page, payload.size()) == static_cast<ssize_t>(payload.size()), "a collection protected a page during a host write");
-    GuestWriteWatchEndHostWrite_nid_postfix(region.base + region.page, payload.size());
-    Require(std::memcmp(region.base + region.page, payload.data(), payload.size()) == 0, "the host write did not reach the page");
-    Require(region.Collect() == std::set<std::size_t>({1}), "a host write is not reported after it ends");
+    Require(::read(descriptors[0], region.base + region.page, payload.size()) == static_cast<ssize_t>(payload.size()), "a system call cannot write a watched page");
+    Require(region.Collect() == std::set<std::size_t>({1}), "a system call write is not reported");
+    Require(::write(descriptors[1], payload.data(), payload.size()) == static_cast<ssize_t>(payload.size()), "cannot fill the pipe again");
+    GuestWriteWatchBeginHostWrite_nid_postfix(region.base + 2 * region.page, payload.size());
+    Require(region.Collect() == std::set<std::size_t>({2}), "a page under a host write is not reported");
+    Require(::read(descriptors[0], region.base + 2 * region.page, payload.size()) == static_cast<ssize_t>(payload.size()), "a page under a host write cannot be written");
+    Require(region.Collect() == std::set<std::size_t>({2}), "a page under a host write is not reported at every collection");
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base + 2 * region.page, payload.size());
+    Require(std::memcmp(region.base + 2 * region.page, payload.data(), payload.size()) == 0, "the host write did not reach the page");
+    Require(region.Collect() == std::set<std::size_t>({2}), "a host write is not reported after it ends");
     Require(region.Collect().empty(), "a finished host write is reported again");
     ::close(descriptors[0]);
     ::close(descriptors[1]);
@@ -228,11 +237,58 @@ void CheckThreads() {
     Require(region.Collect().empty(), "writes are reported after the writers stopped");
 }
 
+#if defined(__x86_64__)
+__attribute__((target("avx"))) void StoreVector(std::uint8_t* destination, std::uint8_t value) {
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination), _mm256_set1_epi8(static_cast<char>(value)));
+}
+#endif
+
+void StoreThirtyTwo(std::uint8_t* destination, std::uint8_t value) {
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("avx")) return StoreVector(destination, value);
+#endif
+    typedef std::uint8_t Vector __attribute__((vector_size(32), aligned(1)));
+    Vector vector;
+    for (int lane = 0; lane < 32; ++lane) vector[lane] = value;
+    *reinterpret_cast<volatile Vector*>(destination) = vector;
+}
+
+void CheckVector() {
+    Region region(8);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    Require(region.Collect() == All(8), "a new range is not reported in full");
+    StoreThirtyTwo(region.base + 3 * region.page - 16, 5);
+    Require(region.Collect() == std::set<std::size_t>({2, 3}), "a vector store across a page boundary is not reported on both pages");
+    Require(region.base[3 * region.page - 16] == 5 && region.base[3 * region.page + 15] == 5, "a vector store across a page boundary was lost");
+    mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(region.base);
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    Require(mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) == KERN_SUCCESS, "cannot read the kernel protection of the watched range");
+    Require(address <= reinterpret_cast<mach_vm_address_t>(region.base) && address + size >= reinterpret_cast<mach_vm_address_t>(region.base + region.bytes) && (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE), "a collection changed the kernel protection of a watched page");
+    std::atomic<bool> stored{false};
+    std::thread blocked([&] {
+        sigset_t all;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, nullptr);
+        StoreThirtyTwo(region.base + 6 * region.page - 16, 9);
+        stored.store(true);
+    });
+    for (int wait = 0; wait < 500 && !stored.load(); ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!stored.load()) {
+        std::fprintf(stderr, "a vector store from a thread with every signal blocked did not complete\n");
+        std::_Exit(1);
+    }
+    blocked.join();
+    Require(region.Collect() == std::set<std::size_t>({5, 6}), "a vector store from a thread with every signal blocked is not reported");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection or threads");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection, threads or vector");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -242,6 +298,7 @@ int main(int argc, char** argv) {
         else if (mode == "host") CheckHostWrite();
         else if (mode == "protection") CheckProtection();
         else if (mode == "threads") CheckThreads();
+        else if (mode == "vector") CheckVector();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
