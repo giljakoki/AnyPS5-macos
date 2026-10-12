@@ -25,43 +25,35 @@ static constexpr int SCE_PLAYGO_ERROR_BAD_CHUNK_ID = static_cast<int>(0x80B2000C
 static constexpr int SCE_PLAYGO_ERROR_BAD_SIZE = static_cast<int>(0x80B2000B);
 static constexpr int SCE_PLAYGO_ERROR_BAD_LOCUS = static_cast<int>(0x80B20010);
 
-struct ChunkTable {
-    std::set<uint16_t> ids{0};
-    bool defined = false;
-};
+using ChunkTable = std::set<uint16_t>;
 
-static bool ReadPackageChunks(ChunkTable& table) {
+static void ReadPackageChunks(ChunkTable& table) {
     constexpr std::size_t CountOffset = 0x0A;
     std::ifstream file(ResolvePath_nid_no_patch("/app0/sce_sys/playgo-chunk.dat"), std::ios::binary);
     char header[CountOffset + sizeof(uint16_t)]{};
-    if (!file.read(header, sizeof(header)) || std::memcmp(header, "plgx", 4) != 0) return false;
+    if (!file.read(header, sizeof(header)) || std::memcmp(header, "plgx", 4) != 0) return;
     uint16_t count = 0;
     std::memcpy(&count, header + CountOffset, sizeof(count));
-    if (count == 0) return false;
-    for (uint32_t id = 0; id < count; ++id) table.ids.insert(static_cast<uint16_t>(id));
-    table.defined = true;
-    return true;
+    for (uint32_t id = 0; id < count; ++id) table.insert(static_cast<uint16_t>(id));
 }
 
 static const ChunkTable& Chunks() {
     static const ChunkTable chunks = [] {
-        ChunkTable table;
+        ChunkTable table{0};
         std::ifstream file(ResolvePath_nid_no_patch("/app0/playgo-chunkdefs.xml"));
         if (!file) {
             ReadPackageChunks(table);
             return table;
         }
-        table.defined = true;
-        auto& result = table.ids;
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         static const std::regex chunk(R"re(<chunk\s+id="(\d+)")re");
         for (auto it = std::sregex_iterator(text.begin(), text.end(), chunk); it != std::sregex_iterator(); ++it)
-            result.insert(static_cast<uint16_t>(std::stoul((*it)[1].str())));
+            table.insert(static_cast<uint16_t>(std::stoul((*it)[1].str())));
         static const std::regex defaultChunk(R"re(default_chunk="(\d+)")re");
         std::smatch match;
         if (std::regex_search(text, match, defaultChunk)) {
             const auto last = std::stoul(match[1].str());
-            for (unsigned long id = 0; id <= last && id <= 0xFFFF; ++id) result.insert(static_cast<uint16_t>(id));
+            for (unsigned long id = 0; id <= last && id <= 0xFFFF; ++id) table.insert(static_cast<uint16_t>(id));
         }
         return table;
     }();
@@ -69,8 +61,7 @@ static const ChunkTable& Chunks() {
 }
 
 static bool IsKnownChunk(uint16_t id) {
-    const auto& chunks = Chunks();
-    return !chunks.defined || chunks.ids.contains(id);
+    return Chunks().contains(id);
 }
 
 static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries) {
@@ -91,7 +82,7 @@ int APS5_VABI scePlayGoClose(int handle) {
 int APS5_VABI scePlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list, uint32_t number_of_entries, uint32_t* out_entries) {
     if (handle != PLAYGO_HANDLE) return SCE_PLAYGO_ERROR_BAD_HANDLE;
     if (!out_entries) return SCE_PLAYGO_ERROR_BAD_POINTER;
-    const auto& valid = Chunks().ids;
+    const auto& valid = Chunks();
     if (!out_chunk_id_list) {
         *out_entries = static_cast<uint32_t>(valid.size());
         return 0;
