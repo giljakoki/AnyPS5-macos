@@ -75,11 +75,13 @@ uint64_t APS5_VABI sceAvPlayerCurrentTime(AvPlayerInternal* h) {
 
 int APS5_VABI sceAvPlayerDisableStream(AvPlayerInternal* h, uint32_t stream_id) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] DisableStream %u\n", stream_id);
     return ToPlayer(h)->DisableStream(stream_id);
 }
 
 int APS5_VABI sceAvPlayerEnableStream(AvPlayerInternal* h, uint32_t stream_id) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] EnableStream %u\n", stream_id);
     return ToPlayer(h)->EnableStream(stream_id);
 }
 
@@ -92,11 +94,13 @@ Bool APS5_VABI sceAvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* a
 
 int APS5_VABI sceAvPlayerGetStreamInfo(AvPlayerInternal* h, uint32_t stream_id, AvPlayerStreamInfo* info) {
     if (!h || !info) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] GetStreamInfo %u\n", stream_id);
     return ToPlayer(h)->GetStreamInfo(stream_id, *info);
 }
 
 int APS5_VABI sceAvPlayerGetStreamInfoEx(AvPlayerInternal* h, uint32_t stream_id, AvPlayerStreamInfoEx* info) {
     if (!h || !info) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] GetStreamInfoEx %u\n", stream_id);
     return ToPlayer(h)->GetStreamInfoEx(stream_id, *info);
 }
 
@@ -175,6 +179,7 @@ int APS5_VABI sceAvPlayerResume(AvPlayerInternal* h) {
 
 int APS5_VABI sceAvPlayerSetAvSyncMode(AvPlayerInternal* h, uint32_t sync_mode) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] SetAvSyncMode %u\n", sync_mode);
     return ToPlayer(h)->SetAvSyncMode(sync_mode);
 }
 
@@ -200,6 +205,7 @@ int APS5_VABI sceAvPlayerSetLooping(AvPlayerInternal* h, Bool loop) {
 
 int APS5_VABI sceAvPlayerSetTrickSpeed(AvPlayerInternal* h, int32_t trick_speed) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] SetTrickSpeed %d\n", trick_speed);
     return ToPlayer(h)->SetTrickSpeed(trick_speed);
 }
 
@@ -224,6 +230,7 @@ int APS5_VABI sceAvPlayerStop(AvPlayerInternal* h) {
 
 int APS5_VABI sceAvPlayerStreamCount(AvPlayerInternal* h) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Trace()) std::fprintf(stderr, "[avplayer] StreamCount\n");
     return ToPlayer(h)->StreamCount();
 }
 
