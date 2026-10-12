@@ -115,12 +115,22 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
     return bytes + 4u > request.target.maxWorkgroupSharedMemoryBytes ? static_cast<std::uint32_t>(bytes) : 0u;
 }
 
-void ReportBarycentricEmulation(std::uint64_t address, const std::string& reason) {
+void ReportBarycentricEmulation(const RecompileRequest& request, const std::string& reason) {
     static std::mutex mutex;
     static std::set<std::pair<std::uint64_t, std::string>> reported;
+    static const bool dump = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+    const auto address = request.shader.codeAddress;
     const std::lock_guard lock(mutex);
     if (!reported.emplace(address, reason).second) return;
     std::fprintf(stderr, "[recompile] pixel shader 0x%llx emulates barycentrics: %s\n", static_cast<unsigned long long>(address), reason.c_str());
+    if (!dump) return;
+    char name[64];
+    std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
+    const auto text = RequestSerializer{}.Serialize(request);
+    if (std::FILE* file = std::fopen(name, "wb")) {
+        std::fwrite(text.data(), 1, text.size(), file);
+        std::fclose(file);
+    }
 }
 
 }
@@ -283,7 +293,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     simplify();
     std::string hostInterpolation;
     if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel, hostInterpolation)) {
-        ReportBarycentricEmulation(request.shader.codeAddress, hostInterpolation);
+        ReportBarycentricEmulation(request, hostInterpolation);
         translateOptions.fragmentShaderBarycentricEnabled = true;
         program = translator.Translate(decoded, cfg, translateOptions);
         program.Metadata().barycentricEmulation = true;
