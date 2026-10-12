@@ -98,6 +98,7 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
         registered[i] = {setIndex, reinterpret_cast<uint64_t>(buffers[i].data), reinterpret_cast<uint64_t>(buffers[i].metadata)};
         const auto display = DescribeVideoOutBuffer(registered[i], group);
         AgcDriverCheckGuestMemory_nid_postfix(buffers[i].data, AgcDriverDisplayBufferSize_nid_postfix(display), 65536);
+        std::fprintf(stderr, "[videoout] buffer %d of set %d registered: data %p metadata %p %ux%u category %d\n", bufferIndexStart + i, setIndex, buffers[i].data, buffers[i].metadata, attribute->width, attribute->height, category);
     }
     cfg->groups[setIndex] = group;
     cfg->width = attribute->width;
