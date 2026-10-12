@@ -65,4 +65,11 @@ extern "C" {
 LibcException::TypeInfoVtable _ZTVN10__cxxabiv117__class_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__class_type_info)};
 LibcException::TypeInfoVtable _ZTVN10__cxxabiv120__si_class_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__si_class_type_info)};
 LibcException::TypeInfoVtable _ZTVN10__cxxabiv121__vmi_class_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__vmi_class_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv117__pbase_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__pbase_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv119__pointer_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__pointer_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv129__pointer_to_member_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__pointer_to_member_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv120__function_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__function_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv123__fundamental_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__fundamental_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv116__enum_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__enum_type_info)};
+LibcException::TypeInfoVtable _ZTVN10__cxxabiv117__array_type_infoE_nid_postfix {0, &typeid(__cxxabiv1::__array_type_info)};
 }

@@ -178,4 +178,8 @@ int SignalCondition_nid_no_patch(void** handle) {
     return threadSuccess;
 }
 
+int APS5_VABI _Cnd_signal_nid_postfix(void** handle) {
+    return SignalCondition_nid_no_patch(handle);
+}
+
 }

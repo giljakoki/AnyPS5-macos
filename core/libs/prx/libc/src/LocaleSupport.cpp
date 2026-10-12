@@ -230,6 +230,19 @@ std::int32_t _ZNSt6locale2id7_Id_cntE_nid_postfix = 0;
 
 GuestLocale::Implementation* _ZSt21_sceLibcClassicLocale_nid_postfix = &g_classicLocale;
 
+struct StreamManipulator {
+    void (APS5_VABI *apply)(GuestLocale::IosBase*, std::int64_t);
+    std::int64_t argument;
+};
+
+static void APS5_VABI SetStreamWidth(GuestLocale::IosBase* stream, std::int64_t width) {
+    stream->width = static_cast<std::int32_t>(width);
+}
+
+StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(int width) {
+    return {SetStreamWidth, width};
+}
+
 void APS5_VABI _ZNSt8ios_baseD2Ev_nid_postfix(GuestLocale::IosBase* self) {
     if (self == nullptr) throw std::invalid_argument("ios_base destructor: null object");
     if (self->standardStream != 0 || self->storage != nullptr || self->callbacks != nullptr) throw std::runtime_error("ios_base destructor: unsupported stream storage or callbacks");

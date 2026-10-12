@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <climits>
+#include <cwchar>
 #include <cstdint>
 #include <cstddef>
 #include <cerrno>
@@ -326,6 +329,21 @@ char* APS5_VABI ctime_nid_postfix(const int64_t* timer) {
 
 size_t APS5_VABI strftime_nid_postfix(char* str, size_t count, const char* format, const GuestTm* timeptr) {
     return libc_strftime_nid_postfix(str, count, format, timeptr);
+}
+
+size_t APS5_VABI wcsftime_nid_postfix(wchar_t* str, size_t count, const wchar_t* format, const GuestTm* timeptr) {
+    const std::tm host = toHostTm(*timeptr);
+    std::string narrow(std::wcslen(format) * MB_LEN_MAX + 1, '\0');
+    const size_t narrowLength = std::wcstombs(narrow.data(), format, narrow.size());
+    if (narrowLength == static_cast<size_t>(-1)) throw std::runtime_error("wcsftime: the format is not convertible to the current locale");
+    narrow.resize(narrowLength);
+    if (!hasFreeBsdConversion(narrow.c_str())) return std::wcsftime(str, count, format, &host);
+    const std::string expanded = expandFreeBsdConversions(narrow.c_str(), *timeptr);
+    std::wstring wide(expanded.size() + 1, L'\0');
+    const size_t wideLength = std::mbstowcs(wide.data(), expanded.c_str(), wide.size());
+    if (wideLength == static_cast<size_t>(-1)) throw std::runtime_error("wcsftime: the expanded format is not convertible to wide characters");
+    wide.resize(wideLength);
+    return std::wcsftime(str, count, wide.c_str(), &host);
 }
 
 // The guest's CLOCKS_PER_SEC is 1000000: clock() reports process CPU time in microseconds.
