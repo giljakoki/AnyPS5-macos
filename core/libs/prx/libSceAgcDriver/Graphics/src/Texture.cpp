@@ -2925,6 +2925,8 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         // Still pending for the adjacency rule of writeBack until each one is stored.
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         if (!flush.empty()) BumpPendingSerial();
+        static const bool traceSubmits = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+        if (traceSubmits && !flush.empty() && bytes >= 0x100000) std::fprintf(stderr, "[submit-trace] flush pending 0x%llx+0x%zx reason %s images %zu first 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), bytes, reason, flush.size(), static_cast<unsigned long long>(flush.front()->descriptor.baseAddress), static_cast<unsigned long long>(flush.front()->guestBytes));
     }
     if (flush.empty()) {
         // Units shadowed over the range (another image's results retiled into the import's unit
@@ -3225,6 +3227,8 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
 }
 
 std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::size_t bytes) {
+    static const bool traceSubmits = std::getenv("APS5_TRACE_SUBMITS") != nullptr;
+    if (traceSubmits && bytes >= 0x100000) std::fprintf(stderr, "[submit-trace] discard pending inside 0x%llx+0x%zx\n", static_cast<unsigned long long>(address), bytes);
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     std::size_t discarded = 0;
