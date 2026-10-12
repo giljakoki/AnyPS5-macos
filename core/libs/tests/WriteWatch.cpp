@@ -278,11 +278,40 @@ void CheckVector() {
     Require(region.Collect() == std::set<std::size_t>({5, 6}), "a vector store from a thread with every signal blocked is not reported");
 }
 
+void CheckReservation() {
+    constexpr std::size_t Bytes = std::size_t{16} << 30;
+    constexpr int Rounds = 200;
+    const auto page = static_cast<std::size_t>(::getpagesize());
+    auto* base = static_cast<std::uint8_t*>(::mmap(nullptr, Bytes, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0));
+    Require(base != MAP_FAILED, "cannot reserve the test range");
+    Require(::mprotect(base, 4 * page, PROT_READ | PROT_WRITE) == 0, "cannot commit the start of the reservation");
+    const auto start = std::chrono::steady_clock::now();
+    GuestWriteWatchRegister_nid_postfix(base, Bytes);
+    std::size_t reported = 0;
+    Require(GuestWriteWatchCollect_nid_postfix(reinterpret_cast<std::uintptr_t>(base), 4 * page, [](void* context, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::size_t*>(context) += end - begin; }, &reported) && reported == 4 * page, "the committed start of a reservation is not reported");
+    for (int round = 0; round < Rounds; ++round) {
+        GuestWriteWatchRegister_nid_postfix(base, Bytes);
+        for (std::size_t bytes = Bytes / 2; bytes >= (std::size_t{256} << 20); bytes /= 2) {
+            GuestWriteWatchRegister_nid_postfix(base + bytes, bytes);
+            Require(GuestWriteWatchUnregister_nid_postfix(base + bytes, bytes), "a registered part of a reservation is not unregistered");
+        }
+        Require(GuestWriteWatchCovers_nid_postfix(reinterpret_cast<std::uintptr_t>(base), page), "the start of a reservation is not covered");
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    base[page] = 1;
+    reported = 0;
+    Require(GuestWriteWatchCollect_nid_postfix(reinterpret_cast<std::uintptr_t>(base), 4 * page, [](void* context, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::size_t*>(context) += end - begin; }, &reported) && reported == 4 * page, "a reservation registered again is not reported in full");
+    Require(GuestWriteWatchUnregister_nid_postfix(base, Bytes), "the reservation is not unregistered");
+    Require(!GuestWriteWatchCovers_nid_postfix(reinterpret_cast<std::uintptr_t>(base), page), "an unregistered reservation is covered");
+    ::munmap(base, Bytes);
+    Require(elapsed < std::chrono::seconds(2), "registering a large reservation costs time per page");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection, threads or vector");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection, threads, vector or reservation");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -293,6 +322,7 @@ int main(int argc, char** argv) {
         else if (mode == "protection") CheckProtection();
         else if (mode == "threads") CheckThreads();
         else if (mode == "vector") CheckVector();
+        else if (mode == "reservation") CheckReservation();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
