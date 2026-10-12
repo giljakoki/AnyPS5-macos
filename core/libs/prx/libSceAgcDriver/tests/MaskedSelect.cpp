@@ -827,5 +827,55 @@ int main() {
         return !removed(written);
     });
 
+    const auto mergedExecCopies = [](bool narrowedIncoming, bool exportedEverywhere) {
+        Builder b;
+        auto& exec = b.mask(16u);
+        const auto [low, high] = b.ballotWords(exec);
+        const auto [allLow, allHigh] = b.ballotWords(b.truth());
+        auto& savedLow = b.wordAnd(*low, *allLow);
+        auto& savedHigh = b.wordAnd(*high, *allHigh);
+        auto& old = b.lane();
+        IrBlock& head = *b.block;
+        IrBlock& body = b.newBlock();
+        IrBlock& merge = b.newBlock();
+        head.AddBranch(&body);
+        head.AddBranch(&merge);
+        body.AddBranch(&merge);
+        b.block = &body;
+        const auto [copyLow, copyHigh] = b.ballotWords(b.truth());
+        IrValue* restoredLow = &b.wordAnd(savedLow, *copyLow);
+        IrValue* restoredHigh = &b.wordAnd(savedHigh, *copyHigh);
+        if (narrowedIncoming) {
+            const auto [killedLow, killedHigh] = b.ballotWords(b.logicalAnd(exec, b.mask(8u)));
+            restoredLow = &b.wordAnd(*restoredLow, *killedLow);
+            restoredHigh = &b.wordAnd(*restoredHigh, *killedHigh);
+        }
+        auto& restored = b.threadBit(*restoredLow, *restoredHigh);
+        b.block = &merge;
+        auto& merged = b.program.CreateValue(IrOpcode::Phi, IrType::Bool);
+        merge.AppendInstruction(&merged);
+        merged.AddPhiOperand(&head, &exec);
+        merged.AddPhiOperand(&body, &restored);
+        auto& written = b.select(merged, b.add(old, 1u), old);
+        auto& exported = exportedEverywhere ? b.ballotBit(b.truth()) : b.threadBit(savedLow, savedHigh);
+        b.emit(IrOpcode::SetAttribute, IrType::Void, {&written, &exported});
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a write under an EXEC merged from the entry EXEC and its copy restored after a region, exported under the saved entry EXEC, drops the select", [&] {
+        const auto [count, gone] = mergedExecCopies(false, false);
+        return count != 0u && gone;
+    });
+
+    passed &= run("a write under an EXEC merged from the entry EXEC and an EXEC narrowed inside a region, exported under the saved entry EXEC, keeps the select", [&] {
+        const auto [count, gone] = mergedExecCopies(true, false);
+        return count == 0u && !gone;
+    });
+
+    passed &= run("a write under an EXEC merged from the entry EXEC and its restored copy, exported for every running lane, keeps the select", [&] {
+        const auto [count, gone] = mergedExecCopies(false, true);
+        return count == 0u && !gone;
+    });
+
     return passed ? 0 : 1;
 }
