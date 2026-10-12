@@ -23,13 +23,12 @@
 #endif
 
 #if defined(__APPLE__)
-#include <atomic>
-#include <cerrno>
-#include <csignal>
 #include <cstring>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <sched.h>
+#include <memory>
+#include <new>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -333,9 +332,7 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        std::vector<std::uint8_t> pages((end - begin) / _page, Written | Fresh);
-        std::vector<bool> queried(pages.size(), false);
-        const Lock lock(_lock);
+        std::vector<std::pair<std::uintptr_t, Segment>> mapped;
         for (auto cursor = begin; cursor < end;) {
             mach_vm_address_t address = cursor;
             mach_vm_size_t size = 0;
@@ -346,34 +343,45 @@ public:
             const auto first = std::max<std::uintptr_t>(cursor, address);
             const auto last = std::min<std::uintptr_t>(end, address + size);
             const std::uint8_t protection = ((info.protection & VM_PROT_READ) ? PROT_READ : 0) | ((info.protection & VM_PROT_WRITE) ? PROT_WRITE : 0) | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
-            for (auto page = first; page < last; page += _page) {
-                pages[(page - begin) / _page] = Written | Fresh | protection;
-                queried[(page - begin) / _page] = true;
-            }
+            mapped.emplace_back(first, Segment{last, protection});
             cursor = last;
         }
-        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            auto& entry = pages[(page - begin) / _page];
-            const std::uint8_t recorded = state & ProtectionMask;
-            const bool armed = (state & Protected) != 0 && (entry & ProtectionMask) == (recorded & ~PROT_WRITE);
-            if (armed || !queried[(page - begin) / _page]) entry = static_cast<std::uint8_t>(Written | Fresh | recorded);
-            else state = static_cast<std::uint8_t>(state & ~Protected);
-        });
+        const std::lock_guard lock(_lock);
+        std::vector<std::pair<std::uintptr_t, Segment>> segments;
+        auto cursor = begin;
+        const auto unqueried = [&](std::uintptr_t from, std::uintptr_t to) {
+            auto it = _segments.upper_bound(from);
+            if (it != _segments.begin()) --it;
+            for (; it != _segments.end() && it->first < to && from < to; ++it) {
+                if (it->second.end <= from) continue;
+                if (it->first > from) segments.emplace_back(from, Segment{it->first, 0});
+                const auto last = std::min(to, it->second.end);
+                segments.emplace_back(std::max(from, it->first), Segment{last, it->second.protection});
+                from = last;
+            }
+            if (from < to) segments.emplace_back(from, Segment{to, 0});
+        };
+        for (const auto& [first, segment] : mapped) {
+            if (first > cursor) unqueried(cursor, first);
+            segments.emplace_back(first, segment);
+            cursor = segment.end;
+        }
+        if (cursor < end) unqueried(cursor, end);
         erase(begin, end);
-        _ranges.emplace(begin, Range{end, std::move(pages)});
+        for (const auto& [first, segment] : segments) _segments.emplace(first, segment);
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return false;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         return erase(begin, end);
     }
 
     bool Covers(std::uintptr_t begin, std::uintptr_t end) {
         if (!_available) return false;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         return covers(begin, end);
     }
 
@@ -386,21 +394,46 @@ public:
         if (end <= begin) return true;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
         {
-            const Lock lock(_lock);
+            const std::lock_guard lock(_lock);
             if (take != Take::Fresh && !covers(begin, end)) return false;
-            forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-                if ((state & Written) == 0) return;
-                const bool fresh = (state & Fresh) != 0;
-                if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) return;
-                state &= static_cast<std::uint8_t>(~Fresh);
-                if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
-                else runs.emplace_back(page, page + _page);
-                for (const auto& [first, last] : _hostWrites)
-                    if (page >= first && page < last) return;
-                state &= static_cast<std::uint8_t>(~Written);
-                if ((state & PROT_WRITE) != 0) state |= Protected;
-            });
-            for (const auto& [first, last] : runs) protect(first, last);
+            auto it = _segments.upper_bound(begin);
+            if (it != _segments.begin()) --it;
+            Leaf* leaf = nullptr;
+            std::uintptr_t leafNumber = ~std::uintptr_t{0};
+            for (; it != _segments.end() && it->first < end; ++it) {
+                const auto first = std::max(begin, it->first);
+                const auto last = std::min(end, it->second.end);
+                const std::uint8_t initial = Written | Fresh | Materialized | it->second.protection;
+                for (auto page = first; page < last; page += _page) {
+                    const auto number = page / _page;
+                    if ((number >> LeafShift) != leafNumber) {
+                        leafNumber = number >> LeafShift;
+                        const auto found = _leaves.find(leafNumber);
+                        leaf = found != _leaves.end() ? found->second.get() : nullptr;
+                    }
+                    const auto index = number & (LeafPages - 1);
+                    std::uint8_t state = leaf != nullptr && (leaf->states[index] & Materialized) != 0 ? leaf->states[index] : initial;
+                    const bool fresh = (state & Fresh) != 0;
+                    if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) continue;
+                    const bool compared = (state & Comparable) == Comparable;
+                    const auto shadow = leaf != nullptr ? leaf->shadows[index] : NoShadow;
+                    if ((state & Written) == 0 && (!compared || shadow == NoShadow || !differs(page, _shadows.At(shadow)))) continue;
+                    if (leaf == nullptr) leaf = materializeLeaf(leafNumber);
+                    if ((leaf->states[index] & Materialized) == 0) ++leaf->materialized;
+                    state &= static_cast<std::uint8_t>(~Fresh);
+                    if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
+                    else runs.emplace_back(page, page + _page);
+                    const bool hostWrite = std::any_of(_hostWrites.begin(), _hostWrites.end(), [&](const auto& write) { return page >= write.first && page < write.second; });
+                    if (!hostWrite) {
+                        if (compared) {
+                            if (leaf->shadows[index] == NoShadow) leaf->shadows[index] = _shadows.Allocate(_page);
+                            std::memcpy(_shadows.At(leaf->shadows[index]), reinterpret_cast<const void*>(page), _page);
+                        }
+                        state &= static_cast<std::uint8_t>(~Written);
+                    }
+                    leaf->states[index] = state;
+                }
+            }
         }
         for (const auto& [first, last] : runs) written(context, first, last);
         return true;
@@ -410,9 +443,13 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        const Lock lock(_lock);
-        forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
-            state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
+        const std::lock_guard lock(_lock);
+        split(begin);
+        split(end);
+        for (auto it = _segments.lower_bound(begin); it != _segments.end() && it->first < end; ++it) it->second.protection = static_cast<std::uint8_t>(protection & ProtectionMask);
+        forEachMaterialized(begin, end, [&](Leaf& leaf, std::size_t index) {
+            auto& state = leaf.states[index];
+            state = static_cast<std::uint8_t>(Materialized | Written | (state & Fresh) | (protection & ProtectionMask));
         });
     }
 
@@ -420,11 +457,10 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         _hostWrites.emplace_back(begin, end);
-        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
-            state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
+        forEachMaterialized(begin, end, [&](Leaf& leaf, std::size_t index) {
+            leaf.states[index] |= Written;
         });
     }
 
@@ -432,97 +468,99 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
-        const Lock lock(_lock);
+        const std::lock_guard lock(_lock);
         const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{begin, end});
         if (found != _hostWrites.end()) _hostWrites.erase(found);
     }
 
     int Protection(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
         const auto page = pageStart(address);
-        const Lock lock(_lock);
-        auto it = _ranges.upper_bound(page);
-        if (_available && it != _ranges.begin() && page < std::prev(it)->second.end) {
+        const std::lock_guard lock(_lock);
+        auto it = _segments.upper_bound(page);
+        if (_available && it != _segments.begin() && page < std::prev(it)->second.end) {
             --it;
-            const auto& pages = it->second.pages;
-            const std::uint8_t protection = pages[(page - it->first) / _page] & ProtectionMask;
-            auto end = page + _page;
-            while (end < it->second.end && end < limit && (pages[(end - it->first) / _page] & ProtectionMask) == protection) end += _page;
+            const auto protection = it->second.protection;
+            auto end = it->second.end;
+            for (auto next = std::next(it); next != _segments.end() && next->first == end && end < limit && next->second.protection == protection; ++next) end = next->second.end;
             *runEnd = std::min(end, limit);
             return protection;
         }
-        *runEnd = it != _ranges.end() ? std::min(it->first, limit) : limit;
+        *runEnd = it != _segments.end() ? std::min(it->first, limit) : limit;
         return -1;
     }
 
 private:
     static constexpr std::uint8_t ProtectionMask = PROT_READ | PROT_WRITE | PROT_EXEC;
+    static constexpr std::uint8_t Comparable = PROT_READ | PROT_WRITE;
     static constexpr std::uint8_t Written = 0x10;
-    static constexpr std::uint8_t Protected = 0x20;
     static constexpr std::uint8_t Fresh = 0x40;
+    static constexpr std::uint8_t Materialized = 0x80;
+    static constexpr std::uint32_t NoShadow = ~std::uint32_t{0};
+    static constexpr unsigned LeafShift = 16;
+    static constexpr std::uintptr_t LeafPages = std::uintptr_t{1} << LeafShift;
 
-    struct Range {
+    struct Segment {
         std::uintptr_t end;
-        std::vector<std::uint8_t> pages;
+        std::uint8_t protection;
     };
 
-    struct Turns {
-        std::atomic<std::uint64_t> next{0};
-        std::atomic<std::uint64_t> serving{0};
+    struct Leaf {
+        Leaf() {
+            states.fill(0);
+            shadows.fill(NoShadow);
+        }
+        std::array<std::uint8_t, LeafPages> states;
+        std::array<std::uint32_t, LeafPages> shadows;
+        std::size_t materialized = 0;
     };
 
-    struct Lock {
-        explicit Lock(Turns& turns) : _turns(turns), _turn(turns.next.fetch_add(1, std::memory_order_relaxed)) {
-            while (_turns.serving.load(std::memory_order_acquire) != _turn) ::sched_yield();
+    class Shadows {
+    public:
+        std::uint32_t Allocate(std::uintptr_t page) {
+            if (!_free.empty()) {
+                const auto slot = _free.back();
+                _free.pop_back();
+                return slot;
+            }
+            if (_used == _chunks.size() * ChunkPages) {
+                void* chunk = ::mmap(nullptr, ChunkPages * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (chunk == MAP_FAILED) throw std::bad_alloc();
+                _chunks.push_back(static_cast<std::uint8_t*>(chunk));
+                _page = page;
+            }
+            return _used++;
         }
-        ~Lock() {
-            _turns.serving.store(_turn + 1, std::memory_order_release);
+
+        void Release(std::uint32_t slot) {
+            _free.push_back(slot);
         }
-        Turns& _turns;
-        std::uint64_t _turn;
+
+        std::uint8_t* At(std::uint32_t slot) const {
+            return _chunks[slot / ChunkPages] + static_cast<std::size_t>(slot % ChunkPages) * _page;
+        }
+
+    private:
+        static constexpr std::uint32_t ChunkPages = 1024;
+        std::vector<std::uint8_t*> _chunks;
+        std::vector<std::uint32_t> _free;
+        std::uint32_t _used = 0;
+        std::uintptr_t _page = 0;
     };
 
     Watch() {
-        if (std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return;
-        struct sigaction action {};
-        action.sa_sigaction = &Watch::fault;
-        action.sa_flags = SA_SIGINFO | SA_RESTART;
-        sigemptyset(&action.sa_mask);
-        if (sigaction(SIGBUS, &action, &_previousBus) != 0 || sigaction(SIGSEGV, &action, &_previousSegv) != 0) {
-            std::fprintf(stderr, "[memory] write watch: cannot install the fault handler (%s); guest buffers are fully re-read every use\n", std::strerror(errno));
-            return;
-        }
-        _available = true;
+        _available = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
     }
 
-    static void fault(int signal, siginfo_t* info, void* context) {
-        auto& watch = Get();
-        if (watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
-        const auto& previous = signal == SIGBUS ? watch._previousBus : watch._previousSegv;
-        if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
-            previous.sa_sigaction(signal, info, context);
-            return;
+    bool differs(std::uintptr_t page, const std::uint8_t* shadow) const {
+        const auto* current = reinterpret_cast<const std::uint64_t*>(page);
+        const auto* previous = reinterpret_cast<const std::uint64_t*>(shadow);
+        const auto words = _page / sizeof(std::uint64_t);
+        for (std::size_t block = 0; block < words; block += 64) {
+            std::uint64_t difference = 0;
+            for (std::size_t word = block; word < block + 64; ++word) difference |= current[word] ^ previous[word];
+            if (difference != 0) return true;
         }
-        if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler != nullptr) {
-            previous.sa_handler(signal);
-            return;
-        }
-        ::signal(signal, SIG_DFL);
-    }
-
-    bool record(std::uintptr_t address) {
-        const auto page = pageStart(address);
-        const Lock lock(_lock);
-        auto it = _ranges.upper_bound(page);
-        if (it == _ranges.begin()) return false;
-        --it;
-        if (page >= it->second.end) return false;
-        auto& state = it->second.pages[(page - it->first) / _page];
-        if ((state & Protected) != 0) {
-            state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
-            ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
-            return true;
-        }
-        return (state & PROT_WRITE) != 0;
+        return false;
     }
 
     std::uintptr_t pageStart(std::uintptr_t address) const {
@@ -533,43 +571,52 @@ private:
         return (address + _page - 1) & ~(_page - 1);
     }
 
+    Leaf* materializeLeaf(std::uintptr_t number) {
+        auto& leaf = _leaves[number];
+        if (!leaf) leaf = std::make_unique<Leaf>();
+        return leaf.get();
+    }
+
     template <typename TFunction>
-    void forEachPage(std::uintptr_t begin, std::uintptr_t end, TFunction function) {
-        auto it = _ranges.upper_bound(begin);
-        if (it != _ranges.begin()) --it;
-        for (; it != _ranges.end() && it->first < end; ++it) {
-            const auto first = std::max(begin, it->first);
-            const auto last = std::min(end, it->second.end);
-            for (auto page = first; page < last; page += _page) function(page, it->second.pages[(page - it->first) / _page]);
+    void forEachMaterialized(std::uintptr_t begin, std::uintptr_t end, TFunction function) {
+        const auto firstPage = begin / _page;
+        const auto lastPage = end / _page;
+        const auto firstLeaf = firstPage >> LeafShift;
+        const auto lastLeaf = (lastPage - 1) >> LeafShift;
+        std::vector<std::uintptr_t> numbers;
+        if (lastLeaf - firstLeaf >= _leaves.size()) {
+            for (const auto& [number, leaf] : _leaves)
+                if (number >= firstLeaf && number <= lastLeaf) numbers.push_back(number);
+        } else {
+            for (auto number = firstLeaf; number <= lastLeaf; ++number)
+                if (_leaves.contains(number)) numbers.push_back(number);
+        }
+        for (const auto number : numbers) {
+            auto& leaf = *_leaves.at(number);
+            const auto from = std::max(firstPage, number << LeafShift) - (number << LeafShift);
+            const auto to = std::min(lastPage, (number + 1) << LeafShift) - (number << LeafShift);
+            for (auto index = from; index < to && leaf.materialized != 0; ++index)
+                if ((leaf.states[index] & Materialized) != 0) function(leaf, index);
+            if (leaf.materialized == 0) _leaves.erase(number);
         }
     }
 
-    void protect(std::uintptr_t begin, std::uintptr_t end) {
-        std::uintptr_t runStart = 0;
-        std::uintptr_t previous = begin;
-        int runProtection = -1;
-        const auto flush = [&](std::uintptr_t runEnd) {
-            if (runProtection >= 0) ::mprotect(reinterpret_cast<void*>(runStart), runEnd - runStart, runProtection);
-            runProtection = -1;
-        };
-        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            const int wanted = (state & Protected) != 0 ? (state & ProtectionMask & ~PROT_WRITE) : -1;
-            if (wanted != runProtection || page != previous) {
-                flush(previous);
-                runStart = page;
-                runProtection = wanted;
-            }
-            previous = page + _page;
-        });
-        flush(previous);
+    void split(std::uintptr_t at) {
+        auto it = _segments.upper_bound(at);
+        if (it == _segments.begin()) return;
+        --it;
+        if (it->first >= at || it->second.end <= at) return;
+        const auto tail = it->second;
+        it->second.end = at;
+        _segments.emplace(at, tail);
     }
 
     bool covers(std::uintptr_t begin, std::uintptr_t end) const {
-        auto it = _ranges.upper_bound(begin);
-        if (it == _ranges.begin()) return false;
+        auto it = _segments.upper_bound(begin);
+        if (it == _segments.begin()) return false;
         --it;
         auto cursor = begin;
-        for (; it != _ranges.end() && it->first <= cursor; ++it) {
+        for (; it != _segments.end() && it->first <= cursor; ++it) {
             if (it->second.end > cursor) cursor = it->second.end;
             if (cursor >= end) return true;
         }
@@ -577,38 +624,29 @@ private:
     }
 
     bool erase(std::uintptr_t begin, std::uintptr_t end) {
+        split(begin);
+        split(end);
         bool removed = false;
-        auto it = _ranges.upper_bound(begin);
-        if (it != _ranges.begin()) --it;
-        while (it != _ranges.end() && it->first < end) {
-            const auto rangeBegin = it->first;
-            const auto rangeEnd = it->second.end;
-            if (rangeEnd <= begin) {
-                ++it;
-                continue;
-            }
+        for (auto it = _segments.lower_bound(begin); it != _segments.end() && it->first < end;) {
+            it = _segments.erase(it);
             removed = true;
-            auto pages = std::move(it->second.pages);
-            it = _ranges.erase(it);
-            const auto cutBegin = std::max(begin, rangeBegin);
-            const auto cutEnd = std::min(end, rangeEnd);
-            for (auto page = cutBegin; page < cutEnd; page += _page) {
-                const auto state = pages[(page - rangeBegin) / _page];
-                if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
-            }
-            if (rangeBegin < cutBegin) _ranges.emplace(rangeBegin, Range{cutBegin, std::vector<std::uint8_t>(pages.begin(), pages.begin() + (cutBegin - rangeBegin) / _page)});
-            if (cutEnd < rangeEnd) it = _ranges.emplace(cutEnd, Range{rangeEnd, std::vector<std::uint8_t>(pages.begin() + (cutEnd - rangeBegin) / _page, pages.end())}).first;
         }
+        forEachMaterialized(begin, end, [&](Leaf& leaf, std::size_t index) {
+            if (leaf.shadows[index] != NoShadow) _shadows.Release(leaf.shadows[index]);
+            leaf.shadows[index] = NoShadow;
+            leaf.states[index] = 0;
+            --leaf.materialized;
+        });
         return removed;
     }
 
     const std::uintptr_t _page = static_cast<std::uintptr_t>(::getpagesize());
     bool _available = false;
-    Turns _lock;
-    std::map<std::uintptr_t, Range> _ranges;
+    std::mutex _lock;
+    std::map<std::uintptr_t, Segment> _segments;
+    std::unordered_map<std::uintptr_t, std::unique_ptr<Leaf>> _leaves;
+    Shadows _shadows;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
-    struct sigaction _previousBus {};
-    struct sigaction _previousSegv {};
 };
 
 const bool g_opened = (Watch::Get(), true);
