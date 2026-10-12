@@ -90,8 +90,21 @@ static void CheckUtc(const UtcCase& expected) {
         && utc.tm_hour == expected.hour && utc.tm_min == expected.min && utc.tm_sec == expected.sec
         && utc.tm_wday == expected.wday && utc.tm_yday == expected.yday && utc.tm_isdst == 0,
         "UTC calendar fields are wrong");
-    Require(utc.tm_gmtoff == 0, "UTC conversion did not reset tm_gmtoff");
-    Require(utc.tm_zone != nullptr && std::strcmp(utc.tm_zone, "UTC") == 0, "UTC conversion did not set tm_zone");
+}
+
+static void CheckBounds() {
+    struct Guarded {
+        GuestTm tm;
+        std::array<unsigned char, 32> guard;
+    };
+    static_assert(sizeof(GuestTm) == 36);
+    const std::int64_t timer = 1700000000;
+    Guarded guarded{};
+    guarded.guard.fill(0x5c);
+    Require(gmtime_s_nid_postfix(&timer, &guarded.tm) == &guarded.tm, "UTC conversion failed");
+    Require(localtime_s_nid_postfix(&timer, &guarded.tm) == &guarded.tm, "Local conversion failed");
+    Require(mktime_nid_postfix(&guarded.tm) == timer, "mktime did not invert localtime");
+    for (const unsigned char byte : guarded.guard) Require(byte == 0x5c, "A conversion wrote past the guest tm");
 }
 
 static void CheckFormat(const GuestTm& guest, const char* format, const char* expected) {
@@ -132,14 +145,17 @@ static void CheckFreeBsdConversions() {
     Require(gmtime_s_nid_postfix(&timer, &guest) == &guest, "UTC conversion failed");
     CheckFormat(guest, "%k|%l", "22|10");
     CheckFormat(guest, "%v", "14-Nov-2023");
-    CheckFormat(guest, "%+", "Tue Nov 14 22:13:20 UTC 2023");
+    char expected[96];
+    std::snprintf(expected, sizeof(expected), "Tue Nov 14 22:13:20 %s 2023", HostZoneName(0));
+    CheckFormat(guest, "%+", expected);
     CheckFormat(guest, "%s", "1699992800");
     CheckWideFormat(guest, L"%Y-%m-%d %H:%M:%S", L"2023-11-14 22:13:20");
     CheckWideFormat(guest, L"%v|%k|%s", L"14-Nov-2023|22|1699992800");
     CheckFormat(guest, "%%k %%l %%s %%v %%+", "%k %l %s %v %+");
     CheckFormat(guest, "%%%k", "%22");
     CheckFormat(guest, "[%k][%l]", "[22][10]");
-    CheckFormat(guest, "%Ek|%Ol|%Os|%Ev|%O+", "22|10|1699992800|14-Nov-2023|Tue Nov 14 22:13:20 UTC 2023");
+    std::snprintf(expected, sizeof(expected), "22|10|1699992800|14-Nov-2023|Tue Nov 14 22:13:20 %s 2023", HostZoneName(0));
+    CheckFormat(guest, "%Ek|%Ol|%Os|%Ev|%O+", expected);
     CheckFormat(guest, "%E%k", "%k");
     CheckFormat(guest, "%O%l", "%l");
     CheckFormat(guest, "%E%s", "%s");
@@ -151,19 +167,9 @@ static void CheckFreeBsdConversions() {
     CheckFormat(guest, "%E%k%k", "%k22");
     CheckBufferSize(guest, "%k", 2);
     CheckBufferSize(guest, "%k:%l", 5);
-    CheckBufferSize(guest, "%+", 28);
+    CheckBufferSize(guest, "%+", 25 + std::strlen(HostZoneName(0)));
     CheckBufferSize(guest, "%Ek", 2);
 
-    guest.tm_zone = "XYZ";
-    CheckFormat(guest, "%+", "Tue Nov 14 22:13:20 XYZ 2023");
-    CheckFormat(guest, "%O+", "Tue Nov 14 22:13:20 XYZ 2023");
-    guest.tm_zone = "A%B";
-    CheckFormat(guest, "%+", "Tue Nov 14 22:13:20 A%B 2023");
-    guest.tm_zone = nullptr;
-    guest.tm_isdst = 0;
-    char expected[96];
-    std::snprintf(expected, sizeof(expected), "Tue Nov 14 22:13:20 %s 2023", HostZoneName(0));
-    CheckFormat(guest, "%+", expected);
     guest.tm_isdst = 1;
     std::snprintf(expected, sizeof(expected), "Tue Nov 14 22:13:20 %s 2023", HostZoneName(1));
     CheckFormat(guest, "%+", expected);
@@ -218,17 +224,13 @@ int main() {
     std::memset(&local, 0xAA, sizeof(local));
     Require(localtime_s_nid_postfix(&epoch, &local) == &local && local.tm_year == 70 && local.tm_mon == 0
         && local.tm_mday == 1 && local.tm_hour == 2, "Local epoch conversion failed");
-    Require(local.tm_gmtoff == 7200, "Local conversion did not set tm_gmtoff");
-    Require(local.tm_zone != nullptr && std::strlen(local.tm_zone) > 0, "Local conversion did not set tm_zone");
 
     GuestTm roundTrip = local;
     roundTrip.tm_wday = -1;
     roundTrip.tm_yday = -1;
-    roundTrip.tm_gmtoff = -1;
-    roundTrip.tm_zone = nullptr;
     Require(mktime_nid_postfix(&roundTrip) == 0, "mktime did not invert localtime");
     Require(roundTrip.tm_wday == 4 && roundTrip.tm_yday == 0, "mktime did not normalize the calendar fields");
-    Require(roundTrip.tm_gmtoff == 7200 && roundTrip.tm_zone != nullptr, "mktime did not set the zone fields");
+    CheckBounds();
 
     Require(std::strcmp(ctime_nid_postfix(&epoch), "Thu Jan  1 02:00:00 1970\n") == 0, "ctime did not format local time");
     const std::int64_t leap = 951782400 + 13 * 3600 + 4 * 60 + 5;
@@ -256,6 +258,8 @@ int main() {
 #endif
     tzset_nid_postfix();
     GuestTm shifted{};
-    Require(localtime_s_nid_postfix(&epoch, &shifted) == &shifted && shifted.tm_hour == 5 && shifted.tm_gmtoff == 18000,
-        "tzset did not pick up the new TZ");
+    Require(localtime_s_nid_postfix(&epoch, &shifted) == &shifted && shifted.tm_hour == 5, "tzset did not pick up the new TZ");
+    char zoned[64]{};
+    Require(strftime_nid_postfix(zoned, sizeof(zoned), "%z", &shifted) == 5 && std::strcmp(zoned, "+0500") == 0,
+        "strftime did not report the local offset");
 }
