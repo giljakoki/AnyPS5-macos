@@ -265,6 +265,48 @@ void testFlipHold() {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+void testFlipsAhead() {
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = true;
+    }
+    struct GateRelease {
+        std::shared_ptr<State> state;
+        ~GateRelease() {
+            {
+                std::lock_guard lock(state->mutex);
+                state->gate = false;
+            }
+            state->changed.notify_all();
+        }
+    } gateRelease{output->state};
+    std::array<std::uint32_t, 10> gated{0xc0021018, 7, 0, 0, 0xc004105c, 7, 0xfffffffeu, 1, 0, 0};
+    Packet gatedFrame{gated.data(), static_cast<std::uint32_t>(gated.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&gatedFrame) == 0, "gated flip submission failed");
+    {
+        std::unique_lock lock(output->state->mutex);
+        check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; }), "worker did not reach the rendering wait");
+    }
+    auto second = std::async(std::launch::async, [] { submitFlip(); });
+    check(second.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "a flip within the flips-ahead budget was held");
+    second.get();
+    auto third = std::async(std::launch::async, [] { submitFlip(); });
+    check(third.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout, "a flip beyond the flips-ahead budget was accepted");
+    check(output->state->ready == 0, "a flip passed a closed rendering wait");
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = false;
+    }
+    output->state->changed.notify_all();
+    check(third.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "a flip stayed held after the worker reached the oldest one");
+    third.get();
+    AgcDriverWaitIdle_nid_postfix();
+    check(output->state->ready == 3, "flips ahead were lost");
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
 void testFailure() {
     auto output = std::make_shared<Output>();
     output->state->fail = true;
@@ -300,10 +342,12 @@ void testReset(bool compute) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2) testReset(std::string(argv[1]) == "compute");
+        const std::string mode = argc == 2 ? argv[1] : "";
+        if (mode == "ahead") { testFlipsAhead(); testFailure(); }
+        else if (argc == 2) testReset(mode == "compute");
         else { testFlipAndBoundary(); testFlipHold(); testFailure(); }
         const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
-        check(shutdown.find(argc == 2 ? (std::string(argv[1]) == "compute" ? "not readable" : "required shader register") : "intentional flip failure") != std::string::npos, "shutdown lost worker failure");
+        check(shutdown.find(mode == "compute" ? "not readable" : argc == 2 && mode != "ahead" ? "required shader register" : "intentional flip failure") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC flip and suspend tests passed");
         return 0;
     } catch (const std::exception& error) {

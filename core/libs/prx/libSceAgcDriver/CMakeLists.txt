@@ -1185,6 +1185,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_pm4_priority_refused PROPERTIES ENVIRONMENT
             "ANYPS5_NO_SHADER_CACHE=1;APS5_THREAD_PRIORITY=high;DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent/aps5-no-rtkit" SKIP_RETURN_CODE 77)
     endif()
+    add_test(NAME agc_driver_flips_ahead COMMAND agc_driver_flip_tests ahead)
+    set_tests_properties(agc_driver_flips_ahead PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FLIPS_AHEAD=2")
+    if(WIN32)
+        set_tests_properties(agc_driver_flips_ahead PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_flip_compute COMMAND agc_driver_flip_tests compute)
     set_tests_properties(agc_driver_flip_compute PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
     if(WIN32)

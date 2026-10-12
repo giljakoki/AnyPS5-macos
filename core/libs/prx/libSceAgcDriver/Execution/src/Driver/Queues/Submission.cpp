@@ -13,6 +13,8 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -148,14 +150,27 @@ void Driver::noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited) {
     changed.notify_all();
 }
 
+namespace {
+
+std::uint32_t FlipsAheadBudget() {
+    const char* value = std::getenv("APS5_FLIPS_AHEAD");
+    if (value == nullptr) return 1;
+    const std::string text(value);
+    if (text.size() != 1 || text[0] < '1' || text[0] > '8') throw std::runtime_error("AGC driver: APS5_FLIPS_AHEAD must be a number from 1 to 8");
+    return static_cast<std::uint32_t>(text[0] - '0');
+}
+
+}
+
 void Driver::holdFlipBehindWorker(const Submission& submission) {
+    static const std::uint32_t budget = FlipsAheadBudget();
     if (submission.queue != 0 || onWorkerThread()) return;
     bool flips = false;
     for (std::size_t cursor = 0; cursor < submission.commands.size() && !flips; cursor += Pm4::PacketWords(submission.commands[cursor])) flips = submission.commands[cursor] == FlipPacketHeader;
     if (!flips) return;
     std::unique_lock lock(mutex);
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
-    changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) < budget || queue0AwaitsTitle.load(std::memory_order_acquire); });
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
 }
 
