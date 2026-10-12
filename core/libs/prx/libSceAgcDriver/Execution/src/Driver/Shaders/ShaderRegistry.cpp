@@ -29,11 +29,13 @@
 namespace AgcDriver::DriverDetail {
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
+    static const bool dumpAll = [] { const char* text = std::getenv("APS5_DUMP_SHADERS"); return text != nullptr && std::string_view(text) == "all"; }();
+    if (dumpAll) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
     try {
         return ShaderRecompiler::PrepareShader(request, preparation);
     } catch (...) {
         try {
-            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
+            if (!dumpAll && std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
         } catch (...) {}
         throw;
     }

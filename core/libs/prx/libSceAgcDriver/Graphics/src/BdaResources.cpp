@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -244,8 +245,18 @@ void BdaResources::CheckFault() const {
         Require(static_cast<std::uint32_t>(report.reason) == 0 && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.reserved == 0, "BDA fault record has data without publication");
         return;
     }
-    Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.reserved == 0, "incomplete or invalid BDA fault record");
-    Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
+    Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready, "incomplete or invalid BDA fault record");
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle) {
+        const auto word = [](std::uint32_t bits) { return std::bit_cast<float>(bits); };
+        static constexpr std::array<const char*, 6> checks{"one corner vertex", "finite positions", "positive W", "W of vertex 1 equal", "W of vertex 2 equal", "finite fourth vertex"};
+        std::ostringstream text;
+        text << "rect-list requires finite nondegenerate axis-aligned positions with equal positive W; the first rejected primitive has vertex 0 at (" << word(static_cast<std::uint32_t>(report.address)) << ", " << word(static_cast<std::uint32_t>(report.address >> 32u)) << ") with W " << word(report.instruction) << " and vertex 1 at (" << word(report.bytes) << ", " << word(report.stage) << "); failed:";
+        for (std::size_t i = 0; i < checks.size(); ++i) {
+            if ((report.reserved & (1u << i)) == 0u) text << " " << checks[i];
+        }
+        throw std::runtime_error("AGC graphics: " + text.str());
+    }
+    Require(report.reserved == 0, "incomplete or invalid BDA fault record");
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);

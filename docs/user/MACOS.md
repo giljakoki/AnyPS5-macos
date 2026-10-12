@@ -99,6 +99,7 @@ MoltenVK has no subgroup operations in vertex and tessellation-evaluation shader
 ## Limitations
 
 - MoltenVK has no subgroup operations in vertex and tessellation-evaluation shaders; the recompiler lowers what it can exactly and stops the title on the rest, naming the constructs (see above).
+- A rect-list draw whose vertex count is not a multiple of 3 is drawn as a patch list; Vulkan drops the trailing 1 or 2 vertices, but MoltenVK tessellates them as a patch with zeroed control points, which the rect-list hull shader then rejects (`rect-list requires finite nondegenerate axis-aligned positions`, every frame, with a black screen). The driver therefore leaves those vertices out of the draw itself.
 - Metal has no 64-bit floats and no 64-bit atomics, and MoltenVK has no `VK_KHR_shader_clock`. Shaders that need them fail; the affected tests are listed in [technical debt](../dev/TechnicalDebt.md).
 - An f16 multiply that should give -0.0 gives +0.0 under SPIRV-Cross; see [technical debt](../dev/TechnicalDebt.md).
 - `sceKernelGetModuleInfoFromAddr`, `sceKernelGetModuleList` and `sceKernelGetModuleInfo` are not implemented on macOS.

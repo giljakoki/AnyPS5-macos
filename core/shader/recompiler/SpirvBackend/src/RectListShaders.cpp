@@ -97,17 +97,23 @@ public:
 
         auto cornerCount = uintConstant(0);
         for (const auto corner : edgeVertex) cornerCount = result(spv::OpIAdd, uintType, cornerCount, result(spv::OpSelect, uintType, corner, uintConstant(1), uintConstant(0)));
-        auto valid = result(spv::OpIEqual, boolType, cornerCount, uintConstant(1));
-        for (const auto position : positions) valid = result(spv::OpLogicalAnd, boolType, valid, isFinite(position));
+        std::array<std::uint32_t, 6> checks{};
+        checks[0] = result(spv::OpIEqual, boolType, cornerCount, uintConstant(1));
+        checks[1] = isFinite(positions[0]);
+        for (std::uint32_t i = 1; i < 3; ++i) checks[1] = result(spv::OpLogicalAnd, boolType, checks[1], isFinite(positions[i]));
         const auto w = result(spv::OpCompositeExtract, floatType, positions[0], 3u);
-        valid = result(spv::OpLogicalAnd, boolType, valid, result(spv::OpFOrdGreaterThan, boolType, w, constant(floatType, 0)));
-        for (std::uint32_t i = 1; i < 3; ++i) {
-            const auto otherW = result(spv::OpCompositeExtract, floatType, positions[i], 3u);
-            valid = result(spv::OpLogicalAnd, boolType, valid, result(spv::OpFOrdEqual, boolType, w, otherW));
-        }
+        checks[2] = result(spv::OpFOrdGreaterThan, boolType, w, constant(floatType, 0));
+        checks[3] = result(spv::OpFOrdEqual, boolType, w, result(spv::OpCompositeExtract, floatType, positions[1], 3u));
+        checks[4] = result(spv::OpFOrdEqual, boolType, w, result(spv::OpCompositeExtract, floatType, positions[2], 3u));
         const auto position3 = interpolate(positions[0], positions[1], positions[2], barycentric);
-        valid = result(spv::OpLogicalAnd, boolType, valid, isFinite(position3));
-        rejectInvalidRectangle(valid);
+        checks[5] = isFinite(position3);
+        auto valid = checks[0];
+        auto flags = uintConstant(0);
+        for (std::uint32_t i = 0; i < checks.size(); ++i) {
+            if (i != 0) valid = result(spv::OpLogicalAnd, boolType, valid, checks[i]);
+            flags = result(spv::OpBitwiseOr, uintType, flags, result(spv::OpSelect, uintType, checks[i], uintConstant(1u << i), uintConstant(0)));
+        }
+        rejectInvalidRectangle(valid, positions, flags);
         auto vertexIndex = result(spv::OpSelect, intType, edgeVertex[2], intConstant(2), intConstant(0));
         vertexIndex = result(spv::OpSelect, intType, edgeVertex[1], intConstant(1), vertexIndex);
         const auto fourth = result(spv::OpIEqual, boolType, invocation, intConstant(3));
@@ -184,7 +190,7 @@ private:
         return access(pointer(spv::StorageClassStorageBuffer, uintType), fault, uintConstant(0), uintConstant(index));
     }
 
-    void rejectInvalidRectangle(std::uint32_t valid) {
+    void rejectInvalidRectangle(std::uint32_t valid, const std::array<std::uint32_t, 3>& positions, std::uint32_t flags) {
         const auto failed = builder.AllocateId();
         const auto next = builder.AllocateId();
         emit(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
@@ -201,7 +207,15 @@ private:
         emit(spv::OpBranchConditional, won, write, done);
         emit(spv::OpLabel, write);
         store(faultWord(1), uintConstant(static_cast<std::uint32_t>(BdaAbi::FaultReason::InvalidRectangle)));
-        for (std::uint32_t i = 2; i < 8; ++i) store(faultWord(i), uintConstant(0));
+        const auto component = [&](std::uint32_t vertex, std::uint32_t index) {
+            return result(spv::OpBitcast, uintType, result(spv::OpCompositeExtract, floatType, positions[vertex], index));
+        };
+        store(faultWord(2), component(0, 0));
+        store(faultWord(3), component(0, 1));
+        store(faultWord(4), component(1, 0));
+        store(faultWord(5), component(1, 1));
+        store(faultWord(6), component(0, 3));
+        store(faultWord(7), flags);
         emit(spv::OpAtomicStore, state, scope, uintConstant(spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask), uintConstant(static_cast<std::uint32_t>(BdaAbi::FaultState::Ready)));
         emit(spv::OpBranch, done);
         emit(spv::OpLabel, done);
