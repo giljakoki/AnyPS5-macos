@@ -1497,7 +1497,17 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+std::string describePrograms(std::span<const CompiledShader> shaders) {
+    std::string text;
+    for (const auto& shader : shaders) {
+        char address[48];
+        std::snprintf(address, sizeof(address), "%s0x%llx", text.empty() ? "" : ", ", static_cast<unsigned long long>(shader.guestAddress));
+        text += address;
+    }
+    return text;
+}
+
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::string programs) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1523,14 +1533,30 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
         // registration (a throw there leaves nothing behind).
         auto writers = DrawCopiedWriters();
-        recorder.OnComplete([resources, writers] {
+        recorder.OnComplete([resources, writers, programs = std::move(programs)] {
             writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
-            resources->WriteBackBuffers();
+            try {
+                resources->WriteBackBuffers();
+            } catch (const std::exception& error) {
+                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs + ")");
+            }
         });
         writers->push_back(resources);
     } else if (completion) {
-        if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
-        else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        if (resources->Reusable()) recorder.OnComplete([resources, programs] {
+            try {
+                resources->CheckFaults();
+            } catch (const std::exception& error) {
+                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs + ")");
+            }
+        });
+        else recorder.OnComplete([resources, programs = std::move(programs)] {
+            try {
+                resources->WriteBackBuffers();
+            } catch (const std::exception& error) {
+                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs + ")");
+            }
+        });
     }
     for (const auto& resident : residents) {
         if (resident != nullptr) resident->MarkDirty();
@@ -1790,7 +1816,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, describePrograms(shaders));
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -1836,6 +1862,13 @@ bool RecordDraws() {
 
 }
 
+Pm4::DrawParameters CompleteRectangles(const State& state, const Pm4::DrawParameters& draw) {
+    if (!state.rectList || draw.indirect) return draw;
+    auto complete = draw;
+    complete.indexCount -= complete.indexCount % 3u;
+    return complete;
+}
+
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
     std::vector<std::uint64_t> key;
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
@@ -1845,9 +1878,10 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& guestState, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+void Draw(const Context& context, const State& guestState, const Pm4::DrawParameters& guestDraw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     const auto hostState = HostDepthState(context, guestState);
     const State& state = hostState ? *hostState : guestState;
+    const Pm4::DrawParameters draw = CompleteRectangles(state, guestDraw);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -2337,7 +2371,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome, describePrograms(shaders));
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2423,9 +2457,10 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState, const Pm4::DrawParameters& guestDraw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
     const auto hostState = HostDepthState(context, guestState);
     const State& state = hostState ? *hostState : guestState;
+    const Pm4::DrawParameters draw = CompleteRectangles(state, guestDraw);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
