@@ -88,6 +88,10 @@ int APS5_VABI __cxa_thread_atexit_impl_nid_postfix(void (APS5_VABI *func)(void*)
 #endif
 }
 
+int APS5_VABI __cxa_thread_atexit_nid_postfix(void (APS5_VABI *destructor)(void*), void* object, void* dso) {
+    return __cxa_thread_atexit_impl_nid_postfix(destructor, object, dso);
+}
+
 int APS5_VABI LibcInternalExtCxaThreadAtexit_nid_postfix(void (APS5_VABI *destructor)(void*), void* object, void* module_id) {
 #ifdef _WIN32
     (void)module_id;

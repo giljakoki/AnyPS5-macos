@@ -16,6 +16,11 @@ void APS5_VABI _ZNSt6locale5facet9_RegisterEv_nid_postfix(GuestLocale::Facet* se
 void APS5_VABI _ZNSt8_LocinfoC1EPKc_nid_postfix(GuestLocale::LocinfoStorage* self, const char* localeName);
 void APS5_VABI _ZNSt8_LocinfoD1Ev_nid_postfix(GuestLocale::LocinfoStorage* self);
 void APS5_VABI _ZNSt8ios_baseD2Ev_nid_postfix(GuestLocale::IosBase* self);
+struct StreamManipulator {
+    void (APS5_VABI *apply)(GuestLocale::IosBase*, std::int64_t);
+    std::int64_t argument;
+};
+StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(int width);
 const short* APS5_VABI _Getpctype_nid_postfix();
 const short* APS5_VABI _Getptolower_nid_postfix();
 const short* APS5_VABI _Getptoupper_nid_postfix();
@@ -144,12 +149,31 @@ static void CheckStreamDestruction() {
     Require(object.stream.locale == &_ZSt21_sceLibcClassicLocale_nid_postfix);
 }
 
+static void CheckStreamWidth() {
+    struct GuardedStream {
+        std::uint64_t before = 0x12345678;
+        GuestLocale::IosBase stream{};
+        std::uint64_t after = 0x87654321;
+    } object;
+    object.stream.precision = 6;
+    object.stream.flags = 0x204;
+    const StreamManipulator manipulator = _ZSt4setwi_nid_postfix(12);
+    Require(manipulator.apply != nullptr && manipulator.argument == 12);
+    manipulator.apply(&object.stream, manipulator.argument);
+    Require(object.stream.width == 12 && object.stream.precision == 6 && object.stream.flags == 0x204);
+    Require(object.before == 0x12345678 && object.after == 0x87654321);
+    const StreamManipulator reset = _ZSt4setwi_nid_postfix(0);
+    reset.apply(&object.stream, reset.argument);
+    Require(object.stream.width == 0);
+}
+
 int main() {
     CheckGuestCalls();
     CheckLocinfoAlignment();
     CheckCharacterTables();
     CheckCharacterConversions();
     CheckStreamDestruction();
+    CheckStreamWidth();
     _Locksyslock_nid_postfix();
     _Locksyslock_nid_postfix();
     _Unlocksyslock_nid_postfix();

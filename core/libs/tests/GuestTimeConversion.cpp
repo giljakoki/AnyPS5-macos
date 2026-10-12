@@ -1,3 +1,4 @@
+#include <cwchar>
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/GuestTime.hpp"
 #include <array>
@@ -21,6 +22,7 @@ GuestTm* APS5_VABI gmtime_s_nid_postfix(const std::int64_t*, GuestTm*);
 GuestTm* APS5_VABI localtime_s_nid_postfix(const std::int64_t*, GuestTm*);
 std::int64_t APS5_VABI mktime_nid_postfix(GuestTm*);
 std::size_t APS5_VABI strftime_nid_postfix(char*, std::size_t, const char*, const GuestTm*);
+std::size_t APS5_VABI wcsftime_nid_postfix(wchar_t*, std::size_t, const wchar_t*, const GuestTm*);
 void APS5_VABI tzset_nid_postfix(void);
 char* APS5_VABI ctime_nid_postfix(const std::int64_t*);
 int* APS5_VABI __error_nid_postfix();
@@ -100,6 +102,13 @@ static void CheckFormat(const GuestTm& guest, const char* format, const char* ex
     Require(size == std::strlen(expected) && std::strcmp(buffer, expected) == 0, "strftime did not format a FreeBSD conversion");
 }
 
+static void CheckWideFormat(const GuestTm& guest, const wchar_t* format, const wchar_t* expected) {
+    wchar_t buffer[96]{};
+    const std::size_t size = wcsftime_nid_postfix(buffer, sizeof(buffer) / sizeof(buffer[0]), format, &guest);
+    Require(size == std::wcslen(expected) && std::wcscmp(buffer, expected) == 0, "wcsftime did not format a conversion");
+    Require(wcsftime_nid_postfix(buffer, size, format, &guest) == 0, "wcsftime accepted a buffer one character short");
+}
+
 static void CheckBufferSize(const GuestTm& guest, const char* format, std::size_t length) {
     char buffer[96];
     std::memset(buffer, 'x', sizeof(buffer));
@@ -125,6 +134,8 @@ static void CheckFreeBsdConversions() {
     CheckFormat(guest, "%v", "14-Nov-2023");
     CheckFormat(guest, "%+", "Tue Nov 14 22:13:20 UTC 2023");
     CheckFormat(guest, "%s", "1699992800");
+    CheckWideFormat(guest, L"%Y-%m-%d %H:%M:%S", L"2023-11-14 22:13:20");
+    CheckWideFormat(guest, L"%v|%k|%s", L"14-Nov-2023|22|1699992800");
     CheckFormat(guest, "%%k %%l %%s %%v %%+", "%k %l %s %v %+");
     CheckFormat(guest, "%%%k", "%22");
     CheckFormat(guest, "[%k][%l]", "[22][10]");

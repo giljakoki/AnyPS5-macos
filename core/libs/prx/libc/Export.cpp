@@ -32,4 +32,10 @@ std::uint64_t APS5_VABI libcCyberUnknown08(void) {
     return 0;
 }
 
+APS5_EXPORT("jBOZAv6CwkM", libcUnknownImport01);
+std::uint64_t APS5_VABI libcUnknownImport01(void) {
+    NotImplemented_nid_no_patch("jBOZAv6CwkM");
+    return 0;
+}
+
 }
