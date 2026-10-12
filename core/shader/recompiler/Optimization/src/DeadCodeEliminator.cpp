@@ -1,6 +1,54 @@
 #include "Optimization/DeadCodeEliminator.hpp"
+#include <unordered_set>
+#include <vector>
 
 namespace ShaderRecompiler {
+namespace {
+
+bool removePhiWebs(std::span<IrBlock* const> blocks) {
+    std::vector<IrValue*> phis;
+    std::vector<IrValue*> pending;
+    std::unordered_set<const IrValue*> live;
+    for (IrBlock* block : blocks) {
+        for (IrValue* inst : block->Instructions()) {
+            if (!inst->IsPhi()) continue;
+            phis.push_back(inst);
+            for (const IrValue* user : inst->Uses()) {
+                if (user->IsPhi()) continue;
+                if (live.insert(inst).second) pending.push_back(inst);
+                break;
+            }
+        }
+    }
+    while (!pending.empty()) {
+        IrValue* phi = pending.back();
+        pending.pop_back();
+        for (IrValue* argument : phi->Arguments()) {
+            IrValue* incoming = argument == nullptr ? nullptr : argument->Resolve();
+            if (incoming != nullptr && incoming->IsPhi() && live.insert(incoming).second) pending.push_back(incoming);
+        }
+    }
+    std::vector<IrValue*> dead;
+    for (IrValue* phi : phis) {
+        if (!live.contains(phi) && phi->HasUses()) dead.push_back(phi);
+    }
+    for (IrValue* phi : dead) {
+        for (std::size_t index = 0; index < phi->ArgumentCount(); ++index) phi->ReplaceArgument(index, nullptr);
+    }
+    for (IrValue* phi : dead) {
+        auto& instructions = phi->Parent()->Instructions();
+        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+            if (*it != phi) continue;
+            instructions.erase(it);
+            break;
+        }
+        phi->Invalidate();
+        phi->SetParent(nullptr);
+    }
+    return !dead.empty();
+}
+
+}
 
 void DeadCodeEliminator::RemoveIdentities(std::span<IrBlock* const> blocks) const {
     for (IrBlock* block : blocks) {
@@ -42,6 +90,7 @@ void DeadCodeEliminator::Eliminate(std::span<IrBlock* const> blocks) const {
                 changed = true;
             }
         }
+        if (!changed) changed = removePhiWebs(blocks);
     } while (changed);
 }
 
