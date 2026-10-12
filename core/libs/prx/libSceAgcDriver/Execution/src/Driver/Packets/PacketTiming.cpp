@@ -19,7 +19,7 @@ PacketTimer::~PacketTimer() {
     std::string report;
     for (std::size_t i = 0; i < hot.size() && i < 10; ++i) {
         char text[96];
-        std::snprintf(text, sizeof(text), " %s x%llu %.0fms", hot[i].first == 0xffffu ? "flip" : Pm4::Name(hot[i].first << 8u).c_str(), static_cast<unsigned long long>(hot[i].second.first), hot[i].second.second);
+        std::snprintf(text, sizeof(text), " %s x%llu %.0fms", hot[i].first == 0xffffu ? "flip" : Pm4::Name(hot[i].first).c_str(), static_cast<unsigned long long>(hot[i].second.first), hot[i].second.second);
         report += text;
     }
     auto& waits = Driver::waitOutcomes();
