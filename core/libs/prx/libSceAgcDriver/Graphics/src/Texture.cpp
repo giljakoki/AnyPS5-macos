@@ -3635,6 +3635,17 @@ std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, 
     return nullptr;
 }
 
+std::shared_ptr<StorageTexture> StorageTexture::FindPresentable(std::uint64_t address, std::uint64_t bytes, bool& pending) {
+    auto image = FindPending(address, bytes);
+    pending = image != nullptr;
+    if (image != nullptr) return image;
+    image = FindLive(address, bytes);
+    if (image == nullptr) return image;
+    GuestMemory::CollectWritesUncached(address, static_cast<std::size_t>(bytes));
+    if (!GuestMemory::UnchangedSince(address, static_cast<std::size_t>(bytes), image->Generation())) image->Refresh();
+    return image;
+}
+
 bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
     const auto& mine = descriptor;
     const auto& theirs = other.descriptor;
