@@ -146,6 +146,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBuffers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/CommandValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/FrameHitches.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/HitchSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketExecution.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketFlush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketHistory.cpp
@@ -361,6 +362,7 @@ endif()
 add_test_executable(agc_frame_hitches_tests EXCLUDE_FROM_ALL
         tests/FrameHitches.cpp
         Execution/src/Driver/Packets/FrameHitches.cpp
+        Execution/src/Driver/Packets/HitchSampler.cpp
 )
 target_include_directories(agc_frame_hitches_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_frame_hitches_tests PRIVATE libc)

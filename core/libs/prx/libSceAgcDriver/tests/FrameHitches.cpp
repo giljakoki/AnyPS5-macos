@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/FrameHitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/HitchSampler.hpp"
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -44,6 +45,39 @@ void WorkTests() {
     Require(waited.has_value() && waited->find("longest wait WAIT_FLIP_DONE 38.0 ms") != std::string::npos, "a long wait must be reported");
 }
 
+void DescriberTests() {
+    FrameHitchTracker tracker(25);
+    const auto base = Clock::now();
+    int calls = 0;
+    const auto describe = [&](Clock::time_point from, Clock::time_point to) {
+        ++calls;
+        Require(to - from > std::chrono::milliseconds(39), "the describer receives the title interval");
+        return std::string("seen");
+    };
+    tracker.FlipSubmitted(At(base, 0, 35), describe);
+    const auto blocked = tracker.FlipSubmitted(At(base, 40, 42), describe);
+    Require(blocked.has_value() && calls == 0, "a frame that blocked in the driver is not described");
+    const auto slow = tracker.FlipSubmitted(At(base, 90, 92), describe);
+    Require(slow.has_value() && calls == 1 && slow->find("; title thread: seen\n") != std::string::npos, "a frame slow in the title is described: " + slow.value_or(""));
+}
+
+void SummaryTests() {
+    const auto names = [](std::uint64_t address) -> std::string {
+        if (address == 1) return "libc.prx!sceLibcMspaceMalloc";
+        if (address == 2) return "libc.prx!helper";
+        if (address == 3) return "eboot!+0x100";
+        return "eboot!+0x200";
+    };
+    std::vector<ThreadSample> samples(4);
+    samples[0].frames = {1, 2, 3, 0, 0, 0};
+    samples[1].frames = {1, 3, 0, 0, 0, 0};
+    samples[2].frames = {4, 3, 0, 0, 0, 0};
+    samples[3].frames = {2, 0, 0, 0, 0, 0};
+    const auto text = SummarizeSamples(samples, names, 6);
+    Require(text.find("4 samples; leaves: 50% libc.prx!sceLibcMspaceMalloc, 25% eboot!+0x200, 25% libc.prx!helper") == 0, "leaves are ranked by share: " + text);
+    Require(text.find("entered from: 50% libc.prx <- eboot!+0x100, 25% eboot <- none, 25% libc.prx <- none") != std::string::npos, "callers are the first frame outside the leaf's module: " + text);
+}
+
 void ParseTests() {
     Require(ParseHitchThresholdMs(nullptr) == 0, "an unset variable disables the tracer");
     Require(ParseHitchThresholdMs("25") == 25 && ParseHitchThresholdMs("20.5") == 20.5, "thresholds are milliseconds");
@@ -64,6 +98,8 @@ int main() {
     try {
         PeriodTests();
         WorkTests();
+        DescriberTests();
+        SummaryTests();
         ParseTests();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';

@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -30,7 +31,9 @@ class FrameHitchTracker {
 public:
     explicit FrameHitchTracker(double thresholdMs);
 
-    std::optional<std::string> FlipSubmitted(const HitchSubmission& submission);
+    using TitleDescriber = std::function<std::string(std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point)>;
+
+    std::optional<std::string> FlipSubmitted(const HitchSubmission& submission, const TitleDescriber& describeTitle = {});
     void OtherSubmitted();
     std::optional<std::string> WorkFinished(const HitchWork& work);
 

@@ -16,7 +16,7 @@ double Ms(std::chrono::steady_clock::duration duration) {
 
 FrameHitchTracker::FrameHitchTracker(double thresholdMs) : thresholdMs(thresholdMs) {}
 
-std::optional<std::string> FrameHitchTracker::FlipSubmitted(const HitchSubmission& submission) {
+std::optional<std::string> FrameHitchTracker::FlipSubmitted(const HitchSubmission& submission, const TitleDescriber& describeTitle) {
     std::lock_guard lock(mutex);
     ++frames;
     std::optional<std::string> report;
@@ -26,6 +26,11 @@ std::optional<std::string> FrameHitchTracker::FlipSubmitted(const HitchSubmissio
             char text[640];
             std::snprintf(text, sizeof(text), "[hitch] frame %llu: %.1f ms between flip submissions: %.1f ms in the title since the previous one returned, which blocked %.1f ms (flip room %.1f ms, behind the worker %.1f ms); %llu other submissions; queue 0 worker in between: %llu submissions, %.1f ms of packets, %.1f ms waiting, longest submission %llu with %.1f ms of packets (slowest %s %.1f ms)\n", static_cast<unsigned long long>(frames), periodMs, Ms(submission.entered - previous->left), Ms(previous->left - previous->entered), previous->flipRoomMs, previous->workerHoldMs, static_cast<unsigned long long>(otherSubmissions), static_cast<unsigned long long>(workSubmissions), workBusyMs, workWaitMs, static_cast<unsigned long long>(longestWork.serial), longestWork.busyMs, longestWork.slowest.empty() ? "none" : longestWork.slowest.c_str(), longestWork.slowestMs);
             report = text;
+            const auto titleMs = Ms(submission.entered - previous->left);
+            if (describeTitle && titleMs >= thresholdMs / 2) {
+                report->pop_back();
+                *report += "; title thread: " + describeTitle(previous->left, submission.entered) + "\n";
+            }
         }
     }
     previous = submission;
