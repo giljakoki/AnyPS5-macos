@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -185,6 +186,26 @@ bool sharesSlots(const IrProgram& program, const ShaderPixelInputInfo& pixel, st
     return false;
 }
 
+bool unhookUnobservedPhiReads(IrProgram& program) {
+    std::vector<std::pair<IrValue*, std::size_t>> unobserved;
+    for (const auto& block : program.Blocks()) {
+        for (IrValue* inst : block->Instructions()) {
+            if (!inst->IsPhi() || (inst->Type() != IrType::U32 && inst->Type() != IrType::F32)) continue;
+            for (std::size_t index = 0; index < inst->ArgumentCount(); ++index) {
+                const IrValue* incoming = inst->Argument(index);
+                if (incoming == nullptr || !isBarycentric(*lookThrough(incoming))) continue;
+                if (PhiIncomingUnobserved(program, *inst, index)) unobserved.emplace_back(inst, index);
+            }
+        }
+    }
+    for (const auto& [phi, index] : unobserved) {
+        auto& zero = program.CreateValue(IrOpcode::Void, phi->Type());
+        zero.SetImmediateU32(0u);
+        phi->ReplaceArgument(index, &zero);
+    }
+    return !unobserved.empty();
+}
+
 }
 
 bool HostInterpolationChecker::Lower(IrProgram& program, const ShaderPixelInputInfo& pixel, std::string& reason) const {
@@ -211,6 +232,7 @@ bool HostInterpolationChecker::Lower(IrProgram& program, const ShaderPixelInputI
     }
     DeadCodeEliminator{}.Eliminate(program);
     if (MaskedSelectEliminator{}.Eliminate(program).removedSelects != 0u) DeadCodeEliminator{}.Eliminate(program);
+    if (unhookUnobservedPhiReads(program)) DeadCodeEliminator{}.Eliminate(program);
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
             if (isBarycentric(*inst) || inst->Opcode() == IrOpcode::InterpolateHostP1) {
