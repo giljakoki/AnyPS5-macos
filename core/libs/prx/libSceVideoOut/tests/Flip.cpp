@@ -196,7 +196,25 @@ void fillBuffer(std::span<std::byte> bytes, uint32_t width, uint32_t height) {
     }
 }
 
+void testFullHdGeometry() {
+    const AgcDriver::DisplayBuffer fullHd{0x10000, 0x8000000022000000ull, 1920, 1080};
+    check(AgcDriver::DisplayBufferSize(fullHd) == 15u * 9u * 65536u, "a 1920x1080 tiled display buffer does not occupy 15 by 9 blocks of 64 KiB");
+    check(AgcDriver::DisplayBufferOffset(fullHd, 0, 0) == 0, "the first texel of a tiled display buffer is not at its start");
+    check(AgcDriver::DisplayBufferOffset(fullHd, 1919, 1079) == tiledOffset(1919, 1079, 1920), "the last texel of a 1920x1080 tiled display buffer is not where the tile swizzle puts it");
+    check(AgcDriver::DisplayBufferOffset(fullHd, 1919, 1079) / 65536u == 8u * 15u + 14u, "the last texel of a 1920x1080 tiled display buffer is not in block (14, 8)");
+    check(AgcDriver::DisplayBufferOffset(fullHd, 1920 - 128, 0) == 14u * 65536u, "the first texel of the last block column is not at that block's start");
+    AgcDriver::DisplayBuffer linear = fullHd;
+    linear.tilingMode = 1;
+    linear.pitchInPixel = 2048;
+    check(AgcDriver::DisplayBufferSize(linear) == 2048u * 1080u * 4u, "a linear 2048-pitch display buffer has the wrong footprint");
+    check(AgcDriver::DisplayBufferOffset(linear, 1919, 1079) == (static_cast<std::size_t>(1079) * 2048u + 1919u) * 4u, "a linear 2048-pitch display buffer ignores its pitch");
+    AgcDriver::DisplayBuffer tiledWithPitch = fullHd;
+    tiledWithPitch.pitchInPixel = 2048;
+    expectFailure([&] { AgcDriver::DisplayBufferSize(tiledWithPitch); });
+}
+
 void testDecode() {
+    testFullHdGeometry();
     std::vector<std::byte> allocation(6 * 65536 + 65535);
     const auto tiled = alignedBuffer(allocation);
     AgcDriver::DisplayBuffer buffer{reinterpret_cast<uint64_t>(tiled.data()), 0x8000000000000000ull, 259, 137};
