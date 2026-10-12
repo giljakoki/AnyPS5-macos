@@ -1953,6 +1953,8 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         if ((binding.gpuTiling || (color.tileMode != ColorTileMode::Linear && context.detiler != nullptr)) && residentTargets) {
+            RetireDepthSurfacesAt(context, color.address);
+            if (color.mipCount > 1 && color.surfaceAddress != color.address) RetireDepthSurfacesAt(context, color.surfaceAddress);
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
             // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts

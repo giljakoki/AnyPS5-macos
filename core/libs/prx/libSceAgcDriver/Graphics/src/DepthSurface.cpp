@@ -300,4 +300,23 @@ bool DepthSurfaceAt(std::uint64_t address) {
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
 }
 
+void RetireDepthSurfacesAt(const Context& context, std::uint64_t address) {
+    std::vector<std::unique_ptr<DepthSurface>> retired;
+    {
+        std::lock_guard lock(surfacesMutex());
+        auto& list = surfaces();
+        const auto reused = [&](const std::unique_ptr<DepthSurface>& surface) {
+            return surface->context.device == context.device && (surface->target.address == address || surface->target.stencilAddress == address);
+        };
+        for (auto& surface : list) {
+            if (reused(surface)) retired.push_back(std::move(surface));
+        }
+        std::erase_if(list, [](const std::unique_ptr<DepthSurface>& surface) { return surface == nullptr; });
+    }
+    if (retired.empty()) return;
+    auto* recorder = RecorderFor(context);
+    if (recorder == nullptr) return;
+    for (auto& surface : retired) recorder->Keep(std::shared_ptr<DepthSurface>(std::move(surface)));
+}
+
 }
