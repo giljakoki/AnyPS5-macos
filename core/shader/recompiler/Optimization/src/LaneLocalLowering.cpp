@@ -65,6 +65,7 @@ public:
     bool Implies(const IrValue* predicate, std::uint32_t depth = 0) {
         predicate = predicate->Resolve();
         if (predicate == target) return true;
+        if (predicate->Opcode() == IrOpcode::LogicalNot && target->Opcode() == IrOpcode::LogicalNot && predicate->Argument(0)->Resolve() == target->Argument(0)->Resolve()) return true;
         if (target->HasImmediate()) return target->Type() == IrType::U1 && target->ImmediateBool();
         if (predicate->HasImmediate()) return predicate->Type() == IrType::U1 && !predicate->ImmediateBool();
         if (const auto known = results.find(predicate); known != results.end()) return known->second != Proof::NotImplied;
@@ -708,10 +709,17 @@ void Lowering::lowerWaveMaskBranches() {
         if (zero) {
             if (condition->Opcode() == IrOpcode::LogicalNot) active = condition->Argument(0)->Resolve();
             else {
-                IrValue& inverted = program.CreateValue(IrOpcode::LogicalNot, IrType::U1);
-                inverted.AddArgument(condition);
-                program.BlockOrder()[header]->AppendInstruction(&inverted);
-                active = &inverted;
+                IrValue* existing = nullptr;
+                for (const IrUse& use : condition->OperandUses()) {
+                    if (use.user->Opcode() == IrOpcode::LogicalNot && !use.user->IsIdentity() && use.user->Parent() != nullptr) existing = use.user;
+                }
+                if (existing == nullptr) {
+                    IrValue& inverted = program.CreateValue(IrOpcode::LogicalNot, IrType::U1);
+                    inverted.AddArgument(condition);
+                    program.BlockOrder()[header]->AppendInstruction(&inverted);
+                    existing = &inverted;
+                }
+                active = existing;
             }
         }
         std::vector<IrValue*> guards{active};
