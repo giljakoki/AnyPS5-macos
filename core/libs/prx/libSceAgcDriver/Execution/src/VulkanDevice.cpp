@@ -293,6 +293,8 @@ struct VulkanDevice::State {
     bool dmaBufImport = false;
     bool memoryBudget = false;
     bool depthRangeUnrestricted = false;
+    bool shaderClipDistance = false;
+    bool invertedDepthBounds = false;
     bool samplerAnisotropy = false;
     bool textureCompressionBC = false;
     bool samplerFilterMinmax = false;
@@ -1092,6 +1094,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
     // A device that advertises VK_KHR_portability_subset (MoltenVK) must have it enabled.
     if (hasExtension("VK_KHR_portability_subset")) deviceExtensions.push_back("VK_KHR_portability_subset");
+    state->invertedDepthBounds = !hasExtension("VK_KHR_portability_subset");
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1157,7 +1160,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->capabilities.push_back(11);
     state->capabilities.push_back(5347);
     state->spirvExtensions.push_back("SPV_KHR_physical_storage_buffer");
-    state->depthRangeUnrestricted = hasExtension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+    state->depthRangeUnrestricted = std::getenv("APS5_NO_DEPTH_RANGE_UNRESTRICTED") == nullptr && hasExtension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (state->depthRangeUnrestricted) deviceExtensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     // Guest dispatches cover whole thread groups past the edge of small images; robust image access
     // drops those writes instead of faulting the device.
@@ -1317,7 +1320,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     enabled.tessellationShader = available.tessellationShader;
     state->tessellationShader = enabled.tessellationShader == VK_TRUE;
     if (state->tessellationShader) state->capabilities.push_back(3);
-    APS5_LOG_OUT("Vulkan features tessellationAvailable=%u mesh=%u depthClip=%u depthRangeUnrestricted=%u pipelineLibrary=%u", static_cast<unsigned>(state->tessellationShader), static_cast<unsigned>(state->meshShader), static_cast<unsigned>(state->depthClipControl), static_cast<unsigned>(state->depthRangeUnrestricted), static_cast<unsigned>(state->graphicsPipelineLibrary));
     require(available.samplerAnisotropy && available.textureCompressionBC, "device lacks sampler anisotropy or BC texture compression support required for texture sampling");
     enabled.samplerAnisotropy = VK_TRUE;
     enabled.textureCompressionBC = VK_TRUE;
@@ -1357,6 +1359,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->sampleRateShading = enabled.sampleRateShading == VK_TRUE;
     if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);
     enabled.shaderClipDistance = available.shaderClipDistance;
+    state->shaderClipDistance = enabled.shaderClipDistance == VK_TRUE;
+    APS5_LOG_OUT("Vulkan features tessellationAvailable=%u mesh=%u depthClip=%u depthRangeUnrestricted=%u depthClamp=%u clipDistance=%u invertedDepthBounds=%u pipelineLibrary=%u", static_cast<unsigned>(state->tessellationShader), static_cast<unsigned>(state->meshShader), static_cast<unsigned>(state->depthClipControl), static_cast<unsigned>(state->depthRangeUnrestricted), static_cast<unsigned>(state->depthClamp), static_cast<unsigned>(state->shaderClipDistance), static_cast<unsigned>(state->invertedDepthBounds), static_cast<unsigned>(state->graphicsPipelineLibrary));
     if (enabled.shaderStorageImageWriteWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageWriteWithoutFormat);
     if (enabled.shaderStorageImageReadWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageReadWithoutFormat);
     state->storageImageWithoutFormat = enabled.shaderStorageImageWriteWithoutFormat == VK_TRUE && enabled.shaderStorageImageReadWithoutFormat == VK_TRUE;
@@ -3030,6 +3034,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     context.singlePassStorage = state->storageImageWithoutFormat;
+    context.shaderClipDistance = state->shaderClipDistance;
+    context.invertedDepthBounds = state->invertedDepthBounds;
     return context;
 }
 

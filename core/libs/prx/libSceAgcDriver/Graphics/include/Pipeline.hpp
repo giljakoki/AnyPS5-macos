@@ -3,7 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <cstdint>
+#include <optional>
 #include <set>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -106,6 +109,27 @@ bool HasStencil(VkFormat format);
 void ValidateViewport(const Context& context, const VkViewport& viewport);
 void ValidateDepthBounds(const Context& context, const State& state);
 void ValidateProvokingVertex(const Context& context, const State& state, std::span<const CompiledShader> shaders = {});
+
+struct DepthFeatures {
+    bool unrestricted = false;
+    bool depthClamp = false;
+    bool clipDistance = false;
+    bool depthBounds = false;
+    bool invertedBounds = false;
+};
+enum class HostDepthPath : std::uint8_t { Native, Unobserved };
+struct HostDepth {
+    HostDepthPath path = HostDepthPath::Native;
+    float minDepth = 0.0f;
+    float maxDepth = 1.0f;
+    float minDepthBounds = 0.0f;
+    float maxDepthBounds = 1.0f;
+};
+DepthFeatures DepthFeaturesOf(const Context& context);
+bool DepthObserved(const State& state);
+std::string DepthDiagnostic(const DepthFeatures& features, const State& state);
+HostDepth ResolveHostDepth(const DepthFeatures& features, const State& state);
+std::optional<State> HostDepthState(const Context& context, const State& state);
 
 void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment);
 bool ShadersWriteMemory(std::span<const CompiledShader> shaders);

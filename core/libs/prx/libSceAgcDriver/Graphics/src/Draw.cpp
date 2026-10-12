@@ -1845,7 +1845,9 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+void Draw(const Context& context, const State& guestState, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    const auto hostState = HostDepthState(context, guestState);
+    const State& state = hostState ? *hostState : guestState;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -2421,7 +2423,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+    const auto hostState = HostDepthState(context, guestState);
+    const State& state = hostState ? *hostState : guestState;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");

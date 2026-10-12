@@ -6,12 +6,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <list>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -113,6 +116,92 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
     Require(viewport.width <= context.limits.maxViewportDimensions[0] && std::abs(viewport.height) <= context.limits.maxViewportDimensions[1], "viewport dimensions exceed device limits");
     Require(viewport.x >= context.limits.viewportBoundsRange[0] && viewport.x + viewport.width <= context.limits.viewportBoundsRange[1], "viewport X exceeds device bounds");
     Require(std::min(viewport.y, viewport.y + viewport.height) >= context.limits.viewportBoundsRange[0] && std::max(viewport.y, viewport.y + viewport.height) <= context.limits.viewportBoundsRange[1], "viewport Y exceeds device bounds");
+}
+
+DepthFeatures DepthFeaturesOf(const Context& context) {
+    return {context.depthRangeUnrestricted, context.depthClamp, context.shaderClipDistance, context.depthBounds, context.invertedDepthBounds};
+}
+
+bool DepthObserved(const State& state) {
+    if (state.posZ) return true;
+    if (!state.depth) return false;
+    if (state.depthWrite) return true;
+    return state.depthTest && state.depthCompare != VK_COMPARE_OP_ALWAYS && state.depthCompare != VK_COMPARE_OP_NEVER;
+}
+
+std::string DepthDiagnostic(const DepthFeatures& features, const State& state) {
+    constexpr std::array<const char*, DepthRangeRegisters.size()> names{"PA_CL_CLIP_CNTL", "PA_CL_VPORT_ZSCALE", "PA_CL_VPORT_ZOFFSET", "PA_SC_VPORT_ZMIN_0", "PA_SC_VPORT_ZMAX_0", "DB_RENDER_OVERRIDE", "DB_RENDER_CONTROL", "DB_DEPTH_CLEAR"};
+    constexpr std::array<bool, DepthRangeRegisters.size()> floats{false, true, true, true, true, false, false, true};
+    constexpr std::array<const char*, 8> compares{"NEVER", "LESS", "EQUAL", "LESS_OR_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_OR_EQUAL", "ALWAYS"};
+    const auto flag = [](bool value) { return value ? 1u : 0u; };
+    std::string text;
+    char buffer[192];
+    for (std::size_t index = 0; index < DepthRangeRegisters.size(); ++index) {
+        const auto& word = state.depthRegisters[index];
+        const char* separator = index == 0 ? "" : " ";
+        if (!word) std::snprintf(buffer, sizeof(buffer), "%s%s[0x%03x]=absent", separator, names[index], DepthRangeRegisters[index]);
+        else if (floats[index]) std::snprintf(buffer, sizeof(buffer), "%s%s[0x%03x]=0x%08x (%.9g)", separator, names[index], DepthRangeRegisters[index], *word, static_cast<double>(std::bit_cast<float>(*word)));
+        else std::snprintf(buffer, sizeof(buffer), "%s%s[0x%03x]=0x%08x", separator, names[index], DepthRangeRegisters[index], *word);
+        text += buffer;
+    }
+    std::snprintf(buffer, sizeof(buffer), "; viewport depth [%.9g, %.9g] negativeOneToOne=%u depthClamp=%u", static_cast<double>(state.viewport.minDepth), static_cast<double>(state.viewport.maxDepth), flag(state.negativeOneToOne), flag(state.depthClamp));
+    text += buffer;
+    std::string format = "none";
+    if (state.depth) {
+        switch (state.depth->format) {
+        case VK_FORMAT_D16_UNORM: format = "D16_UNORM"; break;
+        case VK_FORMAT_D16_UNORM_S8_UINT: format = "D16_UNORM_S8_UINT"; break;
+        case VK_FORMAT_D32_SFLOAT: format = "D32_SFLOAT"; break;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT: format = "D32_SFLOAT_S8_UINT"; break;
+        default: format = "VkFormat " + std::to_string(static_cast<int>(state.depth->format)); break;
+        }
+    }
+    const auto compare = static_cast<std::size_t>(state.depthCompare);
+    std::snprintf(buffer, sizeof(buffer), "; depth target=%s test=%u write=%u compare=%s bounds=%u [%.9g, %.9g]", format.c_str(), flag(state.depthTest), flag(state.depthWrite), compare < compares.size() ? compares[compare] : "invalid", flag(state.depthBoundsTest), static_cast<double>(state.minDepthBounds), static_cast<double>(state.maxDepthBounds));
+    text += buffer;
+    std::snprintf(buffer, sizeof(buffer), "; posZ=%u rectList=%u mesh=%u tessellation=%u; device depthRangeUnrestricted=%u depthClamp=%u clipDistance=%u depthBounds=%u invertedDepthBounds=%u", flag(state.posZ), flag(state.rectList), flag(state.stages.mesh.has_value()), flag(state.stages.tessellation.has_value()), flag(features.unrestricted), flag(features.depthClamp), flag(features.clipDistance), flag(features.depthBounds), flag(features.invertedBounds));
+    text += buffer;
+    return text;
+}
+
+HostDepth ResolveHostDepth(const DepthFeatures& features, const State& state) {
+    HostDepth host{HostDepthPath::Native, state.viewport.minDepth, state.viewport.maxDepth, state.minDepthBounds, state.maxDepthBounds};
+    Require(std::isfinite(host.minDepth) && std::isfinite(host.maxDepth), "non-finite viewport depth range");
+    if (features.unrestricted) return host;
+    if (state.depth && state.depthBoundsTest) {
+        if (!features.depthBounds) throw std::runtime_error("AGC graphics: device does not support the depth bounds test: " + DepthDiagnostic(features, state));
+        const auto low = state.minDepthBounds;
+        const auto high = state.maxDepthBounds;
+        if (!std::isfinite(low) || !std::isfinite(high)) throw std::runtime_error("AGC graphics: non-finite depth bounds: " + DepthDiagnostic(features, state));
+        if (low > high || low > 1.0f || high < 0.0f) {
+            if (!features.invertedBounds) throw std::runtime_error("AGC graphics: depth bounds that never pass need min > max bounds without VK_EXT_depth_range_unrestricted, which the device is not known to accept: " + DepthDiagnostic(features, state));
+            host.minDepthBounds = 1.0f;
+            host.maxDepthBounds = 0.0f;
+        } else {
+            host.minDepthBounds = std::max(low, 0.0f);
+            host.maxDepthBounds = std::min(high, 1.0f);
+        }
+    }
+    const auto unit = [](float value) { return value >= 0.0f && value <= 1.0f; };
+    if (unit(host.minDepth) && unit(host.maxDepth)) return host;
+    if (!DepthObserved(state)) {
+        host.path = HostDepthPath::Unobserved;
+        host.minDepth = 0.0f;
+        host.maxDepth = 1.0f;
+        return host;
+    }
+    throw std::runtime_error("AGC graphics: viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted, which the device lacks, and the draw observes depth (remapping it is not implemented): " + DepthDiagnostic(features, state));
+}
+
+std::optional<State> HostDepthState(const Context& context, const State& state) {
+    const auto host = ResolveHostDepth(DepthFeaturesOf(context), state);
+    if (host.minDepth == state.viewport.minDepth && host.maxDepth == state.viewport.maxDepth && host.minDepthBounds == state.minDepthBounds && host.maxDepthBounds == state.maxDepthBounds) return std::nullopt;
+    auto resolved = state;
+    resolved.viewport.minDepth = host.minDepth;
+    resolved.viewport.maxDepth = host.maxDepth;
+    resolved.minDepthBounds = host.minDepthBounds;
+    resolved.maxDepthBounds = host.maxDepthBounds;
+    return resolved;
 }
 
 bool ShadersWriteMemory(std::span<const CompiledShader> shaders) {

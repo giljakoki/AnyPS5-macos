@@ -79,6 +79,8 @@ struct DepthTarget {
     std::uint32_t guestSamples = 1;
 };
 
+inline constexpr std::array<std::uint32_t, 8> DepthRangeRegisters{0x204, 0x113, 0x114, 0x0b4, 0x0b5, 0x003, 0x000, 0x00b};
+
 struct State {
     ShaderStages stages;
     std::optional<DepthTarget> depth;
@@ -119,6 +121,8 @@ struct State {
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
     std::uint32_t samples = 1;
+    bool posZ = false;
+    std::array<std::optional<std::uint32_t>, DepthRangeRegisters.size()> depthRegisters{};
 };
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
@@ -185,8 +189,8 @@ struct DrawKeyRange {
     std::uint32_t first;
     std::uint32_t count;
 };
-inline constexpr std::array<DrawKeyRange, 49> DrawKeyRegisters{{
-    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
+inline constexpr std::array<DrawKeyRange, 50> DrawKeyRegisters{{
+    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x003, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
     {RegisterBank::Context, 0x080, 4}, {RegisterBank::Context, 0x08c, 4}, {RegisterBank::Context, 0x090, 2}, {RegisterBank::Context, 0x094, 2}, {RegisterBank::Context, 0x0b4, 2}, {RegisterBank::Context, 0x105, 4}, {RegisterBank::Context, 0x10b, 3}, {RegisterBank::Context, 0x10f, 6},
     // SPI_PS_INPUT_CNTL_0..31, SPI_PS_INPUT_ENA/ADDR, SPI_PS_IN_CONTROL, SPI_SHADER_POS/Z/COL_FORMAT,
     // CB_BLEND0..7_CONTROL, GE_MAX_OUTPUT_PER_SUBGROUP.

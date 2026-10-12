@@ -170,6 +170,8 @@ struct Context {
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
+    bool shaderClipDistance = false;
+    bool invertedDepthBounds = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

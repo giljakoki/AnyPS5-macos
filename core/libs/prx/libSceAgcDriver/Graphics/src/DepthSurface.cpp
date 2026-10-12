@@ -6,6 +6,8 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -22,6 +24,13 @@ Recorder* RecorderFor(const Context& context) {
     return recorder != nullptr && recorder->Device() == context.device ? recorder : nullptr;
 }
 
+void RequireClearDepth(const Context& context, const DepthTarget& target, float depth) {
+    if (context.depthRangeUnrestricted || (depth >= 0.0f && depth <= 1.0f)) return;
+    char text[320];
+    std::snprintf(text, sizeof(text), "AGC graphics: clearing depth surface 0x%llx (vk format %d) to DB_DEPTH_CLEAR %.9g (0x%08x) outside [0, 1] requires VK_EXT_depth_range_unrestricted, which the device lacks", static_cast<unsigned long long>(target.address), static_cast<int>(target.format), static_cast<double>(depth), std::bit_cast<std::uint32_t>(depth));
+    throw std::runtime_error(text);
+}
+
 class DepthSurface {
 public:
     DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target) {
@@ -31,6 +40,7 @@ public:
         Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be an attachment on this device");
         Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be sampled on this device");
         Require(target.extent.width <= context.limits.maxFramebufferWidth && target.extent.height <= context.limits.maxFramebufferHeight, "depth target exceeds framebuffer limits");
+        RequireClearDepth(context, target, target.clearDepth);
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         try {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -89,6 +99,7 @@ public:
 
     void ApplyFastClear() {
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
+        if ((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) RequireClearDepth(context, target, clearDepth);
         pendingClear = 0;
         if (aspects == 0) return;
         auto* recorder = RecorderFor(context);

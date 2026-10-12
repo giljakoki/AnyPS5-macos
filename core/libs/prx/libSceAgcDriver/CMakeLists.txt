@@ -1059,6 +1059,22 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_emulated_color_compare_srgb_decode PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_host_depth_range_restricted COMMAND agc_driver_host_depth_range_tests)
+    set_tests_properties(agc_driver_host_depth_range_restricted PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DEPTH_RANGE_UNRESTRICTED=1"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_host_depth_range_restricted_no_gpl COMMAND agc_driver_host_depth_range_tests)
+    set_tests_properties(agc_driver_host_depth_range_restricted_no_gpl PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1;APS5_NO_DEPTH_RANGE_UNRESTRICTED=1"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_host_depth_range_restricted_verify COMMAND agc_driver_host_depth_range_tests)
+    set_tests_properties(agc_driver_host_depth_range_restricted_verify PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DEPTH_RANGE_UNRESTRICTED=1;APS5_VERIFY_DRAW_RECIPE=1"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_host_depth_range_restricted agc_driver_host_depth_range_restricted_no_gpl agc_driver_host_depth_range_restricted_verify PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_shared_write_partial_collect COMMAND agc_shared_write_tests --partial-collect)
     set_tests_properties(agc_shared_write_partial_collect PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     if(WIN32)
