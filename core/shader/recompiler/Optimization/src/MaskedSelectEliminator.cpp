@@ -1,7 +1,9 @@
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/DeadCodeEliminator.hpp"
+#include "Optimization/WaveUniformity.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -808,6 +810,256 @@ private:
     std::uint32_t epoch = 0;
 };
 
+
+struct EdgeValue {
+    bool known = false;
+    std::uint32_t value = 0;
+    std::uint32_t poison = 0;
+};
+
+struct EdgeFact {
+    const IrValue* condition = nullptr;
+    bool value = false;
+};
+
+std::size_t blockIndexOf(const IrProgram& program, const IrBlock* block) {
+    const auto& order = program.BlockOrder();
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        if (order[index] == block) return index;
+    }
+    return order.size();
+}
+
+const IrBlock* blockWithId(const IrProgram& program, std::uint32_t id) {
+    const auto& info = program.Metadata().blockInfo;
+    for (std::size_t index = 0; index < info.size(); ++index) {
+        if (info[index].id == id) return program.BlockOrder()[index];
+    }
+    return nullptr;
+}
+
+bool uniformAcrossWave(const std::unordered_set<const IrValue*>& uniform, const IrValue* value, std::uint32_t depth) {
+    value = value->Resolve();
+    if (value->HasImmediate() || uniform.contains(value)) return true;
+    if (depth > DepthLimit || value->IsPhi()) return false;
+    if (value->Opcode() != IrOpcode::ImageSampleRaw && !isLaneLocal(value->Opcode())) return false;
+    for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+        const IrValue* argument = value->Argument(index);
+        if (argument == nullptr || !uniformAcrossWave(uniform, argument, depth + 1u)) return false;
+    }
+    return true;
+}
+
+std::optional<EdgeFact> edgeFact(const IrProgram& program, const IrBlock* predecessor, const IrBlock* block) {
+    const auto& info = program.Metadata().blockInfo;
+    if (info.size() != program.BlockOrder().size()) return std::nullopt;
+    const std::size_t index = blockIndexOf(program, predecessor);
+    if (index >= info.size()) return std::nullopt;
+    const BlockInfo& branch = info[index];
+    if (branch.terminator.kind != TerminatorKind::ConditionalBranch || !IsWaveMaskBranch(branch) || branch.condition == nullptr) return std::nullopt;
+    const IrBlock* onTrue = blockWithId(program, branch.terminator.trueBlock);
+    const IrBlock* onFalse = blockWithId(program, branch.terminator.falseBlock);
+    if (onTrue == onFalse || (block != onTrue && block != onFalse)) return std::nullopt;
+    const bool taken = block == onTrue;
+    const bool any = branch.terminator.condition == BranchCondition::ExecNonZero || branch.terminator.condition == BranchCondition::VccNonZero;
+    const IrValue* condition = branch.condition->Resolve();
+    if (taken == any && !uniformAcrossWave(WaveUniformValues(program), condition, 0u)) return std::nullopt;
+    return EdgeFact{condition, taken};
+}
+
+const IrValue* incomingFrom(const IrValue& phi, const IrBlock* predecessor) {
+    for (std::size_t index = 0; index < phi.PhiBlockCount(); ++index) {
+        if (phi.PhiBlock(index) == predecessor) return phi.Argument(index) == nullptr ? nullptr : phi.Argument(index)->Resolve();
+    }
+    return nullptr;
+}
+
+EdgeValue knownValue(std::uint32_t value) {
+    return EdgeValue{true, value, 0u};
+}
+
+EdgeValue tainted() {
+    return EdgeValue{false, 0u, ~0u};
+}
+
+std::uint32_t mayBeSet(const EdgeValue& value) {
+    return value.known ? value.value : ~0u;
+}
+
+std::uint32_t surelySet(const EdgeValue& value) {
+    return value.known ? value.value : 0u;
+}
+
+bool knownFalse(const EdgeValue& value) {
+    return value.known && value.value == 0u;
+}
+
+class EdgeEvaluation {
+public:
+    EdgeEvaluation(const IrProgram& program, const IrValue& phi, const IrBlock* predecessor, std::optional<EdgeFact> fact) : program(program), phi(phi), predecessor(predecessor), fact(fact) {}
+
+    bool Unobserved() {
+        for (const IrValue* inst : phi.Parent()->Instructions()) {
+            const auto result = evaluate(*inst);
+            if (!result) return false;
+            values[inst] = *result;
+        }
+        return true;
+    }
+
+private:
+    EdgeValue argument(const IrValue* value) {
+        value = value->Resolve();
+        const auto found = values.find(value);
+        return found != values.end() ? found->second : outside(value, 0u);
+    }
+
+    EdgeValue outside(const IrValue* value, std::uint32_t depth) {
+        value = value->Resolve();
+        if (value->HasImmediate()) return value->Type() == IrType::Bool ? knownValue(value->ImmediateBool() ? 1u : 0u) : value->Type() == IrType::U32 || value->Type() == IrType::F32 ? knownValue(value->ImmediateU32()) : EdgeValue{};
+        if (fact && value == fact->condition) return knownValue(fact->value ? 1u : 0u);
+        if (value->Type() == IrType::Bool && everyRunningLane(value, program.WaveSize())) return knownValue(1u);
+        if (depth > DepthLimit || value->ArgumentCount() == 0u) return {};
+        if (isSelect(value->Opcode()) && value->ArgumentCount() == 3u) {
+            const EdgeValue condition = outside(value->Argument(0), depth + 1u);
+            if (condition.known) return outside(value->Argument(condition.value != 0u ? 1u : 2u), depth + 1u);
+            const EdgeValue left = outside(value->Argument(1), depth + 1u);
+            const EdgeValue right = outside(value->Argument(2), depth + 1u);
+            return left.known && right.known && left.value == right.value ? left : EdgeValue{};
+        }
+        if (value->ArgumentCount() != 2u) return {};
+        const EdgeValue left = outside(value->Argument(0), depth + 1u);
+        const EdgeValue right = outside(value->Argument(1), depth + 1u);
+        switch (value->Opcode()) {
+            case IrOpcode::IEqual32:
+                return left.known && right.known ? knownValue(left.value == right.value ? 1u : 0u) : EdgeValue{};
+            case IrOpcode::INotEqual32:
+                return left.known && right.known ? knownValue(left.value != right.value ? 1u : 0u) : EdgeValue{};
+            case IrOpcode::LogicalAnd:
+                if (knownFalse(left) || knownFalse(right)) return knownValue(0u);
+                return left.known && right.known ? knownValue(1u) : EdgeValue{};
+            default:
+                return {};
+        }
+    }
+
+    std::optional<EdgeValue> evaluate(const IrValue& inst) {
+        if (inst.IsPhi()) {
+            if (&inst == &phi) return tainted();
+            const IrValue* incoming = incomingFrom(inst, predecessor);
+            if (incoming == nullptr) return std::nullopt;
+            return outside(incoming, 0u);
+        }
+        if (inst.Opcode() == IrOpcode::LaneId) return EdgeValue{};
+        std::vector<EdgeValue> arguments;
+        for (std::size_t index = 0; index < inst.ArgumentCount(); ++index) {
+            if (inst.Argument(index) == nullptr) return std::nullopt;
+            arguments.push_back(argument(inst.Argument(index)));
+        }
+        if (inst.Opcode() == IrOpcode::SetAttribute) {
+            for (const EdgeValue& value : arguments) {
+                if (value.poison != 0u) return std::nullopt;
+            }
+            return EdgeValue{};
+        }
+        if (!isLaneLocal(inst.Opcode())) return std::nullopt;
+        EdgeValue result = transfer(inst, arguments);
+        if (result.poison == 0u && inst.Type() == IrType::Bool && everyRunningLane(&inst, program.WaveSize())) result = knownValue(1u);
+        return result;
+    }
+
+    static EdgeValue transfer(const IrValue& inst, const std::vector<EdgeValue>& arguments) {
+        const auto clean = [&] {
+            for (const EdgeValue& value : arguments) {
+                if (value.poison != 0u) return false;
+            }
+            return true;
+        };
+        switch (inst.Opcode()) {
+            case IrOpcode::BitwiseAnd32: {
+                const EdgeValue& left = arguments[0];
+                const EdgeValue& right = arguments[1];
+                const std::uint32_t poison = (left.poison & mayBeSet(right)) | (right.poison & mayBeSet(left));
+                if (poison == 0u && left.known && right.known) return knownValue(left.value & right.value);
+                return EdgeValue{false, 0u, poison};
+            }
+            case IrOpcode::BitwiseOr32: {
+                const EdgeValue& left = arguments[0];
+                const EdgeValue& right = arguments[1];
+                const std::uint32_t poison = (left.poison & ~surelySet(right)) | (right.poison & ~surelySet(left));
+                if (poison == 0u && left.known && right.known) return knownValue(left.value | right.value);
+                return EdgeValue{false, 0u, poison};
+            }
+            case IrOpcode::ShiftRightLogical32:
+            case IrOpcode::ShiftLeftLogical32: {
+                const EdgeValue& shifted = arguments[0];
+                const EdgeValue& amount = arguments[1];
+                if (!amount.known) return clean() ? EdgeValue{} : tainted();
+                const std::uint32_t bits = amount.value & 31u;
+                const bool right = inst.Opcode() == IrOpcode::ShiftRightLogical32;
+                const std::uint32_t poison = right ? shifted.poison >> bits : shifted.poison << bits;
+                if (poison == 0u && shifted.known) return knownValue(right ? shifted.value >> bits : shifted.value << bits);
+                return EdgeValue{false, 0u, poison};
+            }
+            case IrOpcode::BitFieldUExtract: {
+                const EdgeValue& field = arguments[0];
+                const EdgeValue& offset = arguments[1];
+                const EdgeValue& count = arguments[2];
+                if (!offset.known || !count.known || offset.value >= 32u) return clean() ? EdgeValue{} : tainted();
+                const std::uint32_t width = std::min(count.value, 32u - offset.value);
+                const std::uint32_t mask = width >= 32u ? ~0u : (1u << width) - 1u;
+                const std::uint32_t poison = (field.poison >> offset.value) & mask;
+                if (poison == 0u && field.known) return knownValue((field.value >> offset.value) & mask);
+                return EdgeValue{false, 0u, poison};
+            }
+            case IrOpcode::SelectU1:
+            case IrOpcode::SelectU32:
+            case IrOpcode::SelectF32: {
+                const EdgeValue& condition = arguments[0];
+                if (condition.poison != 0u) return tainted();
+                if (condition.known) return arguments[condition.value != 0u ? 1u : 2u];
+                const EdgeValue& left = arguments[1];
+                const EdgeValue& right = arguments[2];
+                if (left.known && right.known && left.value == right.value) return left;
+                return EdgeValue{false, 0u, left.poison | right.poison};
+            }
+            case IrOpcode::IEqual32:
+            case IrOpcode::INotEqual32: {
+                if (!clean()) return tainted();
+                const EdgeValue& left = arguments[0];
+                const EdgeValue& right = arguments[1];
+                if (!left.known || !right.known) return {};
+                return knownValue(((left.value == right.value) == (inst.Opcode() == IrOpcode::IEqual32)) ? 1u : 0u);
+            }
+            case IrOpcode::LogicalAnd: {
+                const EdgeValue& left = arguments[0];
+                const EdgeValue& right = arguments[1];
+                if ((knownFalse(left) && left.poison == 0u) || (knownFalse(right) && right.poison == 0u)) return knownValue(0u);
+                if (!clean()) return tainted();
+                return left.known && right.known ? knownValue(1u) : EdgeValue{};
+            }
+            default:
+                return clean() ? EdgeValue{} : tainted();
+        }
+    }
+
+    const IrProgram& program;
+    const IrValue& phi;
+    const IrBlock* predecessor;
+    std::optional<EdgeFact> fact;
+    std::unordered_map<const IrValue*, EdgeValue> values;
+};
+
+}
+
+bool PhiIncomingUnobserved(const IrProgram& program, const IrValue& phi, std::size_t index) {
+    const IrBlock* block = phi.Parent();
+    if (!phi.IsPhi() || block == nullptr || !block->Successors().empty() || phi.ArgumentCount() != phi.PhiBlockCount() || index >= phi.PhiBlockCount()) return false;
+    const IrBlock* predecessor = phi.PhiBlock(index);
+    for (std::size_t other = 0; other < phi.PhiBlockCount(); ++other) {
+        if (other != index && phi.PhiBlock(other) == predecessor) return false;
+    }
+    return EdgeEvaluation(program, phi, predecessor, edgeFact(program, predecessor, block)).Unobserved();
 }
 
 MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& program) const {

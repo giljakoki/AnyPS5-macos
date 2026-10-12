@@ -126,6 +126,64 @@ bool run(const char* name, const std::function<bool()>& test) {
     }
 }
 
+enum class SkipCondition { Uniform, UniformSample, LaneSample, Lanes };
+
+bool skippedBarycentricUnobserved(SkipCondition kind, bool maskLowHalf) {
+    Builder b;
+    IrBlock& entry = *b.block;
+    const auto [runLow, runHigh] = b.ballotWords(b.truth());
+    auto& barycentric = b.add(b.lane(), 7u);
+    auto& userData = b.emit(IrOpcode::GetUserData, IrType::U32, {&b.constant(4u)});
+    const auto sampled = [&](IrValue& coordinate) -> IrValue& {
+        auto& address = b.emit(IrOpcode::MakeImageAddress, IrType::ImageAddress, {&coordinate, &coordinate});
+        auto& texel = b.emit(IrOpcode::ImageSampleRaw, IrType::Vec4U32, {&b.emit(IrOpcode::GetImageResource, IrType::ImageResource, {&userData}), &b.emit(IrOpcode::GetSamplerResource, IrType::SamplerResource, {&userData}), &address});
+        auto& alpha = b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&b.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&texel, &b.constant(0u)})});
+        auto& threshold = b.program.CreateValue(IrOpcode::Void, IrType::F32);
+        threshold.SetImmediateF32(0.75f);
+        return b.emit(IrOpcode::FPOrdGreaterThan32, IrType::Bool, {&alpha, &threshold});
+    };
+    auto& condition = kind == SkipCondition::Uniform ? b.emit(IrOpcode::IEqual32, IrType::Bool, {&userData, &b.constant(0u)}) : kind == SkipCondition::UniformSample ? sampled(b.constant(0x3f000000u)) : kind == SkipCondition::LaneSample ? sampled(b.lane()) : b.mask(16u);
+    auto& flag = b.select(condition, b.constant(0x100u), b.constant(1u));
+    IrBlock& body = b.newBlock();
+    b.block = &body;
+    auto& computed = b.add(b.lane(), 5u);
+    IrBlock& exit = b.newBlock();
+    entry.AddBranch(&exit);
+    entry.AddBranch(&body);
+    body.AddBranch(&exit);
+    b.block = &exit;
+    auto& value = b.phi(IrType::U32, entry, barycentric);
+    value.AddPhiOperand(&body, &computed);
+    auto& merged = b.phi(IrType::U32, entry, flag);
+    merged.AddPhiOperand(&body, &b.constant(1u));
+    auto& running = b.threadBit(*runLow, *runHigh);
+    auto& taken = b.logicalAnd(running, b.emit(IrOpcode::IEqual32, IrType::Bool, {&b.constant(0x100u), &merged}));
+    auto& high = b.emit(IrOpcode::BitwiseAnd32, IrType::U32, {&value, &b.constant(0xffff0000u)});
+    auto& packed = b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&high, &b.constant(0u)});
+    auto& chosen = b.select(taken, packed, value);
+    auto& low = maskLowHalf ? b.emit(IrOpcode::BitwiseAnd32, IrType::U32, {&chosen, &b.constant(0xffffu)}) : chosen;
+    auto& half = b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&low, &b.constant(0x3c000000u)});
+    auto& output = b.emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&half, &half, &b.constant(0u), &b.constant(0u)});
+    (void)b.emit(IrOpcode::SetAttribute, IrType::Void, {&output, &running});
+    const auto describe = [](IrBlock& block) {
+        BlockInfo info;
+        info.id = block.Id();
+        return info;
+    };
+    BlockInfo branch = describe(entry);
+    branch.terminator.kind = TerminatorKind::ConditionalBranch;
+    branch.terminator.condition = BranchCondition::VccNonZero;
+    branch.terminator.trueBlock = exit.Id();
+    branch.terminator.falseBlock = body.Id();
+    branch.terminator.mergeBlock = exit.Id();
+    branch.condition = &condition;
+    BlockInfo fallthrough = describe(body);
+    fallthrough.terminator.kind = TerminatorKind::Branch;
+    fallthrough.terminator.trueBlock = exit.Id();
+    b.program.Metadata().blockInfo = {branch, fallthrough, describe(exit)};
+    return PhiIncomingUnobserved(b.program, value, 0u);
+}
+
 }
 
 int main() {
@@ -875,6 +933,26 @@ int main() {
     passed &= run("a write under an EXEC merged from the entry EXEC and its restored copy, exported for every running lane, keeps the select", [&] {
         const auto [count, gone] = mergedExecCopies(false, true);
         return count == 0u && !gone;
+    });
+
+    passed &= run("a value merged from a uniform wave-mask branch's taken edge whose bits the merge block masks off is unobserved", [] {
+        return skippedBarycentricUnobserved(SkipCondition::Uniform, true);
+    });
+
+    passed &= run("a value merged from the taken edge of a wave-mask branch on a sample at a constant coordinate whose bits the merge block masks off is unobserved", [] {
+        return skippedBarycentricUnobserved(SkipCondition::UniformSample, true);
+    });
+
+    passed &= run("a value merged from the taken edge of a wave-mask branch on a sample at a lane-varying coordinate stays observed", [] {
+        return !skippedBarycentricUnobserved(SkipCondition::LaneSample, true);
+    });
+
+    passed &= run("a value merged from a lane-varying wave-mask branch's taken edge stays observed", [] {
+        return !skippedBarycentricUnobserved(SkipCondition::Lanes, true);
+    });
+
+    passed &= run("a value merged from a uniform wave-mask branch's taken edge whose bits reach an export stays observed", [] {
+        return !skippedBarycentricUnobserved(SkipCondition::Uniform, false);
     });
 
     return passed ? 0 : 1;
