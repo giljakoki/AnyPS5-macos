@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/FrameHitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -227,6 +229,9 @@ void Driver::executeRewindTail(const Submission& stalled) {
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto* hitches = FrameHitches();
+    HitchSubmission hitch{};
+    if (hitches != nullptr) hitch.entered = std::chrono::steady_clock::now();
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < 0x58), "unsupported compute queue");
     GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
@@ -248,12 +253,20 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
+    const auto roomStart = hitches != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     waitForFlipRoom(submission);
+    const auto holdStart = hitches != nullptr ? std::chrono::steady_clock::now() : roomStart;
     holdFlipBehindWorker(submission);
+    if (hitches != nullptr) {
+        const auto held = std::chrono::steady_clock::now();
+        hitch.flipRoomMs = std::chrono::duration<double, std::milli>(holdStart - roomStart).count();
+        hitch.workerHoldMs = std::chrono::duration<double, std::milli>(held - holdStart).count();
+    }
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
     const auto validated = profile ? std::chrono::steady_clock::now() : start;
+    bool flipSubmission = false;
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -276,10 +289,18 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
             submission.holdsFlip = true;
             flipsAhead.fetch_add(1, std::memory_order_acq_rel);
         }
+        flipSubmission = submission.holdsFlip;
         enqueue(std::move(submission));
         ++accepted;
     }
     changed.notify_all();
+    if (hitches == nullptr) return;
+    if (!flipSubmission) {
+        hitches->OtherSubmitted();
+        return;
+    }
+    hitch.left = std::chrono::steady_clock::now();
+    if (const auto report = hitches->FlipSubmitted(hitch)) AgcDriver::ProfilePrint_nid_no_patch("%s", report->c_str());
 }
 
 void Driver::SuspendPoint() {

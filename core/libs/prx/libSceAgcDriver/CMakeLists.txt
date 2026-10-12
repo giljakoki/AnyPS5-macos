@@ -145,6 +145,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WriteEvidence.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBuffers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/CommandValidation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/FrameHitches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketExecution.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketFlush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketHistory.cpp
@@ -353,6 +354,23 @@ if(BUILD_TESTING)
     set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_frame_hitches_tests EXCLUDE_FROM_ALL
+        tests/FrameHitches.cpp
+        Execution/src/Driver/Packets/FrameHitches.cpp
+)
+target_include_directories(agc_frame_hitches_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_frame_hitches_tests PRIVATE libc)
+set_target_properties(agc_frame_hitches_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_frame_hitches_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_frame_hitches_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_frame_hitches COMMAND agc_frame_hitches_tests)
+    if(WIN32)
+        set_tests_properties(agc_frame_hitches PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
