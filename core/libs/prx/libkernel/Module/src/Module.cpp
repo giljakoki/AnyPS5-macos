@@ -269,14 +269,30 @@ int APS5_VABI sceKernelStopUnloadModule(KernelModule handle, size_t args, const 
 
 extern "C" {
 
-int APS5_VABI __elf_phdr_match_addr_nid_postfix(dl_phdr_info* phdrInfo, void* addr) {
-    if (phdrInfo == nullptr) throw std::invalid_argument("__elf_phdr_match_addr: phdr_info is null");
+int APS5_VABI __elf_phdr_match_addr_nid_postfix(const void* moduleInfo, void* addr) {
+    if (moduleInfo == nullptr) throw std::invalid_argument("__elf_phdr_match_addr: module info is null");
+    std::uint64_t size = 0;
+    std::memcpy(&size, moduleInfo, sizeof(size));
+    const ModuleSegmentInfo* segments = nullptr;
+    std::uint32_t count = 0;
+    if (size == sizeof(ModuleInfoEx)) {
+        const auto* info = static_cast<const ModuleInfoEx*>(moduleInfo);
+        segments = info->segments;
+        count = info->segment_count;
+    } else if (size == sizeof(ModuleInfo)) {
+        const auto* info = static_cast<const ModuleInfo*>(moduleInfo);
+        segments = info->segments;
+        count = info->segment_count;
+    } else {
+        throw std::invalid_argument("__elf_phdr_match_addr: module info of size " + std::to_string(size) + " is neither SceKernelModuleInfo nor SceKernelModuleInfoEx");
+    }
+    if (count > 4) throw std::invalid_argument("__elf_phdr_match_addr: module info with " + std::to_string(count) + " segments");
+    constexpr std::int32_t executable = 4;
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
-    for (std::uint16_t i = 0; i < phdrInfo->dlpi_phnum; ++i) {
-        const Elf64_Phdr& header = phdrInfo->dlpi_phdr[i];
-        if (header.p_type != PT_LOAD || (header.p_flags & PF_X) == 0) continue;
-        const std::uintptr_t begin = phdrInfo->dlpi_addr + header.p_vaddr;
-        if (begin <= address && address + sizeof(addr) < begin + header.p_memsz) return 1;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& segment = segments[i];
+        if ((segment.prot & executable) == 0) continue;
+        if (segment.address <= address && address < segment.address + segment.size) return 1;
     }
     return 0;
 }

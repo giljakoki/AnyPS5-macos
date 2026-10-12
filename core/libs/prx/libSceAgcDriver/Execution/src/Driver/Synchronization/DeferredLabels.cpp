@@ -3,9 +3,26 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ThreadOwned.hpp"
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+void noteUnimportedLabel(std::uint64_t address, std::size_t bytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::mutex mutex;
+    static std::set<std::uint64_t> seen;
+    std::lock_guard lock(mutex);
+    if (seen.size() >= 32 || !seen.insert(address).second) return;
+    std::fprintf(stderr, "[sync] label 0x%llx (%zu bytes) lies outside every host import: each of its stores drains the device first\n", static_cast<unsigned long long>(address), bytes);
+}
+
+}
 
 DeferredLabels& deferredLabels() {
     static thread_local DeferredLabels* deferred = nullptr;
@@ -117,6 +134,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label.address, bytes, stamp, queue, first) : 4;
         first = false;
         countLabelOutcome(reason);
+        if (reason == 3) noteUnimportedLabel(label.address, label.size);
         if (reason != 0 && reason != 5) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(label.address, bytes, 4);

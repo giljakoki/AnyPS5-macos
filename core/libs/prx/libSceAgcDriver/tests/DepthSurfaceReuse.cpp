@@ -186,5 +186,23 @@ void RunDepthSurfaceReuseTests() {
     Require(lookup(context, {stencil, FormatR8G8B8A8Unorm, 320, 180, TileRenderTarget64KB}) == nullptr, "an RGBA8 view of a stencil plane's own extent must be read as reused memory");
     Require(lookup(context, {stencil, FormatR32Float, 320, 180}) == nullptr, "an R32F view of a stencil plane's own extent must be read as reused memory");
 
+    Require(DepthSurfaceAt(depth32) && DepthSurfaceAt(depth16) && DepthSurfaceAt(depthStencil) && DepthSurfaceAt(stencil), "every bound depth and stencil plane must be known as a depth surface");
+    static int otherDeviceTag = 0;
+    auto otherDevice = context;
+    otherDevice.device = reinterpret_cast<VkDevice>(&otherDeviceTag);
+    RetireDepthSurfacesAt(otherDevice, depth32);
+    Require(DepthSurfaceAt(depth32), "a color target of another device must leave a depth surface alone");
+    RetireDepthSurfacesAt(context, depth32);
+    Require(!DepthSurfaceAt(depth32), "a color target bound over a depth surface must retire it");
+    Require(lookup(context, {depth32, FormatR32Float, 384, 384}) == nullptr, "a retired depth surface must not serve samples");
+    Require(DepthSurfaceAt(depth16) && DepthSurfaceAt(depthStencil) && DepthSurfaceAt(stencil), "retiring one depth surface must leave the others");
+    RetireDepthSurfacesAt(context, stencil);
+    Require(!DepthSurfaceAt(depthStencil) && !DepthSurfaceAt(stencil), "a color target bound over a stencil plane must retire its depth/stencil surface");
+    Require(DepthSurfaceAt(depth16), "retiring a depth/stencil surface must leave the other surfaces");
+    const auto first = DepthSurfaceView(context, {depth32, 0, {384, 384}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    Require(DepthSurfaceAt(depth32) && first != VK_NULL_HANDLE, "a depth target bound again after its retirement gets a fresh surface");
+    Require(DepthSurfaceView(context, {depth32, 0, {384, 384}, VK_FORMAT_D32_SFLOAT, 1.0f, 0}) == first, "the fresh surface serves the next binding of the same target");
+    Require(lookup(context, {depth32, FormatR32Float, 384, 384}) != nullptr, "the fresh surface serves samples again");
+
     ClearDepthSurfaces(context.device);
 }
