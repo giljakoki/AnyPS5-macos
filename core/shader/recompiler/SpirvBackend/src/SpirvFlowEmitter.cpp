@@ -156,7 +156,7 @@ std::uint32_t EmitWaveMaskBranchCondition(SpirvValueEmitContext& ctx, const Bloc
 
 std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
     const auto condition = info.terminator.condition;
-    if (ctx.otherHalf == nullptr && IsWaveMaskBranch(condition)) {
+    if (ctx.otherHalf == nullptr && IsWaveMaskBranch(info)) {
         return EmitWaveMaskBranchCondition(ctx, info);
     }
     if (ctx.otherHalf == nullptr || condition == BranchCondition::ScalarInstruction || condition == BranchCondition::GotoVariable || condition == BranchCondition::IndirectTarget) {

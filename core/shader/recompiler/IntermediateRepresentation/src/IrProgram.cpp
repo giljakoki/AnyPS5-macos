@@ -312,6 +312,55 @@ const std::vector<IrBlock*>& IrProgram::BlockOrder() const {
     return blockOrder;
 }
 
+std::string terminatorToString(const std::map<const IrValue*, std::size_t>& ids, const std::vector<BlockInfo>& blockInfo, const BlockInfo& info) {
+    const auto block = [&](std::uint32_t id) {
+        for (std::size_t index = 0; index < blockInfo.size(); index++) {
+            if (blockInfo[index].id == id) return "$" + std::to_string(index);
+        }
+        return std::string("?");
+    };
+    const auto conditionName = [](BranchCondition condition) {
+        switch (condition) {
+        case BranchCondition::Always: return "always";
+        case BranchCondition::SccZero: return "scc0";
+        case BranchCondition::SccNonZero: return "scc1";
+        case BranchCondition::VccZero: return "vccz";
+        case BranchCondition::VccNonZero: return "vccnz";
+        case BranchCondition::ExecZero: return "execz";
+        case BranchCondition::ExecNonZero: return "execnz";
+        case BranchCondition::ScalarInstruction: return "scalar";
+        case BranchCondition::IndirectTarget: return "indirect";
+        case BranchCondition::GotoVariable: return "goto";
+        default: return "unknown";
+        }
+    };
+    const auto& term = info.terminator;
+    std::string text = "          ";
+    switch (term.kind) {
+    case TerminatorKind::Branch:
+        text += "branch " + block(term.trueBlock);
+        break;
+    case TerminatorKind::ConditionalBranch:
+        text += std::string("branch_") + conditionName(term.condition) + (info.laneLocalBranch ? " lane-local" : (term.condition == BranchCondition::ExecZero || term.condition == BranchCondition::ExecNonZero || term.condition == BranchCondition::VccZero || term.condition == BranchCondition::VccNonZero) ? " wave-mask" : "");
+        if (info.condition != nullptr) text += " " + valueToString(ids, info.condition);
+        text += " true=" + block(term.trueBlock) + " false=" + block(term.falseBlock);
+        break;
+    case TerminatorKind::IndirectBranch:
+        text += "branch_indirect";
+        break;
+    case TerminatorKind::Return:
+        text += "return";
+        break;
+    default:
+        text += "unsupported";
+        break;
+    }
+    if (term.mergeBlock != InvalidControlFlowId) text += " merge=" + block(term.mergeBlock);
+    if (term.continueBlock != InvalidControlFlowId) text += " continue=" + block(term.continueBlock);
+    if (term.loopHeader) text += " loop";
+    return text + "\n";
+}
+
 std::string ProgramToString(const IrProgram& program) {
     std::map<const IrValue*, std::size_t> ids;
     std::size_t nextId = 1;
@@ -342,6 +391,7 @@ std::string ProgramToString(const IrProgram& program) {
             }
             text += " (" + TypeToString(inst->Type()) + "; uses=" + std::to_string(inst->UseCount()) + ")\n";
         }
+        text += terminatorToString(ids, blockInfo, blockInfo[blockIndex]);
     }
     return text;
 }

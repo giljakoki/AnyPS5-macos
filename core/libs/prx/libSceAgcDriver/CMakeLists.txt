@@ -1059,6 +1059,15 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_emulated_color_compare_srgb_decode PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_exec_host_lanes_no_vertex_subgroups COMMAND agc_driver_exec_host_lanes_tests)
+    add_test(NAME agc_driver_vertex_lane_local_no_vertex_subgroups COMMAND agc_driver_vertex_lane_local_tests)
+    set_tests_properties(agc_driver_exec_host_lanes_no_vertex_subgroups agc_driver_vertex_lane_local_no_vertex_subgroups PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SUBGROUP_STAGES=0x32"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_exec_host_lanes_no_vertex_subgroups agc_driver_vertex_lane_local_no_vertex_subgroups PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_host_depth_range_restricted COMMAND agc_driver_host_depth_range_tests)
     set_tests_properties(agc_driver_host_depth_range_restricted PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DEPTH_RANGE_UNRESTRICTED=1"

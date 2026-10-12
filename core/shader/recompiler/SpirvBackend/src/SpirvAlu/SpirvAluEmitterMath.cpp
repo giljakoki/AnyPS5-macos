@@ -551,6 +551,7 @@ std::optional<std::uint32_t> EmitHalfWaveReduction(SpirvValueEmitContext& ctx, c
         const auto upper = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), ConstantU32(state, 32u));
         keys = lane >= 32u ? Select(state, TypeU32(state), upper, keys, identity) : Select(state, TypeU32(state), upper, identity, keys);
     }
+    if (!state.stageSubgroups) ctx.Fail(inst, (read + " needs subgroup arithmetic, which the device does not support in this shader stage").c_str());
     state.module.EmitCapability(spv::CapabilityGroupNonUniformArithmetic);
     const auto result = state.module.AllocateId();
     state.module.AddFunction(scan->reduction->reduce, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), static_cast<std::uint32_t>(spv::GroupOperationReduce), keys);

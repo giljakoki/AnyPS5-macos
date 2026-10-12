@@ -153,6 +153,10 @@ Multisampled (MSAA) color and depth targets are rendered as host multisampled im
 
 `APS5_TRACE_MSAA=1` prints `[msaa]` lines to stderr, each distinct one once: the register state of every draw that uses multisampling or a CB metadata pass, the descriptors of multisampled and FMASK textures with the address of the shader that reads them, printed before that shader is compiled, and uniform fills of up to 4 MiB, where CMASK, FMASK and HTILE clears show. The log of one run with both variables shows how a title uses multisampling and what it still needs. Any other value stops the title: for `APS5_MSAA_SINGLE_SAMPLE` at its first draw, for `APS5_TRACE_MSAA` at its first draw, compute dispatch or buffer fill.
 
+### Devices without subgroup operations in vertex shaders
+
+A device whose `Selected GPU` log line lacks the vertex bit in `stages=` (MoltenVK reports `stages=0x32`) runs vertex, local and tessellation-evaluation programs without subgroup operations. The recompiler then rewrites the wave-level constructs it can prove exact for each vertex on its own: the own-lane bit of masks built from compares, EXEC and `s_*_saveexec`; lane-index arithmetic whose result is the same for every lane of the wave the entry `s3` describes; `v_readfirstlane` and `v_readlane` of wave-uniform values; and `s_cbranch_execz`, `execnz`, `vccz` and `vccnz` regions whose side effects are masked by EXEC and whose results merge back unchanged for the lanes that skip them. Everything else stops the title with a message such as `ShaderRecompiler::Recompile: vertex program 0x… (wave64, s3 counts 32) needs subgroup operations, which the device does not support in vertex shaders (subgroup stages 0x32); exact lowering left: a wave-mask branch controls a loop at 0x…-0x…`, listing each construct that is left with its address range. Include that line, and the `shader_*.req` file `APS5_DUMP_SHADERS=1` writes for it, when reporting the title.
+
 ## Exit codes
 
 `0`: conversion succeeded. `1`: invalid arguments. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.
