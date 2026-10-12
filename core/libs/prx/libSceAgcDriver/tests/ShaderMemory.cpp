@@ -1523,6 +1523,12 @@ void verifyStagesWithoutSubgroups() {
     require(!native.empty() && subgroupWords(native) != 0u, "stages without subgroups: the same program on a device with vertex subgroups lost its subgroup operations");
     const auto narrow = prepared(prologue, 64u, 32u, withoutVertex);
     require(!narrow.empty() && subgroupWords(narrow) == 0u, "stages without subgroups: the NGG prologue comparing v_mbcnt with the s3 count on a 32-lane host kept subgroup operations");
+    const std::vector<std::uint32_t> ifElse{
+        0x7e020280u, 0xbeac047eu, 0x7daa0a80u, 0xbf880001u, 0x7e0202f2u, 0x8afe7e2cu, 0xbf880001u, 0x7e0202f4u,
+        0xbefe042cu, 0xf80008cfu, 0x01010101u, 0xbf810000u,
+    };
+    const auto branches = prepared(ifElse, 64u, 32u, withoutVertex);
+    require(!branches.empty() && subgroupWords(branches) == 0u, "stages without subgroups: an if/else of v_cmpx, s_cbranch_execz, s_andn2_b64 exec and a second s_cbranch_execz over masked writes kept subgroup operations");
     const auto uniformRead = prepared(firstLane, 32u, 32u, withoutVertex, true);
     require(!uniformRead.empty() && subgroupWords(uniformRead) == 0u, "stages without subgroups: v_readfirstlane of a user data value kept subgroup operations");
     const char* refused = "needs subgroup operations, which the device does not support in vertex shaders (subgroup stages 0x32); exact lowering left:";
