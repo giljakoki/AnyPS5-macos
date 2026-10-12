@@ -3297,6 +3297,7 @@ void descriptorCacheTests() {
 
 void textureCacheBudgetTests() {
     using AgcDriver::Graphics::TextureCacheBudget;
+    using AgcDriver::Graphics::HostImportBudget;
     constexpr std::uint64_t GiB = 1ull << 30u;
     VkPhysicalDeviceMemoryProperties memory{};
     Require(TextureCacheBudget(memory) == 2 * GiB, "a device without memory heaps does not keep 2 GiB of cached textures");
@@ -3312,6 +3313,11 @@ void textureCacheBudgetTests() {
     Require(TextureCacheBudget(memory) == 2 * GiB, "a heap past memoryHeapCount or a host heap counted toward the texture caches");
     memory.memoryHeapCount = 3;
     Require(TextureCacheBudget(memory) == 6 * GiB, "a 24 GiB device-local heap does not give 6 GiB of cached textures");
+    Require(HostImportBudget(memory) == 18 * GiB, "a 24 GiB device-local heap does not admit 18 GiB of host imports");
+    memory.memoryHeaps[2].size = 6 * GiB;
+    Require(HostImportBudget(memory) == 6 * GiB, "a 6 GiB device-local heap does not keep the 6 GiB host import floor");
+    memory.memoryHeapCount = 0;
+    Require(HostImportBudget(memory) == 6 * GiB, "a device without memory heaps does not keep the 6 GiB host import floor");
 }
 
 void sampledTextureBudgetTests() {
