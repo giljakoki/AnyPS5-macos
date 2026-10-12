@@ -85,7 +85,7 @@ int Run(const int argc, char* argv[]) {
         }
 
         auto elfReader = std::make_shared<Relinker::ElfReader>(sourceBytes);
-        const std::shared_ptr<Relinker::ISyscallScanner> syscallScanner = args.skipSyscallCheck ? Relinker::MakeNullSyscallScanner() : Relinker::MakeSyscallScanner();
+        const std::shared_ptr<Relinker::ISyscallScanner> syscallScanner = args.skipSyscallCheck ? Relinker::MakeNullSyscallScanner() : Relinker::MakeSyscallScanner(args.trapSdkSyscallStubs);
 
         const auto pipeline = std::make_shared<Relinker::RelinkerPipeline>(
             elfReader,
@@ -115,16 +115,32 @@ int Run(const int argc, char* argv[]) {
         const Elfpatcher::Linux::LinuxDesktopEntryWriter desktopEntryWriter;
         const auto desktopEntry = args.toWindows || args.toMacos ? std::nullopt : desktopEntryWriter.Prepare(Io::NativePath(args.inputPath).parent_path() / "sce_sys", Io::NativePath(absPath));
 
+        const auto checkOutputInputs = [&](const std::filesystem::path& path, const char* kind) {
+            if (!std::filesystem::exists(path)) return;
+            if (std::filesystem::equivalent(Io::NativePath(args.inputPath), path))
+                throw Domain::RelinkerException(std::string(kind) + " output would overwrite the input executable: " + Io::Utf8Path(path));
+            for (const auto& artifact : guestArtifacts)
+                if (std::filesystem::equivalent(artifact.SourcePath, path))
+                    throw Domain::RelinkerException(std::string(kind) + " output would overwrite an input module: " + Io::Utf8Path(path));
+        };
+        if (desktopEntry) {
+            checkOutputInputs(desktopEntry->IconPath, "Icon");
+            checkOutputInputs(desktopEntry->EntryPath, "Desktop entry");
+        }
+
         std::filesystem::create_directories(Io::NativePath(absPath).parent_path());
         if (args.writeRegistry) {
             const std::filesystem::path outFsPath = Io::NativePath(absPath);
-            const std::string registryPath = Io::Utf8Path(outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + ".registry.json"));
+            std::vector<std::filesystem::path> registryPaths{
+                outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + ".registry.json")
+            };
+            for (const auto& artifact : guestArtifacts)
+                registryPaths.push_back(outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + "." + Io::Utf8Path(artifact.Path.filename()) + ".registry.json"));
+            for (const auto& path : registryPaths) checkOutputInputs(path, "Registry");
             const auto registryWriter = std::make_shared<Relinker::CallRegistryWriter>();
-            fileWriter.Write(registryPath, registryWriter->WriteCallRegistry(result.RegistryEntries));
-            for (const auto& artifact : guestArtifacts) {
-                const auto modulePath = outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + "." + Io::Utf8Path(artifact.Path.filename()) + ".registry.json");
-                fileWriter.Write(Io::Utf8Path(modulePath), registryWriter->WriteModuleImports(artifact.Imports));
-            }
+            fileWriter.Write(Io::Utf8Path(registryPaths.front()), registryWriter->WriteCallRegistry(result.RegistryEntries));
+            for (std::size_t index = 0; index < guestArtifacts.size(); ++index)
+                fileWriter.Write(Io::Utf8Path(registryPaths[index + 1]), registryWriter->WriteModuleImports(guestArtifacts[index].Imports));
         }
 
         auto byteWriter = std::make_shared<Io::ByteWriter>();

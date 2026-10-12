@@ -1350,6 +1350,7 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
             const auto compared = Select(state, f32, test, one, zero);
             result = Select(state, f32, equal(parameter(0u), index + 1u), compared, result);
         }
+        result = Select(state, f32, equal(parameter(4u), EmulatedCompare::ReferenceZero), zero, result);
         return result;
     };
     const auto scaledU = Binary(state, spv::OpFMul, f32, extract(f32, setup.coord, 0u), Unary(state, spv::OpConvertSToF, f32, width));

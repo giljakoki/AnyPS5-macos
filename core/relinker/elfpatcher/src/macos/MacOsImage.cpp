@@ -424,10 +424,12 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
         metaEnd += 8;
         input.Binds.push_back({symbol, metaRva + static_cast<std::uint32_t>(slot)});
     }
-    const auto moduleArgsSlot = metaEnd;
-    const auto moduleResultSlot = moduleArgsSlot + 8;
+    std::uint64_t moduleArgsSlot = 0;
+    std::uint64_t moduleResultSlot = 0;
     if (input.InitRva != 0) {
-        metaEnd = moduleResultSlot + 8;
+        moduleArgsSlot = metaEnd;
+        moduleResultSlot = metaEnd + 8;
+        metaEnd += 16;
         input.Binds.push_back({"___aps5_get_pending_module_args_nid_no_patch", metaRva + static_cast<std::uint32_t>(moduleArgsSlot)});
         input.Binds.push_back({"___aps5_set_module_init_result_nid_no_patch", metaRva + static_cast<std::uint32_t>(moduleResultSlot)});
     }

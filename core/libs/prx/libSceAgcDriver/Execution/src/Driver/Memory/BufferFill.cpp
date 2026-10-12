@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <bit>
 #include <cstdlib>
@@ -268,6 +269,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
         if (pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3]) {
             Graphics::NoteDepthMetadataFill(base, bytes, pattern[0]);
+            Graphics::NoteColorMetadataFill(base, bytes, pattern[0]);
             Graphics::TraceMultisampleFill(base, bytes, pattern[0], "buffer fill");
         }
         if (profile) {

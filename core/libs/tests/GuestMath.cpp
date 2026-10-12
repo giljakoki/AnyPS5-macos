@@ -40,6 +40,7 @@ int APS5_VABI __fpclassifyf_nid_postfix(float);
 float APS5_VABI fmodf_nid_postfix(float, float);
 float APS5_VABI asinf_nid_postfix(float);
 float APS5_VABI acosf_nid_postfix(float);
+double APS5_VABI asin_nid_postfix(double);
 float APS5_VABI atan2f_nid_postfix(float, float);
 float APS5_VABI hypotf_nid_postfix(float, float);
 double APS5_VABI hypot_nid_postfix(double, double);
@@ -53,6 +54,7 @@ float APS5_VABI log1pf_nid_postfix(float);
 double APS5_VABI expm1_nid_postfix(double);
 float APS5_VABI logbf_nid_postfix(float);
 double APS5_VABI exp2_nid_postfix(double);
+float APS5_VABI __powisf2_nid_postfix(float, int);
 double APS5_VABI ldexp_nid_postfix(double, int);
 double APS5_VABI scalbn_nid_postfix(double, int);
 float APS5_VABI scalbnf_nid_postfix(float, int);
@@ -126,6 +128,12 @@ static void CheckHypotSpecialValue() {
     Require(std::bit_cast<std::uint64_t>(hypot_nid_postfix(std::bit_cast<double>(0x7ff0000000000001ull), INFINITY)) == 0x7ff0000000000000ull);
     Require(std::bit_cast<std::uint64_t>(hypot_nid_postfix(-INFINITY, std::bit_cast<double>(0x7ff0000000000001ull))) == 0x7ff0000000000000ull);
     Require(std::bit_cast<std::uint64_t>(hypot_nid_postfix(std::bit_cast<double>(0x7ff0000000000001ull), -INFINITY)) == 0x7ff0000000000000ull);
+}
+
+static void CheckAsinfErrno() {
+    errno = 0;
+    (void)asinf_nid_postfix(2.0f);
+    Require(errno == 0);
 }
 
 static void CheckLongDouble() {
@@ -280,6 +288,36 @@ static void CheckIntegerConversions() {
 }
 
 static bool Near(double value, double expected, double tolerance) { return std::abs(value - expected) <= tolerance * std::abs(expected); }
+
+static void CheckAsin() {
+    const double pi = 3.14159265358979323846;
+    const double pi_2 = pi / 2;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+
+    Require(asin_nid_postfix(0.) == 0.);
+    Require(std::signbit(asin_nid_postfix(-0.)));
+    Require(Near(asin_nid_postfix(1.), pi_2, 1e-15));
+    Require(Near(asin_nid_postfix(-1.), -pi_2, 1e-15));
+    Require(std::isnan(asin_nid_postfix(2.0)) && std::signbit(asin_nid_postfix(2.0)));
+    Require(std::isnan(asin_nid_postfix(-2.0)) && std::signbit(asin_nid_postfix(-2.0)));
+    Require(std::isnan(asin_nid_postfix(infinity)) && std::signbit(asin_nid_postfix(infinity)));
+    Require(std::isnan(asin_nid_postfix(-infinity)) && std::signbit(asin_nid_postfix(-infinity)));
+    Require(std::isnan(asin_nid_postfix(nan)));
+    Require(Near(asin_nid_postfix(0.5), pi/6, 1e-15));
+    Require(Near(asin_nid_postfix(-0.5), -pi/6, 1e-15));
+    Require(Near(asin_nid_postfix(1./std::sqrt(2)), pi/4, 1e-15));
+    Require(asin_nid_postfix(1e-300) == 1e-300);
+    Require(asin_nid_postfix(-1e-300) == -1e-300);
+    std::feclearexcept(FE_ALL_EXCEPT);
+    errno = 0;
+    asin_nid_postfix(2.0);
+    Require(std::fetestexcept(FE_INVALID));
+    Require(errno == 0);
+    std::feclearexcept(FE_ALL_EXCEPT);
+    asin_nid_postfix(nan);
+    Require(!std::fetestexcept(FE_INVALID));
+}
 
 static void CheckHyperbolic() {
     const double infinity = std::numeric_limits<double>::infinity();
@@ -478,7 +516,9 @@ int main() {
     Require(__isnormalf_nid_postfix(std::numeric_limits<float>::denorm_min()) == 0);
     Require(__isnormal_nid_postfix(1.) == 1 && __isnormal_nid_postfix(0.) == 0);
     Require(__isnormal_nid_postfix(std::numeric_limits<double>::denorm_min()) == 0);
+    CheckAsin();
     const auto quotient = div_nid_postfix(7, 2);
+    CheckAsinfErrno();
     Require(quotient.quot == 3 && quotient.rem == 1);
     const auto negativeNumerator = div_nid_postfix(-7, 2);
     Require(negativeNumerator.quot == -3 && negativeNumerator.rem == -1);
@@ -491,6 +531,21 @@ int main() {
     Require(abs_nid_postfix(-42) == 42);
     Require(abs_nid_postfix(std::numeric_limits<int>::max()) == std::numeric_limits<int>::max());
     Require(abs_nid_postfix(std::numeric_limits<int>::min()) == std::numeric_limits<int>::min());
+    Require(__powisf2_nid_postfix(2.0f, 10) == 1024.0f);
+    Require(__powisf2_nid_postfix(2.0f, -10) == 0.0009765625f);
+    Require(__powisf2_nid_postfix(-2.0f, 3) == -8.0f);
+    Require(__powisf2_nid_postfix(-2.0f, -3) == -0.125f);
+    Require(__powisf2_nid_postfix(-2.0f, 4) == 16.0f);
+    Require(__powisf2_nid_postfix(0.0f, 0) == 1.0f);
+    Require(__powisf2_nid_postfix(std::numeric_limits<float>::quiet_NaN(), 0) == 1.0f);
+    Require(std::isnan(__powisf2_nid_postfix(std::numeric_limits<float>::quiet_NaN(), 1)));
+    Require(__powisf2_nid_postfix(-1.0f, std::numeric_limits<int>::min()) == 1.0f);
+    Require(__powisf2_nid_postfix(-1.0f, std::numeric_limits<int>::max()) == -1.0f);
+    Require(__powisf2_nid_postfix(2.0f, std::numeric_limits<int>::min()) == 0.0f);
+    Require(std::isinf(__powisf2_nid_postfix(0.0f, -1)));
+    Require(std::signbit(__powisf2_nid_postfix(-0.0f, 3)));
+    Require(std::isinf(__powisf2_nid_postfix(-0.0f, -3)) && std::signbit(__powisf2_nid_postfix(-0.0f, -3)));
+    Require(__powisf2_nid_postfix(2.0f, -127) == 0x1p-127f);
     CheckHyperbolic();
     CheckHypotSpecialValue();
 }
