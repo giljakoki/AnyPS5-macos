@@ -148,6 +148,7 @@ bool addressSpaceCacheEnabled() {
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
 struct HostImports {
+    bool gpuFillsVisible = true;
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
@@ -525,6 +526,8 @@ void decideImportWatch(const Context& context, HostImports& state) {
     } else {
         state.unwatchImports = probe.writtenAfterSubmit != 0 || probe.writtenAfterFill != 0;
         state.importsStampPages = probe.writtenAtImport != 0;
+        state.gpuFillsVisible = probe.fillVisible;
+        if (!probe.fillVisible) std::fprintf(stderr, "[write-watch] a GPU fill of a host import is not visible to the CPU: DCC keys are stored on the CPU\n");
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
     }
     state.unwatchDmaBufImports = state.unwatchImports;
@@ -1820,6 +1823,8 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         if (!collect(probe.writtenAfterSubmit)) return "the collect after the submission";
         if (const char* step = execute(commands[1])) return step;
         if (!collect(probe.writtenAfterFill)) return "the collect after the fill";
+        probe.fillVisible = true;
+        for (std::uint64_t offset = 0; offset < bytes; offset += 4096) probe.fillVisible = probe.fillVisible && *reinterpret_cast<volatile std::uint8_t*>(base + offset) == 2;
         *reinterpret_cast<volatile std::uint8_t*>(base) = 2;
         if (!collect(probe.writtenByCpu)) return "the collect after a CPU store";
         return nullptr;
@@ -1927,6 +1932,12 @@ ImportWatch PrepareImportWatch(const Context& context) {
     std::lock_guard lock(state.mutex);
     decideImportWatch(context, state);
     return state.unwatchImports ? ImportWatch::Unwatch : ImportWatch::Watch;
+}
+
+bool HostImportGpuFillsVisible() {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.gpuFillsVisible;
 }
 
 namespace {

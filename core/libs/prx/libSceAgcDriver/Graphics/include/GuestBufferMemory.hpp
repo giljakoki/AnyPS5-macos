@@ -46,9 +46,11 @@ struct ImportProbe {
     std::uint32_t writtenAfterSubmit = 0;
     std::uint32_t writtenByCpu = 0;
     std::uint32_t writtenAfterFill = 0;
+    bool fillVisible = false;
 };
 
 ImportProbe ProbeImportWriteProtection(const Context& context);
+bool HostImportGpuFillsVisible();
 ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);

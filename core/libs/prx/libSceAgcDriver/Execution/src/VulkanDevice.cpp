@@ -47,6 +47,7 @@
 #include <SDL_error.h>
 #include <spirv/unified1/spirv.hpp>
 #include <array>
+#include <set>
 #include <optional>
 #include <algorithm>
 #include <cstring>
@@ -2442,15 +2443,36 @@ bool ResidentServesDisplay(const Graphics::StorageTexture& resident, const Displ
         throw std::runtime_error(message);
     }
     if (Graphics::IsDccClear(resident.FilledKeys()) && resident.FilledKeys() == keys) return false;
-    return Graphics::KeysServeSurface(resident.Descriptor().dccAddress, resident.UploadedKeys(), resident.FilledKeys(), buffer.dccAddress, [&] { return ResidentKeys(resident); }, [&] { return keys; });
+    const auto surfaceDcc = resident.Descriptor().dccAddress;
+    if (surfaceDcc != 0 && surfaceDcc != buffer.dccAddress && resident.UploadedKeys() == Graphics::DccKeys::Uncompressed && resident.FilledKeys() == Graphics::DccKeys::Uncompressed && ResidentKeys(resident) == Graphics::DccKeys::Uncompressed) return true;
+    return Graphics::KeysServeSurface(surfaceDcc, resident.UploadedKeys(), resident.FilledKeys(), buffer.dccAddress, [&] { return ResidentKeys(resident); }, [&] { return keys; });
 }
 
 bool ResidentKeysMoved(const Graphics::StorageTexture& resident) {
     return resident.Descriptor().dccAddress != 0 && ResidentKeys(resident) != resident.UploadedKeys();
 }
 
+std::uint64_t SurfaceKeysOfDisplay(const DisplayBuffer& buffer, std::size_t bytes) {
+    const auto live = Graphics::StorageTexture::FindLive(buffer.address, bytes);
+    if (live == nullptr) return 0;
+    const auto surfaceDcc = live->Descriptor().dccAddress;
+    if (surfaceDcc == 0 || surfaceDcc == buffer.dccAddress) return 0;
+    static std::mutex mutex;
+    static std::set<std::uint64_t> reported;
+    const std::lock_guard lock(mutex);
+    if (reported.insert(buffer.address).second) std::fprintf(stderr, "[videoout] display buffer 0x%llx registered DCC metadata 0x%llx, its surface keeps keys at 0x%llx: presenting with the surface's keys\n", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(buffer.dccAddress), static_cast<unsigned long long>(surfaceDcc));
+    return surfaceDcc;
+}
+
 std::optional<std::array<std::byte, 4>> CompressedClearPixel(const DisplayBuffer& buffer, std::size_t bytes) {
     GuestMemory::FlushGpuWrites(buffer.address, bytes);
+    if (const auto surfaceDcc = SurfaceKeysOfDisplay(buffer, bytes); surfaceDcc != 0) {
+        auto surface = buffer;
+        surface.dccAddress = surfaceDcc;
+        const auto surfaceKeys = DisplayBufferKeys(surface);
+        if (surfaceKeys == Graphics::DccKeys::Uncompressed) return std::nullopt;
+        return DisplayBufferClearPixel(buffer, surfaceKeys);
+    }
     const auto keys = DisplayBufferKeys(buffer);
     if (keys == Graphics::DccKeys::Uncompressed) return std::nullopt;
     return DisplayBufferClearPixel(buffer, keys);

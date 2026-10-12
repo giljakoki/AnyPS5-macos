@@ -221,7 +221,7 @@ void TraceKeyStore(const char* path, std::uint64_t begin, std::size_t count) {
 // stored this way (memory the GPU has no view of): the caller stores them on the CPU.
 bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uint64_t begin, std::size_t count) {
     const auto* import = HostImportFor(context, begin, count);
-    if (import == nullptr) return false;
+    if (import == nullptr || !HostImportGpuFillsVisible()) return false;
     const VkDeviceSize first = begin - import->base;
     const VkDeviceSize last = first + count;
     const VkDeviceSize fillBegin = std::min((first + 3) & ~VkDeviceSize{3}, last);
