@@ -20,8 +20,9 @@ namespace {
 constexpr unsigned MspaceThreadUnsafe = 1;
 constexpr unsigned MspaceQuietStats = 4;
 constexpr unsigned MspaceKnownFlags = MspaceThreadUnsafe | MspaceQuietStats;
-constexpr std::uintptr_t Granule = 16;
-constexpr std::uintptr_t MinimumAlignment = 32;
+constexpr std::uintptr_t Granule = 32;
+constexpr std::uintptr_t MinimumAlignment = Granule;
+constexpr std::uintptr_t BaseAlignment = 16;
 constexpr std::uintptr_t ArenaHeaderBytes = 64;
 
 struct Chunk {
@@ -96,7 +97,12 @@ void* Allocate(Arena* arena, std::size_t size, std::size_t alignment) {
         Error(12);
         return nullptr;
     }
-    for (auto candidate = arena->free.lower_bound({needed, 0}); candidate != arena->free.end(); ++candidate) {
+    const auto slack = alignment > MinimumAlignment ? alignment - MinimumAlignment : 0;
+    if (needed > std::numeric_limits<std::uintptr_t>::max() - slack) {
+        Error(12);
+        return nullptr;
+    }
+    for (auto candidate = arena->free.lower_bound({needed + slack, 0}); candidate != arena->free.end(); ++candidate) {
         const auto start = candidate->second;
         const auto chunk = arena->chunks.find(start);
         const auto end = chunk->second.end;
@@ -185,7 +191,7 @@ void* APS5_VABI sceLibcMspaceCreate_nid_postfix(const char* name, void* base,
                                               std::size_t size, unsigned flags) {
     (void)name;
     const auto start = reinterpret_cast<std::uintptr_t>(base);
-    if (!base || (start & (Granule - 1)) || size < ArenaHeaderBytes + 2 * Granule ||
+    if (!base || (start & (BaseAlignment - 1)) || size < ArenaHeaderBytes + 2 * Granule ||
         size > std::numeric_limits<std::uintptr_t>::max() - start || (flags & ~MspaceKnownFlags) != 0) {
         Error(22);
         return nullptr;
@@ -200,8 +206,8 @@ void* APS5_VABI sceLibcMspaceCreate_nid_postfix(const char* name, void* base,
     auto arena = std::make_unique<Arena>();
     arena->base = start;
     arena->end = start + size;
-    const auto first = start + ArenaHeaderBytes;
-    const auto last = start + (size & ~(Granule - 1));
+    const auto first = AlignUp(start + ArenaHeaderBytes, Granule);
+    const auto last = (start + size) & ~(Granule - 1);
     AddFree(*arena, first, last);
     if (Tracing()) std::fprintf(stderr, "[mspace] create %s: 0x%llx+0x%zx flags 0x%x (caller %p)\n", name ? name : "", static_cast<unsigned long long>(start), size, flags, __builtin_return_address(0));
     arenas.emplace(start, std::move(arena));
@@ -312,7 +318,7 @@ void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void* handle, void* pointe
         Error(22);
         return nullptr;
     }
-    const auto effective = std::max<std::size_t>(alignment, 16);
+    const auto effective = std::max<std::size_t>(alignment, MinimumAlignment);
     std::lock_guard lock(arenaMutex);
     auto* arena = Find(handle);
     if (!pointer) return Allocate(arena, size, effective);

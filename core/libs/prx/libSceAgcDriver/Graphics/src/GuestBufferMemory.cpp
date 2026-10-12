@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -637,11 +638,12 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
+    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default three quarters of the
+    // device-local heap, at least 6 GiB: a title's whole GPU arena must fit, or every use of it
+    // copies gigabytes and its render targets are written back each frame).
+    static const std::uint64_t budget = [&] {
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+        return value ? std::strtoull(value, nullptr, 10) << 20u : HostImportBudget(context.memory);
     }();
     const auto live = state.liveBytes;
     if (live + bytes > budget) {

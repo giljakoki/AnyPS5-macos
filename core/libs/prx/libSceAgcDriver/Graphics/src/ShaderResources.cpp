@@ -905,6 +905,11 @@ std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory)
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
 }
 
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory) {
+    const auto heap = largestDeviceLocalHeap(memory);
+    return std::max<std::uint64_t>(6144ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u * 3u : 0u);
+}
+
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes) {
     const auto heap = largestDeviceLocalHeap(memory);
     if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);

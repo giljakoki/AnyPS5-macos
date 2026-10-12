@@ -364,6 +364,7 @@ if(BUILD_TESTING)
     target_link_libraries(mspace_tests PRIVATE libc)
     configure_windows_unwind(mspace_tests)
     add_test(NAME mspace COMMAND mspace_tests)
+    set_tests_properties(mspace PROPERTIES TIMEOUT 120)
     if(WIN32)
         set_tests_properties(mspace PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
