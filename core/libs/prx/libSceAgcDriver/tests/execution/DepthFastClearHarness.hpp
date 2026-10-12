@@ -46,6 +46,12 @@ struct DrawOptions {
     VkCompareOp depthCompare = VK_COMPARE_OP_LESS;
     bool stencilTest = false;
     VkStencilOpState stencil{};
+    float minDepth = 0.0f;
+    float maxDepth = 1.0f;
+    bool depthBounds = false;
+    float minDepthBounds = 0.0f;
+    float maxDepthBounds = 1.0f;
+    float clearDepth = 1.0f;
 };
 
 inline std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
@@ -114,16 +120,19 @@ inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compil
     state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
     state.colors = {state.color};
     state.hasColorTarget = true;
-    state.depth = AgcDriver::Graphics::DepthTarget{surface.depth, surface.stencil, {Width, Height}, surface.format, 1.0f, 0, surface.htile, surface.htileStencil};
+    state.depth = AgcDriver::Graphics::DepthTarget{surface.depth, surface.stencil, {Width, Height}, surface.format, options.clearDepth, 0, surface.htile, surface.htileStencil};
     state.depthTest = options.depthTest;
     state.depthWrite = options.depthWrite;
     state.depthCompare = options.depthCompare;
+    state.depthBoundsTest = options.depthBounds;
+    state.minDepthBounds = options.minDepthBounds;
+    state.maxDepthBounds = options.maxDepthBounds;
     state.stencilTest = options.stencilTest;
     state.stencilFront = options.stencil;
     state.stencilBack = options.stencil;
     state.renderExtent = {Width, Height};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
+    state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), options.minDepth, options.maxDepth};
     state.negativeOneToOne = false;
     state.scissor = {{0, 0}, {Width, Height}};
     state.cullMode = VK_CULL_MODE_NONE;

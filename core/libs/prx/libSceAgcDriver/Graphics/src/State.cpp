@@ -787,6 +787,14 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         result.viewport.maxDepth = result.depth->clearDepth;
         result.depthBias = false;
     }
+    for (std::size_t index = 0; index < DepthRangeRegisters.size(); ++index) {
+        if (const auto word = find(cx, DepthRangeRegisters[index]); word != cx.end()) result.depthRegisters[index] = word->second;
+    }
+    if (!PixelProgramSkipped(queue)) {
+        const auto enabled = find(cx, 0x1b3);
+        const auto addressed = find(cx, 0x1b4);
+        result.posZ = enabled != cx.end() && addressed != cx.end() && (enabled->second & addressed->second & ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionZ)) != 0;
+    }
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", result.viewport.x, result.viewport.y, result.viewport.width, result.viewport.height, result.viewport.minDepth, result.viewport.maxDepth);
     result.scissor = {{0, 0}, result.renderExtent};
     intersect(result.scissor, cx, 0xc, true);

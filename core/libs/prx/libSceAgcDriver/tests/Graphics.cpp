@@ -26,11 +26,13 @@
 #include <array>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -41,6 +43,11 @@
 #include <type_traits>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 extern "C" std::terminate_handler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(std::terminate_handler handler);
 
@@ -2204,6 +2211,168 @@ void DepthClipTests() {
     }
 }
 
+void HostDepthTests() {
+    using AgcDriver::Graphics::HostDepthPath;
+    using AgcDriver::Graphics::ResolveHostDepth;
+    const AgcDriver::Graphics::DepthFeatures unrestricted{.unrestricted = true, .depthClamp = true, .clipDistance = true, .depthBounds = true, .invertedBounds = true};
+    const AgcDriver::Graphics::DepthFeatures restricted{.unrestricted = false, .depthClamp = true, .clipDistance = true, .depthBounds = true, .invertedBounds = true};
+    const AgcDriver::Graphics::DepthTarget target{0x10000, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    struct Row {
+        const char* name;
+        float minDepth;
+        float maxDepth;
+        bool depth;
+        bool test;
+        bool write;
+        VkCompareOp compare;
+        bool bounds;
+        bool posZ;
+        std::optional<HostDepthPath> path;
+        float hostMin;
+        float hostMax;
+    };
+    const std::array rows{
+        Row{"[0, 1] with a depth test", 0.0f, 1.0f, true, true, true, VK_COMPARE_OP_LESS, false, false, HostDepthPath::Native, 0.0f, 1.0f},
+        Row{"reversed [1, 0] with a depth test", 1.0f, 0.0f, true, true, true, VK_COMPARE_OP_GREATER, true, true, HostDepthPath::Native, 1.0f, 0.0f},
+        Row{"[0.25, 0.25] read through POS_Z", 0.25f, 0.25f, false, false, false, VK_COMPARE_OP_ALWAYS, false, true, HostDepthPath::Native, 0.25f, 0.25f},
+        Row{"[-1, 1] without a depth target", -1.0f, 1.0f, false, false, false, VK_COMPARE_OP_ALWAYS, false, false, HostDepthPath::Unobserved, 0.0f, 1.0f},
+        Row{"[-1, 1] with the depth test off", -1.0f, 1.0f, true, false, false, VK_COMPARE_OP_LESS, false, false, HostDepthPath::Unobserved, 0.0f, 1.0f},
+        Row{"reversed [1, -1] comparing ALWAYS without writes", 1.0f, -1.0f, true, true, false, VK_COMPARE_OP_ALWAYS, false, false, HostDepthPath::Unobserved, 0.0f, 1.0f},
+        Row{"[-1, 1] comparing NEVER without writes", -1.0f, 1.0f, true, true, false, VK_COMPARE_OP_NEVER, false, false, HostDepthPath::Unobserved, 0.0f, 1.0f},
+        Row{"[-1, 1] comparing LESS", -1.0f, 1.0f, true, true, false, VK_COMPARE_OP_LESS, false, false, std::nullopt, 0.0f, 0.0f},
+        Row{"[-1, 1] writing depth through ALWAYS", -1.0f, 1.0f, true, true, true, VK_COMPARE_OP_ALWAYS, false, false, std::nullopt, 0.0f, 0.0f},
+        Row{"[-1, 1] with a depth bounds test and the depth test off", -1.0f, 1.0f, true, false, false, VK_COMPARE_OP_ALWAYS, true, false, HostDepthPath::Unobserved, 0.0f, 1.0f},
+        Row{"[-1, 1] with a depth bounds test comparing LESS", -1.0f, 1.0f, true, true, false, VK_COMPARE_OP_LESS, true, false, std::nullopt, 0.0f, 0.0f},
+        Row{"[-1, 1] read through POS_Z without a depth target", -1.0f, 1.0f, false, false, false, VK_COMPARE_OP_ALWAYS, false, true, std::nullopt, 0.0f, 0.0f},
+        Row{"[0, 2] read through POS_Z with the depth test off", 0.0f, 2.0f, true, false, false, VK_COMPARE_OP_ALWAYS, false, true, std::nullopt, 0.0f, 0.0f},
+        Row{"a depth clear to 2", 2.0f, 2.0f, true, true, true, VK_COMPARE_OP_ALWAYS, false, false, std::nullopt, 0.0f, 0.0f},
+    };
+    for (const auto& row : rows) {
+        AgcDriver::Graphics::State state{};
+        state.viewport = {0.0f, 0.0f, 64.0f, 64.0f, row.minDepth, row.maxDepth};
+        if (row.depth) state.depth = target;
+        state.depthTest = row.test;
+        state.depthWrite = row.write;
+        state.depthCompare = row.compare;
+        state.depthBoundsTest = row.bounds;
+        state.posZ = row.posZ;
+        const auto native = ResolveHostDepth(unrestricted, state);
+        Require(native.path == HostDepthPath::Native && native.minDepth == row.minDepth && native.maxDepth == row.maxDepth && native.minDepthBounds == 0.0f && native.maxDepthBounds == 1.0f, std::string(row.name) + ": the host depth changed with VK_EXT_depth_range_unrestricted");
+        if (!row.path) {
+            expectFailure([&] { ResolveHostDepth(restricted, state); }, "viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted, which the device lacks, and the draw observes depth");
+            continue;
+        }
+        const auto host = ResolveHostDepth(restricted, state);
+        Require(host.path == *row.path && host.minDepth == row.hostMin && host.maxDepth == row.hostMax && host.minDepthBounds == 0.0f && host.maxDepthBounds == 1.0f, std::string(row.name) + ": wrong host depth without VK_EXT_depth_range_unrestricted");
+    }
+
+    struct BoundsRow {
+        float low;
+        float high;
+        float hostLow;
+        float hostHigh;
+    };
+    AgcDriver::Graphics::State bounded{};
+    bounded.viewport = {0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f};
+    bounded.depth = target;
+    bounded.depthTest = true;
+    bounded.depthCompare = VK_COMPARE_OP_LESS;
+    bounded.depthBoundsTest = true;
+    for (const auto& row : {BoundsRow{0.25f, 0.75f, 0.25f, 0.75f}, BoundsRow{-0.5f, 0.5f, 0.0f, 0.5f}, BoundsRow{0.5f, 2.0f, 0.5f, 1.0f}, BoundsRow{-1.0f, 2.0f, 0.0f, 1.0f}, BoundsRow{1.0f, 1.0f, 1.0f, 1.0f}, BoundsRow{0.0f, 0.0f, 0.0f, 0.0f}, BoundsRow{-1.0f, 0.0f, 0.0f, 0.0f}, BoundsRow{1.0f, 1.5f, 1.0f, 1.0f}, BoundsRow{1.5f, 2.0f, 1.0f, 0.0f}, BoundsRow{-1.0f, -0.5f, 1.0f, 0.0f}, BoundsRow{0.75f, 0.25f, 1.0f, 0.0f}}) {
+        bounded.minDepthBounds = row.low;
+        bounded.maxDepthBounds = row.high;
+        const auto native = ResolveHostDepth(unrestricted, bounded);
+        Require(native.path == HostDepthPath::Native && native.minDepthBounds == row.low && native.maxDepthBounds == row.high, "depth bounds changed with VK_EXT_depth_range_unrestricted: " + std::to_string(row.low) + ", " + std::to_string(row.high));
+        const auto host = ResolveHostDepth(restricted, bounded);
+        Require(host.path == HostDepthPath::Native && host.minDepth == 0.0f && host.maxDepth == 1.0f && host.minDepthBounds == row.hostLow && host.maxDepthBounds == row.hostHigh, "wrong host depth bounds for " + std::to_string(row.low) + ", " + std::to_string(row.high));
+        const auto never = row.hostLow > row.hostHigh;
+        auto noInverted = restricted;
+        noInverted.invertedBounds = false;
+        if (never) {
+            expectFailure([&] { ResolveHostDepth(noInverted, bounded); }, "depth bounds that never pass need min > max bounds without VK_EXT_depth_range_unrestricted, which the device is not known to accept");
+        } else {
+            const auto plain = ResolveHostDepth(noInverted, bounded);
+            Require(plain.minDepthBounds == row.hostLow && plain.maxDepthBounds == row.hostHigh, "the depth bounds mapping depended on min > max support");
+        }
+    }
+    bounded.minDepthBounds = 0.25f;
+    bounded.maxDepthBounds = 0.75f;
+    auto noBounds = restricted;
+    noBounds.depthBounds = false;
+    expectFailure([&] { ResolveHostDepth(noBounds, bounded); }, "AGC graphics: device does not support the depth bounds test: PA_CL_CLIP_CNTL[0x204]=absent");
+    auto noBoundsUnrestricted = unrestricted;
+    noBoundsUnrestricted.depthBounds = false;
+    const auto leftToPipeline = ResolveHostDepth(noBoundsUnrestricted, bounded);
+    Require(leftToPipeline.minDepthBounds == 0.25f && leftToPipeline.maxDepthBounds == 0.75f, "the depth bounds changed with VK_EXT_depth_range_unrestricted on a device without the depth bounds test");
+    bounded.depthBoundsTest = false;
+    Require(ResolveHostDepth(noBounds, bounded).path == HostDepthPath::Native, "a draw without a depth bounds test needed the depth bounds feature");
+    bounded.depthBoundsTest = true;
+    bounded.maxDepthBounds = std::numeric_limits<float>::quiet_NaN();
+    expectFailure([&] { ResolveHostDepth(restricted, bounded); }, "non-finite depth bounds");
+    bounded.depth.reset();
+    bounded.minDepthBounds = 1.5f;
+    bounded.maxDepthBounds = 2.0f;
+    const auto unbound = ResolveHostDepth(restricted, bounded);
+    Require(unbound.minDepthBounds == 1.5f && unbound.maxDepthBounds == 2.0f, "depth bounds without a depth target were mapped");
+    bounded.viewport.minDepth = std::numeric_limits<float>::infinity();
+    expectFailure([&] { ResolveHostDepth(unrestricted, bounded); }, "non-finite viewport depth range");
+
+    auto queue = makeState();
+    queue.context[0x204] = 0;
+    queue.context[0x113] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x114] = 0;
+    queue.context[0x003] = 0x00010000u;
+    queue.context[0x1b3] = 0x402;
+    queue.context[0x1b4] = 0x402;
+    const auto observed = AgcDriver::Graphics::DecodeState(queue);
+    Require(observed.posZ && observed.viewport.minDepth == -1.0f && observed.viewport.maxDepth == 1.0f, "POS_Z or the [-1, 1] depth range was not decoded");
+    Require(observed.depthRegisters[0] == 0u && observed.depthRegisters[1] == 0x3f800000u && observed.depthRegisters[2] == 0u && observed.depthRegisters[3] == 0u && observed.depthRegisters[4] == 0x3f800000u && observed.depthRegisters[5] == 0x00010000u && !observed.depthRegisters[6] && !observed.depthRegisters[7], "the raw depth range registers were not kept");
+    const std::string expected = "AGC graphics: viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted, which the device lacks, and the draw observes depth (remapping it is not implemented): "
+        "PA_CL_CLIP_CNTL[0x204]=0x00000000 PA_CL_VPORT_ZSCALE[0x113]=0x3f800000 (1) PA_CL_VPORT_ZOFFSET[0x114]=0x00000000 (0) PA_SC_VPORT_ZMIN_0[0x0b4]=0x00000000 (0) PA_SC_VPORT_ZMAX_0[0x0b5]=0x3f800000 (1) "
+        "DB_RENDER_OVERRIDE[0x003]=0x00010000 DB_RENDER_CONTROL[0x000]=absent DB_DEPTH_CLEAR[0x00b]=absent; viewport depth [-1, 1] negativeOneToOne=1 depthClamp=0; "
+        "depth target=none test=0 write=0 compare=ALWAYS bounds=0 [0, 1]; posZ=1 rectList=0 mesh=0 tessellation=0; device depthRangeUnrestricted=0 depthClamp=1 clipDistance=1 depthBounds=1 invertedDepthBounds=1";
+    try {
+        ResolveHostDepth(restricted, observed);
+        throw std::runtime_error("a POS_Z read of a [-1, 1] depth range resolved without VK_EXT_depth_range_unrestricted");
+    } catch (const std::runtime_error& error) {
+        Require(error.what() == expected, std::string("unexpected depth range diagnostic: ") + error.what());
+    }
+    Require(ResolveHostDepth(unrestricted, observed).path == HostDepthPath::Native, "a POS_Z read of a [-1, 1] depth range needed more than VK_EXT_depth_range_unrestricted");
+    queue.context[0x1b4] = 0x002;
+    const auto unread = AgcDriver::Graphics::DecodeState(queue);
+    Require(!unread.posZ && ResolveHostDepth(restricted, unread).path == HostDepthPath::Unobserved, "POS_Z enabled but not addressed made depth observable");
+    queue.context[0x1b4] = 0x402;
+    queue.shader[0x008] = 0;
+    Require(!AgcDriver::Graphics::DecodeState(queue).posZ, "a skipped pixel program read POS_Z");
+
+    auto depthState = observed;
+    depthState.posZ = false;
+    depthState.depth = AgcDriver::Graphics::DepthTarget{0x10000, 0, {64, 64}, VK_FORMAT_D16_UNORM_S8_UINT, 1.0f, 0};
+    depthState.depthTest = true;
+    depthState.depthWrite = true;
+    depthState.depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
+    depthState.depthBoundsTest = true;
+    depthState.minDepthBounds = 0.25f;
+    depthState.maxDepthBounds = 2.0f;
+    depthState.rectList = true;
+    depthState.stages.tessellation = ShaderRecompiler::TessellationConfiguration{};
+    const auto diagnostic = AgcDriver::Graphics::DepthDiagnostic(restricted, depthState);
+    Require(diagnostic.find("; depth target=D16_UNORM_S8_UINT test=1 write=1 compare=LESS_OR_EQUAL bounds=1 [0.25, 2]; posZ=0 rectList=1 mesh=0 tessellation=1;") != std::string::npos, "the depth range diagnostic lost the depth state: " + diagnostic);
+
+    AgcDriver::Graphics::Context context{};
+    auto unobserved = observed;
+    unobserved.posZ = false;
+    const auto resolved = AgcDriver::Graphics::HostDepthState(context, unobserved);
+    Require(resolved && resolved->viewport.minDepth == 0.0f && resolved->viewport.maxDepth == 1.0f && resolved->negativeOneToOne && resolved->viewport.width == unobserved.viewport.width, "an unobserved [-1, 1] depth range was not drawn as [0, 1]");
+    context.depthRangeUnrestricted = true;
+    Require(!AgcDriver::Graphics::HostDepthState(context, unobserved), "the host state was copied with VK_EXT_depth_range_unrestricted");
+    context.depthRangeUnrestricted = false;
+    AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
+    expectFailure([&] { AgcDriver::Graphics::Draw(context, observed, draw, {}); }, "viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted");
+    const AgcDriver::DrawRecipe recipe{};
+    expectFailure([&] { AgcDriver::Graphics::DrawWithRecipe(context, observed, draw, {}, {}, recipe); }, "viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted");
+}
+
 void AlphaToCoverageTests() {
     auto queue = makeState();
     queue.context[0x1b3] = 2;
@@ -3434,6 +3603,45 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     return words;
 }
 
+template<typename TAction>
+std::string capturedStderr(const TAction& action) {
+    std::fflush(stderr);
+    auto* file = std::tmpfile();
+    Require(file != nullptr, "cannot open a temporary file for stderr");
+#ifdef _WIN32
+    const auto saved = _dup(_fileno(stderr));
+    _dup2(_fileno(file), _fileno(stderr));
+#else
+    const auto saved = dup(fileno(stderr));
+    dup2(fileno(file), fileno(stderr));
+#endif
+    const auto restore = [&] {
+        std::fflush(stderr);
+#ifdef _WIN32
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+#else
+        dup2(saved, fileno(stderr));
+        close(saved);
+#endif
+    };
+    try {
+        action();
+    } catch (...) {
+        restore();
+        std::fclose(file);
+        throw;
+    }
+    restore();
+    std::rewind(file);
+    std::string text;
+    char buffer[4096];
+    for (std::size_t bytes = 0; (bytes = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, bytes);
+    std::fclose(file);
+    std::fwrite(text.data(), 1, text.size(), stderr);
+    return text;
+}
+
 void barycentricEmulationTests() {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::Graphics;
@@ -3445,7 +3653,7 @@ void barycentricEmulationTests() {
     for (std::uint32_t location = 0; location < 11u; ++location) crowded.push_back({location, location, false, true});
     expectFailure([&] { static_cast<void>(LayoutBarycentricEmulation(crowded, {true, false, false})); }, "exceed 32 locations");
 
-    const auto compile = [&](std::span<const std::uint32_t> code, bool barycentric, std::uint32_t secondInput = 0xffffffffu) {
+    const auto compile = [&](std::span<const std::uint32_t> code, bool barycentric, std::uint32_t secondInput = 0xffffffffu, std::uint64_t address = 0x30000u) {
         auto queue = makeState();
         queue.context[0x1b3] = 0x2u;
         queue.context[0x1b4] = 0x2u;
@@ -3453,7 +3661,7 @@ void barycentricEmulationTests() {
         queue.context[0x191] = 0u;
         if (secondInput != 0xffffffffu) queue.context[0x192] = secondInput;
         RecompileRequest request{};
-        request.shader = {ShaderStage::Fragment, 0x30000u, code, 0, {}};
+        request.shader = {ShaderStage::Fragment, address, code, 0, {}};
         request.context.waveSize = 64;
         request.context.pixel = DecodePixelStageInfo(queue.context, IdentityExports);
         request.target.vulkanVersion = 0x00401000u;
@@ -3507,6 +3715,31 @@ void barycentricEmulationTests() {
     static constexpr std::array<std::uint32_t, 6> sharedSlot{0xc8080000u, 0xc8090001u, 0xc80e0402u, 0xf800180fu, 0x03030202u, 0xbf810000u};
     const auto shared = compile(sharedSlot, false, 0x400u);
     Require(shared.barycentricEmulation.active && !barycentricCapability(shared), "inputs sharing a slot with different interpolation did not emulate per-vertex parameters");
+    const auto sharedVertexZero = compile(sharedSlot, false, 0x0u);
+    Require(sharedVertexZero.barycentricEmulation.active && !barycentricCapability(sharedVertexZero), "an input read only as P0 that shares a slot with an interpolated input did not emulate per-vertex parameters");
+    static constexpr std::array<std::uint32_t, 4> readsVertexZero{0xc80a0002u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    const auto vertexZero = compile(readsVertexZero, false);
+    Require(!vertexZero.barycentricEmulation.active && vertexZero.fragmentParameters.size() == 1u && vertexZero.fragmentParameters[0].flat && !vertexZero.fragmentParameters[0].perVertex, "an input read only as P0 did not become a flat input");
+    Require(!decorations(vertexZero, spv::DecorationFlat).empty() && decorations(vertexZero, spv::DecorationPerVertexKHR).empty() && !barycentricCapability(vertexZero), "an input read only as P0 was not declared Flat");
+    const auto nativeVertexZero = compile(readsVertexZero, true);
+    Require(!nativeVertexZero.barycentricEmulation.active && nativeVertexZero.fragmentParameters.size() == 1u && !nativeVertexZero.fragmentParameters[0].flat && nativeVertexZero.fragmentParameters[0].perVertex && !decorations(nativeVertexZero, spv::DecorationPerVertexKHR).empty() && barycentricCapability(nativeVertexZero), "a device with the extension stopped reading P0 per vertex");
+    static constexpr std::array<std::uint32_t, 6> interpolatesAndReadsVertexZero{0xc8080000u, 0xc8090001u, 0xc80e0102u, 0xf800180fu, 0x03020302u, 0xbf810000u};
+    Require(compile(interpolatesAndReadsVertexZero, false).barycentricEmulation.active, "an input read as P0 and through v_interp_p1/p2 lost exact barycentrics");
+    static constexpr std::array<std::uint32_t, 7> copiesIj{0x7e0c0300u, 0x7e0e0301u, 0xc8080006u, 0xc8090007u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    static constexpr std::array<std::uint32_t, 10> copiesIjInWholeQuads{0xbe80047eu, 0xbefe0a7eu, 0x7e0c0300u, 0x7e0e0301u, 0xc8080006u, 0xc8090007u, 0x87fe007eu, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    for (const auto& code : {std::span<const std::uint32_t>(copiesIj), std::span<const std::uint32_t>(copiesIjInWholeQuads)}) {
+        const auto copied = compile(code, false);
+        Require(!copied.barycentricEmulation.active && !barycentricCapability(copied), "I/J copied under the EXEC of v_interp_p2_f32 lost host interpolation");
+    }
+    static constexpr std::array<std::uint32_t, 8> copiesIUnderOtherExec{0x7e0c0300u, 0xbefe0481u, 0xc8080006u, 0xc8090001u, 0xbefe04c1u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    Require(compile(copiesIUnderOtherExec, false).barycentricEmulation.active, "I copied under another EXEC than its v_interp_p2_f32 lost exact barycentrics");
+    const auto logged = capturedStderr([&] {
+        for (int repeat = 0; repeat < 2; ++repeat) static_cast<void>(compile(readsVertex, false, 0xffffffffu, 0x7b30000u));
+    });
+    const std::string emulationLine = "[recompile] pixel shader 0x7b30000 emulates barycentrics: v_interp_mov_f32 p10 attr0.x (block pc 0x0..";
+    const auto reported = logged.find(emulationLine);
+    Require(reported != std::string::npos && logged.find(emulationLine, reported + 1) == std::string::npos, "the recompiler did not report a P10 read once as the reason for emulating barycentrics");
+    Require(logged.find("reads a difference of two vertex values of input 0, which host interpolation does not provide (SPI_PS_INPUT_CNTL_0=0x0)\n", reported) != std::string::npos, "the reason for emulating barycentrics did not name the P10 read of input 0");
     fragment = compile(readsVertex, false);
     Require(fragment.barycentricEmulation.active && !fragment.barycentricEmulation.smooth && fragment.fragmentParameters.size() == 1u && fragment.fragmentParameters[0].perVertex, "v_interp_mov of P10 did not emulate per-vertex parameters");
     Require(decorations(fragment, spv::DecorationLocation) == std::vector<std::uint32_t>{0u} && decorations(fragment, spv::DecorationPerVertexKHR).empty() && !decorations(fragment, spv::DecorationFlat).empty() && !barycentricCapability(fragment), "the emulated per-vertex parameter was not a flat array at the first free location");
@@ -4961,13 +5194,25 @@ int main(int argc, char** argv) {
             draw.flags = 1;
             expectFailure([&] { AgcDriver::Graphics::Draw(context, state, draw, {}); }, "draw modifiers");
             auto bounded = state;
+            bounded.depth = AgcDriver::Graphics::DepthTarget{0x10000, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
             bounded.depthBoundsTest = true;
             bounded.minDepthBounds = 0.25f;
-            AgcDriver::Graphics::ValidateDepthBounds(context, bounded);
+            expectFailure([&] { AgcDriver::Graphics::HostDepthState(context, bounded); }, "device does not support the depth bounds test");
+            auto boundsContext = context;
+            boundsContext.depthBounds = true;
+            AgcDriver::Graphics::ValidateDepthBounds(boundsContext, bounded);
+            Require(!AgcDriver::Graphics::HostDepthState(boundsContext, bounded), "depth bounds inside [0, 1] were changed");
             bounded.minDepthBounds = 1.5f;
-            expectFailure([&] { AgcDriver::Graphics::ValidateDepthBounds(context, bounded); }, "depth bounds outside [0, 1]");
+            expectFailure([&] { AgcDriver::Graphics::ValidateDepthBounds(boundsContext, bounded); }, "depth bounds outside [0, 1]");
+            expectFailure([&] { AgcDriver::Graphics::HostDepthState(boundsContext, bounded); }, "depth bounds that never pass");
+            auto inverted = boundsContext;
+            inverted.invertedDepthBounds = true;
+            const auto never = AgcDriver::Graphics::HostDepthState(inverted, bounded);
+            Require(never && never->minDepthBounds == 1.0f && never->maxDepthBounds == 0.0f, "depth bounds above 1 did not become an empty range");
+            AgcDriver::Graphics::ValidateDepthBounds(inverted, *never);
             auto unrestricted = context;
             unrestricted.depthRangeUnrestricted = true;
+            Require(!AgcDriver::Graphics::HostDepthState(unrestricted, bounded), "depth bounds were changed with VK_EXT_depth_range_unrestricted");
             AgcDriver::Graphics::ValidateDepthBounds(unrestricted, bounded);
         }
         RunGuestLeaseWaitTests();
@@ -4977,6 +5222,7 @@ int main(int argc, char** argv) {
         hardwareScreenOffsetTests();
         srgb8TargetTests();
         DepthClipTests();
+        HostDepthTests();
         DepthStencilTests();
         OneDimensionalColorTests();
         htileDepthClearTests();
