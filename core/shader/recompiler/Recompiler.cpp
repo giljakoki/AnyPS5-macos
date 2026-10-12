@@ -39,6 +39,7 @@
 #include "Optimization/include/Optimization/SrtWalker.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "Optimization/include/Optimization/TessellationLowering.hpp"
+#include "Optimization/include/Optimization/LaneLocalLowering.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -161,6 +162,60 @@ std::shared_ptr<const PreparedControlFlow> ShaderPreparationContext::AcquireFron
     return prepared;
 }
 
+// Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.
+void DumpIr(const RecompileRequest& request, const IrProgram& program, const char* pass) {
+    static const std::string list = [] { const char* text = std::getenv("APS5_DUMP_IR"); return text ? std::string(text) : std::string(); }();
+    if (list.empty()) return;
+    char address[32];
+    std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
+    if (list != "all" && list.find(address) == std::string::npos) return;
+    std::fprintf(stderr, "==== IR 0x%s after %s\n%s\n", address, pass, ProgramToString(program).c_str());
+}
+
+std::string StageWord(ShaderStage stage) {
+    switch (stage) {
+        case ShaderStage::Vertex: return "vertex";
+        case ShaderStage::Local: return "local (tessellation LS)";
+        case ShaderStage::TessellationEvaluation: return "tessellation evaluation";
+        case ShaderStage::TessellationControl: return "tessellation control";
+        case ShaderStage::Geometry: return "geometry";
+        case ShaderStage::Fragment: return "pixel";
+        case ShaderStage::Compute: return "compute";
+        case ShaderStage::Mesh: return "mesh";
+    }
+    return "unknown";
+}
+
+bool LaneLocalStage(ShaderStage stage) {
+    return stage == ShaderStage::Vertex || stage == ShaderStage::Local || stage == ShaderStage::TessellationEvaluation;
+}
+
+std::string HexAddress(std::uint64_t value) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+void LowerLaneLocal(const RecompileRequest& request, const ShaderStageInputInfo& inputInfo, IrProgram& program) {
+    const auto stage = request.shader.stage;
+    if (!LaneLocalStage(stage) || StageHasSubgroups(request.target, stage)) return;
+    if (inputInfo.vertex == nullptr) throw std::runtime_error("vertex input metadata is missing");
+    const std::uint32_t lanes = request.context.waveSize == 64u && inputInfo.vertex->hostSubgroupSize == 32u ? 32u : request.context.waveSize;
+    constexpr LaneLocalLowering laneLocalLowering;
+    const auto remaining = laneLocalLowering.Lower(program, lanes);
+    DumpIr(request, program, "lanes");
+    if (remaining.empty()) return;
+    const auto code = request.shader.codeAddress;
+    std::string message = StageWord(stage) + " program " + HexAddress(code) + " (wave" + std::to_string(request.context.waveSize) + ", s3 counts " + std::to_string(lanes) + ") needs subgroup operations, which the device does not support in " + StageWord(stage) + " shaders (subgroup stages " + HexAddress(request.target.subgroupStages) + "); exact lowering left:";
+    constexpr std::size_t shown = 12;
+    for (std::size_t index = 0; index < remaining.size() && index < shown; ++index) {
+        const auto& use = remaining[index];
+        message += (index == 0 ? " " : "; ") + use.description + " at " + HexAddress(code + use.startPc) + "-" + HexAddress(code + use.endPc);
+    }
+    if (remaining.size() > shown) message += "; and " + std::to_string(remaining.size() - shown) + " more";
+    throw std::runtime_error(message);
+}
+
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     return PrepareResourceProgram(request, nullptr);
 }
@@ -195,15 +250,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         translateOptions.embeddedFetch = &embeddedFetch;
     }
     auto program = translator.Translate(decoded, cfg, translateOptions);
-    // Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.
-    const auto dumpIr = [&](const char* pass) {
-        static const std::string list = [] { const char* text = std::getenv("APS5_DUMP_IR"); return text ? std::string(text) : std::string(); }();
-        if (list.empty()) return;
-        char address[32];
-        std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
-        if (list != "all" && list.find(address) == std::string::npos) return;
-        std::fprintf(stderr, "==== IR 0x%s after %s\n%s\n", address, pass, ProgramToString(program).c_str());
-    };
+    const auto dumpIr = [&](const char* pass) { DumpIr(request, program, pass); };
 
     constexpr SsaBuilder ssaBuilder;
     constexpr ConstantFolder constantFolder;
@@ -405,6 +452,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     deadCodeEliminator.RemoveIdentities(program);
     deadCodeEliminator.Eliminate(program);
 
+    LowerLaneLocal(request, inputInfo, program);
+
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
 
@@ -421,6 +470,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
+    targetOptions.stageSubgroups = StageHasSubgroups(request.target, request.shader.stage);
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

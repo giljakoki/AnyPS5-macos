@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_SPIRVBACKEND_INCLUDE_SPIRVBACKEND_SPIRVANALYSIS_HPP
 
 #include "IntermediateRepresentation/IrProgram.hpp"
+#include "Optimization/WaveUniformity.hpp"
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -36,8 +37,6 @@ struct SpirvRequirements {
 inline constexpr std::uint32_t FunctionLdsDwordLimit = 8192u;
 [[nodiscard]] std::uint32_t FunctionLdsDwords(const IrProgram& program);
 [[nodiscard]] std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program);
-[[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
-[[nodiscard]] bool IsWaveMaskBranch(BranchCondition condition);
 
 }
 

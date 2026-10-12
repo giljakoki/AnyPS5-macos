@@ -229,7 +229,26 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    std::uint32_t subgroupStages = 0xffffffffu;
 };
+
+constexpr std::uint32_t SubgroupStageBit(ShaderStage stage) {
+    switch (stage) {
+        case ShaderStage::Vertex:
+        case ShaderStage::Local: return 0x1u;
+        case ShaderStage::TessellationControl: return 0x2u;
+        case ShaderStage::TessellationEvaluation: return 0x4u;
+        case ShaderStage::Geometry: return 0x8u;
+        case ShaderStage::Fragment: return 0x10u;
+        case ShaderStage::Compute: return 0x20u;
+        case ShaderStage::Mesh: return 0x80u;
+    }
+    return 0u;
+}
+
+constexpr bool StageHasSubgroups(const SpirvTarget& target, ShaderStage stage) {
+    return (target.subgroupStages & SubgroupStageBit(stage)) != 0u;
+}
 
 struct BindingLayout {
     std::uint32_t descriptorSet;

@@ -17,6 +17,7 @@ struct BlockInfo {
     Terminator terminator;
     IrValue* condition = nullptr;
     IrValue* indirectTarget = nullptr;
+    bool laneLocalBranch = false;
 };
 
 struct DescriptorSource {

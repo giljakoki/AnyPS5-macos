@@ -1457,6 +1457,101 @@ void verifyNarrowVertexWave() {
     require(GetPreparedArtifact(*PrepareShader(vertex(wave32, 32u, 32u, 8u))).spirv == GetPreparedArtifact(*PrepareShader(vertex(wave32, 32u, 64u, 8u))).spirv, "narrow vertex wave: s3 of a wave32 vertex program depended on the subgroup width");
 }
 
+void verifyStagesWithoutSubgroups() {
+    using namespace ShaderRecompiler;
+    static constexpr std::array<std::uint32_t, 4> capabilities{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic};
+    static constexpr std::array<std::uint32_t, 4> userData{5u, 6u, 7u, 8u};
+    constexpr std::uint32_t withoutVertex = 0x32u;
+    const auto vertex = [](std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t subgroupSize, std::uint32_t subgroupStages, bool withUserData) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Vertex, 0x60000u, code, 0, {}};
+        request.context.waveSize = waveSize;
+        request.context.userDataBaseRegister = 8u;
+        if (withUserData) request.context.userData = userData;
+        request.context.vertex = ShaderVertexStageInfo{};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = subgroupSize;
+        request.target.supportedCapabilities = capabilities;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.target.subgroupStages = subgroupStages;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const auto prepared = [&vertex](std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t subgroupSize, std::uint32_t subgroupStages, bool withUserData = false) {
+        return GetPreparedArtifact(*PrepareShader(vertex(code, waveSize, subgroupSize, subgroupStages, withUserData))).spirv;
+    };
+    const auto subgroupWords = [](const std::vector<std::uint32_t>& spirv) {
+        std::uint32_t count = 0;
+        for (std::size_t cursor = 5; cursor < spirv.size() && (spirv[cursor] >> 16u) != 0u; cursor += spirv[cursor] >> 16u) {
+            const auto opcode = spirv[cursor] & 0xffffu;
+            const auto length = spirv[cursor] >> 16u;
+            if (opcode == spv::OpCapability && length == 2u) {
+                const auto capability = spirv[cursor + 1u];
+                if (capability == spv::CapabilityGroupNonUniform || capability == spv::CapabilityGroupNonUniformBallot || capability == spv::CapabilityGroupNonUniformShuffle || capability == spv::CapabilityGroupNonUniformArithmetic) ++count;
+            }
+            if (opcode >= spv::OpGroupNonUniformElect && opcode <= spv::OpGroupNonUniformQuadSwap) ++count;
+            if (opcode == spv::OpDecorate && length == 4u && spirv[cursor + 2u] == spv::DecorationBuiltIn && spirv[cursor + 3u] == spv::BuiltInSubgroupLocalInvocationId) ++count;
+        }
+        return count;
+    };
+    const std::vector<std::uint32_t> masks{
+        0x7e0002f2u, 0x7d880a84u, 0x02020080u, 0xd70f6a03u, 0x02020b05u, 0x50080080u, 0x7d880affu, 0x00000064u,
+        0xbe803c6au, 0xbf880004u, 0x7e0402f4u, 0x06020501u, 0xf800020fu, 0x04030201u, 0x887e007eu, 0xf80008cfu,
+        0x03020100u, 0xbf810000u,
+    };
+    const std::vector<std::uint32_t> prologue{
+        0x7e020280u, 0x9380ff03u, 0x00080008u, 0xd7650000u, 0x020100c1u, 0xd7660000u, 0x020200c1u, 0x7d880000u,
+        0xbe82246au, 0xbf880003u, 0x7e0202f2u, 0xf800020fu, 0x01010101u, 0x88fe027eu, 0xf80008cfu, 0x01010101u,
+        0xbf810000u,
+    };
+    const std::vector<std::uint32_t> firstLane{0x7e000208u, 0x7e020500u, 0x7e020201u, 0xf80008cfu, 0x01010101u, 0xbf810000u};
+    const std::vector<std::uint32_t> counted{0xbe800f7eu, 0x7e000200u, 0xf80008cfu, 0x00000000u, 0xbf810000u};
+    const std::vector<std::uint32_t> scalarLeak{
+        0xbe850381u, 0x7d880affu, 0x00000064u, 0xbe803c6au, 0xbf880001u, 0xbe850387u, 0x887e007eu, 0x7e020205u,
+        0xf80008cfu, 0x01010101u, 0xbf810000u,
+    };
+    const std::vector<std::uint32_t> waterfall{
+        0xbe80037eu, 0x7e020505u, 0x7d840a01u, 0xbe823c6au, 0x7e020201u, 0x897e027eu, 0xbf89fffau, 0xbefe0300u,
+        0xf80008cfu, 0x01010101u, 0xbf810000u,
+    };
+    const std::vector<std::uint32_t> dpp{0x7e0202fau, 0xff011105u, 0xf80008cfu, 0x01010101u, 0xbf810000u};
+
+    const auto lowered = prepared(masks, 32u, 32u, withoutVertex);
+    require(!lowered.empty() && subgroupWords(lowered) == 0u, "stages without subgroups: a wave32 program with v_cmp/v_cndmask, a carry chain and an s_cbranch_execz region over masked writes and an export kept subgroup operations");
+    const auto native = prepared(masks, 32u, 32u, ~0u);
+    require(!native.empty() && subgroupWords(native) != 0u, "stages without subgroups: the same program on a device with vertex subgroups lost its subgroup operations");
+    const auto narrow = prepared(prologue, 64u, 32u, withoutVertex);
+    require(!narrow.empty() && subgroupWords(narrow) == 0u, "stages without subgroups: the NGG prologue comparing v_mbcnt with the s3 count on a 32-lane host kept subgroup operations");
+    const auto uniformRead = prepared(firstLane, 32u, 32u, withoutVertex, true);
+    require(!uniformRead.empty() && subgroupWords(uniformRead) == 0u, "stages without subgroups: v_readfirstlane of a user data value kept subgroup operations");
+    const char* refused = "needs subgroup operations, which the device does not support in vertex shaders (subgroup stages 0x32); exact lowering left:";
+    expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, refused, "stages without subgroups: s_bcnt1 of EXEC was accepted");
+    expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, "a ballot read as a value at 0x60000-0x", "stages without subgroups: s_bcnt1 of EXEC was not reported as a ballot read as a value");
+    expectFailure([&] { static_cast<void>(prepared(scalarLeak, 32u, 32u, withoutVertex)); }, "a wave-mask branch whose region leaves a value that the skipped path does not have", "stages without subgroups: an execz region writing an SGPR read after the join was accepted");
+    expectFailure([&] { static_cast<void>(prepared(waterfall, 32u, 32u, withoutVertex)); }, "a wave-mask branch controls a loop", "stages without subgroups: a waterfall loop was accepted");
+    expectFailure([&] { static_cast<void>(prepared(waterfall, 32u, 32u, withoutVertex)); }, "v_readfirstlane/v_readlane of a lane-varying value", "stages without subgroups: the waterfall loop's v_readfirstlane of the vertex index was not reported");
+    expectFailure([&] { static_cast<void>(prepared(dpp, 32u, 32u, withoutVertex)); }, "DPP at 0x60000-0x", "stages without subgroups: a DPP row shift was accepted");
+    require(!prepared(waterfall, 32u, 32u, ~0u).empty() && !prepared(dpp, 32u, 32u, ~0u).empty(), "stages without subgroups: programs refused without vertex subgroups did not prepare with them");
+
+    const auto serialized = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(vertex(masks, 32u, 32u, withoutVertex, false)));
+    require(serialized.request.target.subgroupStages == withoutVertex, "stages without subgroups: the request serializer lost the target's subgroup stages");
+
+    for (const bool loweredFirst : {false, true}) {
+        const auto loweredRequest = vertex(masks, 32u, 32u, withoutVertex, false);
+        const auto nativeRequest = vertex(masks, 32u, 32u, ~0u, false);
+        ShaderPreparationContext preparation;
+        const auto first = PrepareShader(loweredFirst ? loweredRequest : nativeRequest, &preparation);
+        const auto second = PrepareShader(loweredFirst ? nativeRequest : loweredRequest, &preparation);
+        const auto& loweredHandle = loweredFirst ? *first : *second;
+        const auto& nativeHandle = loweredFirst ? *second : *first;
+        require(first->source != second->source, "stages without subgroups: programs prepared with and without vertex subgroups share one translated source");
+        require(MatchesPreparedShader(loweredRequest, loweredHandle) && MatchesPreparedShader(nativeRequest, nativeHandle), "stages without subgroups: a prepared program did not match its own request");
+        require(!MatchesPreparedShader(loweredRequest, nativeHandle) && !MatchesPreparedShader(nativeRequest, loweredHandle), "stages without subgroups: a program prepared for one subgroup stage mask matched a request for the other");
+        require(subgroupWords(GetPreparedArtifact(loweredHandle).spirv) == 0u && subgroupWords(GetPreparedArtifact(nativeHandle).spirv) != 0u, "stages without subgroups: preparing for one subgroup stage mask after the other gave the other's program");
+    }
+}
+
 void verifyMeshConfiguration() {
     using namespace ShaderRecompiler;
     ShaderMeshInputInfo list;
@@ -1625,12 +1720,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRAAAAA=", "new requests did not use serialization version 16");
+    require(requestPrefix(encoded, 8u) == "NVNQQREAAAA=", "new requests did not use serialization version 17");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 18u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source or alpha-to-coverage flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQREAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRIAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
@@ -3119,6 +3214,7 @@ int main(int argc, char** argv) {
         verifyLanesOutsideHostSubgroup();
         verifyHalfWaveReduction();
         verifyNarrowVertexWave();
+        verifyStagesWithoutSubgroups();
         verifyMeshConfiguration();
         verifyPixelInputs();
         verifyPixelRequestSerialization();

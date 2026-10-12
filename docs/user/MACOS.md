@@ -77,7 +77,7 @@ The bundle contains the title, the libraries, the Vulkan loader and MoltenVK, an
 
 DOOM's release ships `eboot.bin` and `sce_module/libc.prx` as fake-signed SELF containers. Unpack the executable with `python3 tools/unfself.py eboot.bin eboot.elf`, set `eboot.bin` and the bundled `libc.prx` aside (the title runs on AnyPS5's libc, as on [Linux and Windows](COMPATIBILITY.md)), then convert `eboot.elf` as above.
 
-The first commercial titles tried stop at their first draws on features MoltenVK lacks or the driver does not implement yet: 4x multisampled render targets, pixel shaders that need barycentrics without geometry shaders, and a viewport depth range outside [0, 1] where the draw uses the depth, which needs `VK_EXT_depth_range_unrestricted`.
+The first commercial titles tried stop at their first draws on features MoltenVK lacks or the driver does not implement yet: 4x multisampled render targets, pixel shaders that need barycentrics without geometry shaders, a viewport depth range outside [0, 1] where the draw uses the depth, which needs `VK_EXT_depth_range_unrestricted`, and subgroup operations in vertex shaders.
 
 MoltenVK does not have `VK_EXT_depth_range_unrestricted`. A draw whose viewport depth range lies outside [0, 1] still renders when its depth cannot be seen: it has no depth target, or it does not write depth and its depth test is off or always or never passes, and its pixel shader does not read the fragment depth. A depth bounds test does not count, since it compares the depth already in the target. Any other such draw stops with `viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted`, followed by the draw's depth registers and depth state; include that line when reporting the title. `APS5_NO_DEPTH_RANGE_UNRESTRICTED=1` makes a Linux or Windows device behave the same way.
 
@@ -94,8 +94,11 @@ APS5_MSAA_SINGLE_SAMPLE=1 Title.app/Contents/MacOS/launch
 
 Repeat `--env` for each variable. The second form starts the launcher from Terminal and waits until the title exits; either way the output still goes to the log.
 
+MoltenVK has no subgroup operations in vertex and tessellation-evaluation shaders (its `Selected GPU` log line shows `stages=0x32`: fragment, compute and tessellation control). The recompiler lowers what it can exactly to per-invocation code: lane masks that come from compares and EXEC, lane-index tests against the wave's vertex count, `v_readfirstlane` of wave-uniform values, and `s_cbranch_execz`/`vccz` regions whose effects are masked by EXEC. A program that still needs the wave, such as a waterfall loop over `v_readfirstlane` of a varying value, stops the title with `vertex program 0x… needs subgroup operations, which the device does not support in vertex shaders` followed by the constructs that are left and their addresses; include that line when reporting the title, see [USAGE.md](USAGE.md#devices-without-subgroup-operations-in-vertex-shaders).
+
 ## Limitations
 
+- MoltenVK has no subgroup operations in vertex and tessellation-evaluation shaders; the recompiler lowers what it can exactly and stops the title on the rest, naming the constructs (see above).
 - Metal has no 64-bit floats and no 64-bit atomics, and MoltenVK has no `VK_KHR_shader_clock`. Shaders that need them fail; the affected tests are listed in [technical debt](../dev/TechnicalDebt.md).
 - An f16 multiply that should give -0.0 gives +0.0 under SPIRV-Cross; see [technical debt](../dev/TechnicalDebt.md).
 - `sceKernelGetModuleInfoFromAddr`, `sceKernelGetModuleList` and `sceKernelGetModuleInfo` are not implemented on macOS.

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <optional>
 #include <set>
@@ -196,8 +197,17 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 }
                 const bool isSubgroupCapability = subgroupOperations != 0;
                 if (isSubgroupCapability) {
-                    Require((subgroup.supportedStages & VulkanStage(stage)) != 0, "subgroup capability " + std::to_string(instruction[1]) + " is unsupported for shader stage " + std::to_string(VulkanStage(stage)));
-                    Require((subgroup.supportedOperations & subgroupOperations) == subgroupOperations, "device lacks operations for subgroup capability " + std::to_string(instruction[1]));
+                    const auto describe = [&] {
+                        char address[32];
+                        std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(compiled.guestAddress));
+                        char stages[32];
+                        std::snprintf(stages, sizeof(stages), "0x%x", subgroup.supportedStages);
+                        char operations[32];
+                        std::snprintf(operations, sizeof(operations), "0x%x", subgroup.supportedOperations);
+                        return " of program " + std::string(compiled.guestAddress != 0 ? address : "generated") + " (" + (vertex ? "vertex" : fragment ? "fragment" : mesh ? "mesh" : control ? "tessellation control" : evaluation ? "tessellation evaluation" : "geometry") + ", wave" + std::to_string(vertex || mesh || control || evaluation ? state.stages.vertexWaveSize : fragment ? state.stages.fragmentWaveSize : 0u) + ", host subgroup " + std::to_string(shader.hostSubgroupSize) + "); device subgroup stages " + stages + ", operations " + operations;
+                    };
+                    Require((subgroup.supportedStages & VulkanStage(stage)) != 0, "subgroup capability " + std::to_string(instruction[1]) + " is unsupported for shader stage " + std::to_string(VulkanStage(stage)) + describe());
+                    Require((subgroup.supportedOperations & subgroupOperations) == subgroupOperations, "device lacks operations for subgroup capability " + std::to_string(instruction[1]) + describe());
                 }
 
                 const bool isBaseCapability =

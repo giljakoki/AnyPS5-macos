@@ -170,7 +170,13 @@ int main() {
         if (device->Target().subgroupSize < 32u) {
             std::printf("vertex draw skipped, subgroup size %u cannot hold a wave32\n", device->Target().subgroupSize);
         } else if ((device->SubgroupStages() & VK_SHADER_STAGE_VERTEX_BIT) == 0u) {
-            std::puts("vertex draw skipped, the device has no subgroup operations in vertex shaders");
+            try {
+                Draw(*device);
+                throw std::runtime_error("exec host lanes: the waterfall vertex program was accepted without subgroup operations in vertex shaders");
+            } catch (const std::runtime_error& error) {
+                if (std::string(error.what()).find("a wave-mask branch controls a loop") == std::string::npos) throw;
+            }
+            std::puts("vertex draw refused as expected: the device has no subgroup operations in vertex shaders and the program's waterfall loop is not lane-local");
         } else {
             Draw(*device);
             Check("vertex", Vertices);
