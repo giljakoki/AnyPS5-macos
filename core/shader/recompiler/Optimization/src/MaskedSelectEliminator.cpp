@@ -325,6 +325,41 @@ bool allLanesWord(const IrValue* word, std::uint32_t half) {
     return predicate->HasImmediate() && predicate->Type() == IrType::Bool && predicate->ImmediateBool();
 }
 
+bool runningLanesWord(const IrValue* word, std::uint32_t half, std::uint32_t depth) {
+    word = word->Resolve();
+    if (isImmediate(word, 0xffffffffu) || allLanesWord(word, half)) return true;
+    if (depth > DepthLimit) return false;
+    if (word->Opcode() == IrOpcode::BitwiseAnd32) return runningLanesWord(word->Argument(0), half, depth + 1u) && runningLanesWord(word->Argument(1), half, depth + 1u);
+    if (!word->IsPhi()) return false;
+    bool incomings = false;
+    for (std::size_t index = 0; index < word->ArgumentCount(); ++index) {
+        const IrValue* incoming = word->Argument(index)->Resolve();
+        if (incoming == word) continue;
+        if (!runningLanesWord(incoming, half, depth + 1u)) return false;
+        incomings = true;
+    }
+    return incomings;
+}
+
+bool everyRunningLane(const IrValue* value, std::uint32_t waveSize, std::uint32_t depth = 0) {
+    value = value->Resolve();
+    if (value->HasImmediate()) return value->Type() == IrType::Bool && value->ImmediateBool();
+    if (depth > DepthLimit) return false;
+    if (value->Opcode() == IrOpcode::LogicalAnd) return everyRunningLane(value->Argument(0), waveSize, depth + 1u) && everyRunningLane(value->Argument(1), waveSize, depth + 1u);
+    if (value->IsPhi()) {
+        bool incomings = false;
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+            const IrValue* incoming = value->Argument(index)->Resolve();
+            if (incoming == value) continue;
+            if (!everyRunningLane(incoming, waveSize, depth + 1u)) return false;
+            incomings = true;
+        }
+        return incomings;
+    }
+    const auto bit = threadBit(value, waveSize);
+    return bit && runningLanesWord(bit->low, 0u, depth) && (waveSize == 32u || runningLanesWord(bit->high, 1u, depth));
+}
+
 const IrValue* quadWordOfPredicate(const IrValue* predicate, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth);
 
 const IrValue* quadWord(const IrValue* word, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth) {
@@ -442,9 +477,14 @@ public:
         mask = writeMask;
         loops = acrossLoops;
         always = alwaysTrue(writeMask, waveSize);
+        running = always || everyRunningLane(writeMask, waveSize);
         results.clear();
         proven.clear();
         assumptionReads = 0;
+    }
+
+    bool HoldsForRunningLanes() const {
+        return running;
     }
 
     bool Implies(const IrValue* condition, std::uint32_t depth = 0) {
@@ -531,7 +571,9 @@ private:
         if (low->Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediate(low->Argument(1)->Resolve(), 0u)) {
             const IrValue* ballot = low->Argument(0)->Resolve();
             const bool sameBallot = waveSize == 32u || (high->Opcode() == IrOpcode::CompositeExtractU32x4 && high->Argument(0)->Resolve() == ballot && isImmediate(high->Argument(1)->Resolve(), 1u));
-            result = ballot->Opcode() == IrOpcode::Ballot && sameBallot && Implies(ballot->Argument(0), depth + 1u);
+            const IrValue* predicate = ballot->Argument(0)->Resolve();
+            const bool everyLane = predicate->HasImmediate() && predicate->Type() == IrType::Bool && predicate->ImmediateBool();
+            result = ballot->Opcode() == IrOpcode::Ballot && sameBallot && ((running && everyLane) || Implies(predicate, depth + 1u));
         }
         if (!result && low->Opcode() == IrOpcode::BitwiseAnd32) {
             if (waveSize == 32u) {
@@ -561,6 +603,7 @@ private:
     const IrValue* mask = nullptr;
     bool loops = false;
     bool always = false;
+    bool running = false;
     std::unordered_map<ImplicationKey, Proof, ImplicationKeyHash> results;
     std::vector<ImplicationKey> proven;
     std::size_t assumptionReads = 0;
@@ -622,7 +665,8 @@ public:
         const bool acrossLoops = mask->HasImmediate() || regionOf(regions, mask->Parent()) == Region::Once;
         work = limit;
         implications.Reset(mask, acrossLoops);
-        const bool quadMasked = program.Resources().stage == IrShaderStage::Pixel && wholeQuadSource(mask, program.WaveSize()) != nullptr;
+        const bool running = implications.HoldsForRunningLanes();
+        const bool quadMasked = program.Resources().stage == IrShaderStage::Pixel && (running || wholeQuadSource(mask, program.WaveSize()) != nullptr);
         startVisits();
         pending.clear();
         pending.push_back(&select);
@@ -635,7 +679,7 @@ public:
                 if (!followable(regions, user->Parent(), acrossLoops)) return false;
                 if (isSelect(user->Opcode()) && use.operand == 1u && implications.Implies(user->Argument(0))) continue;
                 if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implications.Implies(user->Argument(1u - use.operand))) continue;
-                if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && implications.Implies(user->Argument(user->ArgumentCount() - 1u))) continue;
+                if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && (running || implications.Implies(user->Argument(user->ArgumentCount() - 1u)))) continue;
                 if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user) && !(quadMasked && user->Opcode() == IrOpcode::ImageSampleRaw)) return false;
                 if (firstVisit(*user)) {
                     if (work == 0) return false;

@@ -765,5 +765,67 @@ int main() {
         return b.eliminate() == 0u && !removed(written);
     });
 
+    const auto restoredExec = [](IrOpcode read) {
+        Builder b;
+        const auto [allLow, allHigh] = b.ballotWords(b.truth());
+        auto& old = b.lane();
+        IrBlock& head = *b.block;
+        IrBlock& body = b.newBlock();
+        IrBlock& merge = b.newBlock();
+        head.AddBranch(&body);
+        head.AddBranch(&merge);
+        body.AddBranch(&merge);
+        b.block = &body;
+        const auto [hostLow, hostHigh] = b.ballotWords(b.truth());
+        auto& low = b.program.CreateValue(IrOpcode::Phi, IrType::U32);
+        auto& high = b.program.CreateValue(IrOpcode::Phi, IrType::U32);
+        body.AppendInstruction(&low);
+        body.AppendInstruction(&high);
+        low.AddPhiOperand(&head, &b.constant(0xffffffffu));
+        low.AddPhiOperand(&head, allLow);
+        high.AddPhiOperand(&head, &b.constant(0xffffffffu));
+        high.AddPhiOperand(&head, allHigh);
+        auto& restored = b.threadBit(b.wordAnd(low, *hostLow), b.wordAnd(high, *hostHigh));
+        b.block = &merge;
+        auto& exec = b.program.CreateValue(IrOpcode::Phi, IrType::Bool);
+        merge.AppendInstruction(&exec);
+        exec.AddPhiOperand(&head, &b.truth());
+        exec.AddPhiOperand(&body, &restored);
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        if (read == IrOpcode::SetAttribute) {
+            b.emit(IrOpcode::SetAttribute, IrType::Void, {&written, &b.ballotBit(b.truth())});
+            return std::pair{b.eliminate(), removed(written)};
+        }
+        auto& value = read == IrOpcode::Void ? b.add(written, 2u) : b.emit(read, IrType::U32, {&written, &exec});
+        b.keep(b.select(exec, value, old));
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a write under an EXEC restored from a copy of every running lane, read by its own lane, drops the select", [&] {
+        const auto [count, gone] = restoredExec(IrOpcode::Void);
+        return count != 0u && gone;
+    });
+
+    passed &= run("a write under an EXEC restored from a copy of every running lane, read by other lanes, keeps the select", [&] {
+        const auto [count, gone] = restoredExec(IrOpcode::DppMoveU32);
+        return count == 0u && !gone;
+    });
+
+    passed &= run("a write under an EXEC restored from a copy of every running lane, exported under another copy of every running lane, drops the select", [&] {
+        const auto [count, gone] = restoredExec(IrOpcode::SetAttribute);
+        return count != 0u && gone;
+    });
+
+    passed &= run("a write under every running lane, re-masked for every lane and read by other lanes, keeps the select", [] {
+        Builder b;
+        auto& exec = b.ballotBit(b.truth());
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& widened = b.select(b.truth(), written, b.constant(0u));
+        b.keep(b.emit(IrOpcode::DppMoveU32, IrType::U32, {&widened, &b.truth()}));
+        b.eliminate();
+        return !removed(written);
+    });
+
     return passed ? 0 : 1;
 }
