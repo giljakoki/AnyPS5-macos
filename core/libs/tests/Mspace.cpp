@@ -59,7 +59,29 @@ static void CheckAlignment() {
     for (void* block : {zeroed, small, moved, posix}) sceLibcMspaceFree_nid_postfix(arena, block);
     Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
 }
+static void CheckManySmallBlocks() {
+    static std::array<unsigned char, 64u << 20u> storage{};
+    void* arena = sceLibcMspaceCreate_nid_postfix("many", storage.data(), storage.size(), 0);
+    Require(arena != nullptr);
+    constexpr std::size_t count = 300000;
+    static std::array<void*, count> blocks{};
+    for (std::size_t index = 0; index < count; ++index) {
+        blocks[index] = sceLibcMspaceMalloc_nid_postfix(arena, 1 + index % 48);
+        Require(blocks[index] != nullptr);
+    }
+    for (std::size_t index = 0; index < count; index += 2) sceLibcMspaceFree_nid_postfix(arena, blocks[index]);
+    for (std::size_t index = 0; index < count; index += 2) {
+        blocks[index] = sceLibcMspaceMalloc_nid_postfix(arena, 1 + (index / 2) % 40);
+        Require(blocks[index] != nullptr && (reinterpret_cast<std::uintptr_t>(blocks[index]) & 31u) == 0);
+    }
+    MallocManagedSize stats{sizeof(MallocManagedSize), 1, 0, 0, 0, 0, 0};
+    Require(sceLibcMspaceMallocStats_nid_postfix(arena, &stats) == 0 && stats.currentInuseSize >= count * 32);
+    for (void* block : blocks) sceLibcMspaceFree_nid_postfix(arena, block);
+    Require(sceLibcMspaceMallocStats_nid_postfix(arena, &stats) == 0 && stats.currentInuseSize == 0);
+    Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
+}
 int main() {
+    CheckManySmallBlocks();
     CheckAlignment();
     alignas(16) std::array<unsigned char, 65536> storage{};
     void* arena = sceLibcMspaceCreate_nid_postfix("test", storage.data(), storage.size(), 0);
