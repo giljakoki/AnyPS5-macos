@@ -32,10 +32,12 @@ std::uint64_t APS5_VABI libcCyberUnknown08(void) {
     return 0;
 }
 
-APS5_EXPORT("jBOZAv6CwkM", libcUnknownImport01);
-std::uint64_t APS5_VABI libcUnknownImport01(void) {
-    NotImplemented_nid_no_patch("jBOZAv6CwkM");
-    return 0;
+int APS5_VABI _Cnd_init_nid_postfix(void** handle);
+
+APS5_EXPORT("jBOZAv6CwkM", libcCndInitNamed);
+int APS5_VABI libcCndInitNamed(void** handle, const char* name) {
+    (void)name;
+    return _Cnd_init_nid_postfix(handle);
 }
 
 }

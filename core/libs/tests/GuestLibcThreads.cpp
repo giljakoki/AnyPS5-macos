@@ -17,6 +17,7 @@ void APS5_VABI _Cnd_destroy_nid_postfix(void** handle);
 int APS5_VABI _Cnd_wait_nid_postfix(void** condition, void** mutex);
 int APS5_VABI _Cnd_broadcast_nid_postfix(void** handle);
 int APS5_VABI _Cnd_signal_nid_postfix(void** handle);
+int APS5_VABI libcCndInitNamed(void** handle, const char* name);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -173,6 +174,12 @@ static void ConditionBroadcast() {
     void* emptyCondition = nullptr;
     _Cnd_destroy_nid_postfix(&emptyCondition);
     RequireThrows<std::invalid_argument>([] { _Cnd_destroy_nid_postfix(nullptr); });
+    void* namedCondition = nullptr;
+    Require(libcCndInitNamed(&namedCondition, "SceLibc_Mtx") == success && namedCondition != nullptr);
+    Require(_Cnd_signal_nid_postfix(&namedCondition) == success);
+    _Cnd_destroy_nid_postfix(&namedCondition);
+    Require(namedCondition == nullptr);
+    RequireThrows<std::invalid_argument>([] { libcCndInitNamed(nullptr, nullptr); });
     _Mtx_destroy_nid_postfix(&mutex);
 }
 
