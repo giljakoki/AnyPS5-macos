@@ -14,9 +14,11 @@
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/FileLock.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
+#include "prx/libkernel/Aio/include/ReadTrace.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <cstdarg>
 #include <deque>
@@ -950,7 +952,9 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
     char empty = 0;
+    const auto started = ReadTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto result = NativePread(d, nbytes == 0 && buf == nullptr ? &empty : buf, nbytes, offset);
+    if (ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Pread, d, result < 0 ? 0 : static_cast<std::uint64_t>(result), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1030,7 +1034,9 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
+    const auto started = ReadTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto result = NativePread(d, buf, nbytes, offset);
+    if (ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Pread, d, result < 0 ? 0 : static_cast<std::uint64_t>(result), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 

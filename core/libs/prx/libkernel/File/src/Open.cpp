@@ -9,8 +9,10 @@
 #include "prx/libkernel/File/include/FileLock.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
+#include "prx/libkernel/Aio/include/ReadTrace.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
+#include <chrono>
 
 #include <cerrno>
 #include <cstdarg>
@@ -257,7 +259,9 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) errno = EFAULT;
     else if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<std::int64_t>(nbytes);
+    const auto started = ReadTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
+    if (ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Read, d, n < 0 ? 0 : static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
     if (n < 0) return SceIoErrorFromErrno(errno);
     return static_cast<std::int64_t>(n);
 }

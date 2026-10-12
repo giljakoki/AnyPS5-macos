@@ -10,6 +10,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libkernel/Aio/include/ReadTrace.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -87,9 +88,11 @@ std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, s
 }
 
 bool RunRequest(KernelAioRwRequest& req, bool write) {
+    const auto started = ReadTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const std::int64_t done = write
         ? NativePwrite(req.fd, req.buf, req.nbyte, req.offset)
         : NativePread(req.fd, req.buf, req.nbyte, req.offset);
+    if (!write && ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Aio, req.fd, done < 0 ? 0 : static_cast<std::uint64_t>(done), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
     if (done < 0) {
         const int error = errno;
         req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EIO);
@@ -289,6 +292,7 @@ int APS5_VABI sceKernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec
         }
         if (current != AioProcessing) {
             *state = current;
+            if (ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::AioWait, id, 0, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
             return 0;
         }
         if (usec != nullptr && *usec != 0) {
