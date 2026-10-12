@@ -147,6 +147,10 @@ Do not disable Dozen if it is the only Vulkan driver available; the application 
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. Any other value stops the title at its first flip.
 
+### Flips ahead of the GPU worker
+
+A frame that ends with a flip is held at its submission until the GPU worker has reached the previous frame's flip, so a title never gets more than one frame ahead of what the worker has read ([TechnicalDebt](../dev/TechnicalDebt.md)). While the worker is slow, for example while it creates the pipelines of a title's first frames, a title that frees upload memory only from its rendering thread can run out of that memory and crash. `APS5_FLIPS_AHEAD=<n>` with n from 1 to 8 lets n frames wait for the worker before the next one is held (1 is the default). Values above 2 can show frames drawn with a later frame's data in titles that keep a three-frame ring of per-frame memory. Any other value stops the title at its first command buffer submission.
+
 ### Multisampled render targets
 
 Multisampled (MSAA) color and depth targets are rendered as host multisampled images, and a CB resolve resolves them. A multisampled state those images do not model stops the title at its first such draw with a message that names `APS5_MSAA_SINGLE_SAMPLE` when the variable would accept the state, such as `AGC graphics: color targets with fewer fragments than samples (EQAA) are unsupported; APS5_MSAA_SINGLE_SAMPLE=1 renders multisampled targets with one sample`. `APS5_MSAA_SINGLE_SAMPLE=1` renders multisampled color and depth targets with one sample instead: edges are not anti-aliased, and a CB resolve becomes a copy. Multisampled textures, per-sample shading and the other cases listed in [TechnicalDebt](../dev/TechnicalDebt.md) still stop the title.
