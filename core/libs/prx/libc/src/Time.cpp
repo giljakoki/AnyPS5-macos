@@ -47,12 +47,11 @@ std::tm toHostTm(const GuestTm& guest) {
     host.tm_yday = guest.tm_yday;
     host.tm_isdst = guest.tm_isdst;
 #ifndef _WIN32
-    host.tm_gmtoff = static_cast<long>(guest.tm_gmtoff);
-#ifdef __APPLE__
-    host.tm_zone = const_cast<char*>(guest.tm_zone);
-#else
-    host.tm_zone = guest.tm_zone;
-#endif
+    std::tm normalized = host;
+    if (std::mktime(&normalized) != static_cast<std::time_t>(-1)) {
+        host.tm_gmtoff = normalized.tm_gmtoff;
+        host.tm_zone = normalized.tm_zone;
+    }
 #endif
     return host;
 }
@@ -137,7 +136,6 @@ bool hasFreeBsdConversion(const char* format) {
 }
 
 const char* guestZoneName(const GuestTm& guest) {
-    if (guest.tm_zone != nullptr) return guest.tm_zone;
 #ifdef _WIN32
     return _tzname[guest.tm_isdst != 0 ? 1 : 0];
 #else
@@ -265,28 +263,16 @@ GuestTm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, GuestTm* result
     std::tm host{};
 #ifdef _WIN32
     if (localtime_s(&host, &t) != 0) return nullptr;
-    copyCalendarFields(host, *result);
-    long standardBias = 0;
-    long daylightBias = 0;
-    _get_timezone(&standardBias);
-    _get_dstbias(&daylightBias);
-    const bool daylight = host.tm_isdst > 0;
-    result->tm_gmtoff = -static_cast<std::int64_t>(standardBias + (daylight ? daylightBias : 0));
-    result->tm_zone = _tzname[daylight ? 1 : 0];
 #else
     if (localtime_r(&t, &host) == nullptr) return nullptr;
-    copyCalendarFields(host, *result);
-    result->tm_gmtoff = host.tm_gmtoff;
-    result->tm_zone = host.tm_zone;
 #endif
+    copyCalendarFields(host, *result);
     return result;
 }
 
 GuestTm* APS5_VABI gmtime_s_nid_postfix(const int64_t* timer, GuestTm* result) {
     if (timer == nullptr || result == nullptr) return nullptr;
     if (!utcCalendarFields(*timer, *result)) return nullptr;
-    result->tm_gmtoff = 0;
-    result->tm_zone = "UTC";
     return result;
 }
 
