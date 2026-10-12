@@ -3710,6 +3710,9 @@ void barycentricEmulationTests() {
         const auto reusedBuiltins = decorations(reused, spv::DecorationBuiltIn);
         Require(!reused.barycentricEmulation.active && !barycentricCapability(reused) && std::find(reusedBuiltins.begin(), reusedBuiltins.end(), static_cast<std::uint32_t>(spv::BuiltInBaryCoordKHR)) == reusedBuiltins.end(), "reusing the I/J VGPRs after v_interp_p1/p2 lost host interpolation");
     }
+    static constexpr std::array<std::uint32_t, 11> overwritesJInWqm{0xbeac047eu, 0xbefe0a7eu, 0xc8100000u, 0xc80c0100u, 0xc8110001u, 0xc80d0101u, 0x7e0202f2u, 0x87fe2c7eu, 0xf800180fu, 0x01010304u, 0xbf810000u};
+    const auto wqm = compile(overwritesJInWqm, false);
+    Require(!wqm.barycentricEmulation.active && !barycentricCapability(wqm), "overwriting the J VGPR under s_wqm_b64 of the entry EXEC, which covers every invocation, lost host interpolation");
     static constexpr std::array<std::uint32_t, 7> widensExec{0xbefe0381u, 0xc8080000u, 0xbefe03c1u, 0xc8090001u, 0xf800180fu, 0x02020202u, 0xbf810000u};
     Require(compile(widensExec, false).barycentricEmulation.active, "v_interp_p2_f32 under a wider EXEC than its v_interp_p1_f32 lost exact barycentrics");
     static constexpr std::array<std::uint32_t, 6> sharedSlot{0xc8080000u, 0xc8090001u, 0xc80e0402u, 0xf800180fu, 0x03030202u, 0xbf810000u};
