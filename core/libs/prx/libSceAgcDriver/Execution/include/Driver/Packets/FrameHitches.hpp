@@ -36,6 +36,7 @@ public:
     std::optional<std::string> FlipSubmitted(const HitchSubmission& submission, const TitleDescriber& describeTitle = {});
     void OtherSubmitted();
     std::optional<std::string> WorkFinished(const HitchWork& work);
+    std::optional<std::string> IdleStoreFinished(double ms);
 
 private:
     std::mutex mutex;
@@ -47,6 +48,8 @@ private:
     double workBusyMs = 0;
     double workWaitMs = 0;
     HitchWork longestWork;
+    std::uint64_t idleStores = 0;
+    double idleStoreMs = 0;
 };
 
 double ParseHitchThresholdMs(const char* text);

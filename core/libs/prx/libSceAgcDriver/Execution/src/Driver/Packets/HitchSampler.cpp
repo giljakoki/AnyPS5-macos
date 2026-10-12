@@ -59,35 +59,39 @@ std::uint64_t ReadWord(std::uint64_t address) {
 
 class MachHitchSampler final : public HitchSampler {
 public:
-    MachHitchSampler() : ring(16384) {
+    MachHitchSampler() : ring(32768) {
         std::thread([this] { run(); }).detach();
     }
 
-    void Follow() override {
+    void Follow(SampledThread thread) override {
         const auto self = mach_thread_self();
-        const auto previous = followed.exchange(self, std::memory_order_acq_rel);
+        const auto previous = followed[static_cast<std::size_t>(thread)].exchange(self, std::memory_order_acq_rel);
         if (previous != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), previous);
     }
 
-    std::string Describe(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) override {
+    std::string Describe(SampledThread thread, std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) override {
         std::vector<ThreadSample> window;
         {
             std::lock_guard lock(mutex);
             for (std::size_t i = 0; i < std::min(written, ring.size()); ++i) {
                 const auto& sample = ring[(written - 1 - i) % ring.size()];
                 if (sample.at < from) break;
-                if (sample.at <= to) window.push_back(sample);
+                if (sample.at <= to && sample.thread == thread) window.push_back(sample);
             }
         }
         return SummarizeSamples(window, [this](std::uint64_t address) { return symbolize(address); }, 6);
     }
 
-    std::string Period() override {
+    std::string Period(SampledThread thread) override {
         std::vector<ThreadSample> period;
         {
             std::lock_guard lock(mutex);
+            auto& reported = periodReported[static_cast<std::size_t>(thread)];
             const auto count = std::min(written - reported, ring.size());
-            for (std::size_t i = 0; i < count; ++i) period.push_back(ring[(written - count + i) % ring.size()]);
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto& sample = ring[(written - count + i) % ring.size()];
+                if (sample.thread == thread) period.push_back(sample);
+            }
             reported = written;
         }
         return SummarizeSamples(period, [this](std::uint64_t address) { return symbolize(address); }, 12);
@@ -121,35 +125,38 @@ private:
     void run() {
         for (;;) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            const auto thread = followed.load(std::memory_order_acquire);
-            if (thread == MACH_PORT_NULL || thread_suspend(thread) != KERN_SUCCESS) continue;
-            x86_thread_state64_t state{};
-            mach_msg_type_number_t count = x86_THREAD_STATE64_COUNT;
-            const auto status = thread_get_state(thread, x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &count);
-            ThreadSample sample{std::chrono::steady_clock::now(), {}};
-            if (status == KERN_SUCCESS) {
-                sample.frames[0] = state.__rip;
-                std::uint64_t frame = state.__rbp;
-                for (std::size_t i = 1; i < sample.frames.size() && frame != 0; ++i) {
-                    sample.frames[i] = ReadWord(frame + 8);
-                    const auto next = ReadWord(frame);
-                    if (next <= frame) break;
-                    frame = next;
-                }
-            }
-            thread_resume(thread);
-            if (status != KERN_SUCCESS) continue;
-            std::lock_guard lock(mutex);
-            ring[written % ring.size()] = sample;
-            ++written;
+            for (std::size_t index = 0; index < followed.size(); ++index) sampleThread(static_cast<SampledThread>(index), followed[index].load(std::memory_order_acquire));
         }
     }
 
-    std::atomic<thread_act_t> followed{MACH_PORT_NULL};
+    void sampleThread(SampledThread role, thread_act_t thread) {
+        if (thread == MACH_PORT_NULL || thread_suspend(thread) != KERN_SUCCESS) return;
+        x86_thread_state64_t state{};
+        mach_msg_type_number_t count = x86_THREAD_STATE64_COUNT;
+        const auto status = thread_get_state(thread, x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &count);
+        ThreadSample sample{std::chrono::steady_clock::now(), role, {}};
+        if (status == KERN_SUCCESS) {
+            sample.frames[0] = state.__rip;
+            std::uint64_t frame = state.__rbp;
+            for (std::size_t i = 1; i < sample.frames.size() && frame != 0; ++i) {
+                sample.frames[i] = ReadWord(frame + 8);
+                const auto next = ReadWord(frame);
+                if (next <= frame) break;
+                frame = next;
+            }
+        }
+        thread_resume(thread);
+        if (status != KERN_SUCCESS) return;
+        std::lock_guard lock(mutex);
+        ring[written % ring.size()] = sample;
+        ++written;
+    }
+
+    std::array<std::atomic<thread_act_t>, 2> followed{};
     std::mutex mutex;
     std::vector<ThreadSample> ring;
     std::size_t written = 0;
-    std::size_t reported = 0;
+    std::array<std::size_t, 2> periodReported{};
     std::mutex symbolMutex;
     std::unordered_map<std::uint64_t, std::string> symbols;
 };

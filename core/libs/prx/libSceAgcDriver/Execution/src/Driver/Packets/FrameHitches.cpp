@@ -24,7 +24,7 @@ std::optional<std::string> FrameHitchTracker::FlipSubmitted(const HitchSubmissio
         const auto periodMs = Ms(submission.entered - previous->entered);
         if (periodMs >= thresholdMs) {
             char text[640];
-            std::snprintf(text, sizeof(text), "[hitch] frame %llu: %.1f ms between flip submissions: %.1f ms in the title since the previous one returned, which blocked %.1f ms (flip room %.1f ms, behind the worker %.1f ms); %llu other submissions; queue 0 worker in between: %llu submissions, %.1f ms of packets, %.1f ms waiting, longest submission %llu with %.1f ms of packets (slowest %s %.1f ms)\n", static_cast<unsigned long long>(frames), periodMs, Ms(submission.entered - previous->left), Ms(previous->left - previous->entered), previous->flipRoomMs, previous->workerHoldMs, static_cast<unsigned long long>(otherSubmissions), static_cast<unsigned long long>(workSubmissions), workBusyMs, workWaitMs, static_cast<unsigned long long>(longestWork.serial), longestWork.busyMs, longestWork.slowest.empty() ? "none" : longestWork.slowest.c_str(), longestWork.slowestMs);
+            std::snprintf(text, sizeof(text), "[hitch] frame %llu: %.1f ms between flip submissions: %.1f ms in the title since the previous one returned, which blocked %.1f ms (flip room %.1f ms, behind the worker %.1f ms); %llu other submissions; queue 0 worker in between: %llu submissions, %.1f ms of packets, %.1f ms waiting, longest submission %llu with %.1f ms of packets (slowest %s %.1f ms), %llu idle stores in %.1f ms\n", static_cast<unsigned long long>(frames), periodMs, Ms(submission.entered - previous->left), Ms(previous->left - previous->entered), previous->flipRoomMs, previous->workerHoldMs, static_cast<unsigned long long>(otherSubmissions), static_cast<unsigned long long>(workSubmissions), workBusyMs, workWaitMs, static_cast<unsigned long long>(longestWork.serial), longestWork.busyMs, longestWork.slowest.empty() ? "none" : longestWork.slowest.c_str(), longestWork.slowestMs, static_cast<unsigned long long>(idleStores), idleStoreMs);
             report = text;
             const auto titleMs = Ms(submission.entered - previous->left);
             if (describeTitle && titleMs >= thresholdMs / 2) {
@@ -39,6 +39,8 @@ std::optional<std::string> FrameHitchTracker::FlipSubmitted(const HitchSubmissio
     workBusyMs = 0;
     workWaitMs = 0;
     longestWork = {};
+    idleStores = 0;
+    idleStoreMs = 0;
     return report;
 }
 
@@ -56,6 +58,16 @@ std::optional<std::string> FrameHitchTracker::WorkFinished(const HitchWork& work
     if (work.busyMs < thresholdMs && work.longestWaitMs < thresholdMs) return std::nullopt;
     char text[384];
     std::snprintf(text, sizeof(text), "[hitch] queue 0 submission %llu: %.1f ms of packets, %.1f ms waiting; slowest %s %.1f ms, longest wait %s %.1f ms\n", static_cast<unsigned long long>(work.serial), work.busyMs, work.waitMs, work.slowest.empty() ? "none" : work.slowest.c_str(), work.slowestMs, work.longestWait.empty() ? "none" : work.longestWait.c_str(), work.longestWaitMs);
+    return std::string(text);
+}
+
+std::optional<std::string> FrameHitchTracker::IdleStoreFinished(double ms) {
+    std::lock_guard lock(mutex);
+    ++idleStores;
+    idleStoreMs += ms;
+    if (ms < thresholdMs) return std::nullopt;
+    char text[160];
+    std::snprintf(text, sizeof(text), "[hitch] queue 0 idle store of pending storage images: %.1f ms\n", ms);
     return std::string(text);
 }
 

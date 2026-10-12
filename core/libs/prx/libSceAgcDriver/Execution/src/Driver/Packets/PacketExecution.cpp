@@ -3,6 +3,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/FrameHitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/HitchSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -112,14 +113,30 @@ void Driver::execute(const Submission& submission) {
     auto* hitches = submission.queue == 0 ? FrameHitches() : nullptr;
     HitchWork hitchWork{};
     hitchWork.serial = submission.serial;
+    auto* hitchSampler = hitches != nullptr ? HitchSampler::Get() : nullptr;
+    if (hitchSampler != nullptr) {
+        thread_local bool followed = false;
+        if (!followed) {
+            hitchSampler->Follow(SampledThread::Worker);
+            followed = true;
+        }
+    }
     struct HitchReport {
         FrameHitchTracker* hitches;
+        HitchSampler* sampler;
         HitchWork& work;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
         ~HitchReport() {
             if (hitches == nullptr) return;
-            if (const auto report = hitches->WorkFinished(work)) AgcDriver::ProfilePrint_nid_no_patch("%s", report->c_str());
+            auto report = hitches->WorkFinished(work);
+            if (!report) return;
+            if (sampler != nullptr) {
+                report->pop_back();
+                *report += "; worker: " + sampler->Describe(SampledThread::Worker, started, std::chrono::steady_clock::now()) + "\n";
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("%s", report->c_str());
         }
-    } hitchReport{hitches, hitchWork};
+    } hitchReport{hitches, hitchSampler, hitchWork};
 
     bumpEpoch(&EpochBumps::submissions);
     clearResolvedAhead();

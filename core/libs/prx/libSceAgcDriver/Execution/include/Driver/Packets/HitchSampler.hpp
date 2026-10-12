@@ -12,8 +12,11 @@
 
 namespace AgcDriver::DriverDetail {
 
+enum class SampledThread : std::uint8_t { Title, Worker };
+
 struct ThreadSample {
     std::chrono::steady_clock::time_point at;
+    SampledThread thread = SampledThread::Title;
     std::array<std::uint64_t, 6> frames{};
 };
 
@@ -24,9 +27,9 @@ public:
     static HitchSampler* Get();
 
     virtual ~HitchSampler() = default;
-    virtual void Follow() = 0;
-    virtual std::string Describe(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) = 0;
-    virtual std::string Period() = 0;
+    virtual void Follow(SampledThread thread) = 0;
+    virtual std::string Describe(SampledThread thread, std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) = 0;
+    virtual std::string Period(SampledThread thread) = 0;
 };
 
 }

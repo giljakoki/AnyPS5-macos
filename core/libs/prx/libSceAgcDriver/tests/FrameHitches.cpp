@@ -26,13 +26,16 @@ void PeriodTests() {
     Require(!tracker.FlipSubmitted(At(base, 16.7, 30, 12, 0)).has_value(), "a 16.7 ms frame is below a 25 ms threshold");
     tracker.OtherSubmitted();
     tracker.WorkFinished({7, 4, 12, "DRAW_INDEX_2", 0.5, "WAIT_FLIP_DONE", 11});
+    Require(!tracker.IdleStoreFinished(3).has_value(), "a short idle store is quiet");
+    const auto store = tracker.IdleStoreFinished(30);
+    Require(store.has_value() && store->find("idle store of pending storage images: 30.0 ms") != std::string::npos, "a long idle store is reported");
     const auto report = tracker.FlipSubmitted(At(base, 76.7, 80, 3, 0));
     Require(report.has_value(), "a 60 ms frame must be reported");
     Require(report->find("60.0 ms between flip submissions") != std::string::npos, "the report must give the period: " + *report);
     Require(report->find("46.7 ms in the title") != std::string::npos, "the report must give the time outside the driver: " + *report);
     Require(report->find("blocked 13.3 ms (flip room 12.0 ms") != std::string::npos, "the report must give the previous submission's block: " + *report);
     Require(report->find("1 other submissions") != std::string::npos, "the report must count other submissions: " + *report);
-    Require(report->find("longest submission 7 with 4.0 ms of packets (slowest DRAW_INDEX_2 0.5 ms)") != std::string::npos, "the report must name the worker's longest submission: " + *report);
+    Require(report->find("longest submission 7 with 4.0 ms of packets (slowest DRAW_INDEX_2 0.5 ms), 2 idle stores in 33.0 ms") != std::string::npos, "the report must name the worker's longest submission and idle stores: " + *report);
     Require(!tracker.FlipSubmitted(At(base, 93.4, 95)).has_value(), "counters reset after a report");
 }
 
