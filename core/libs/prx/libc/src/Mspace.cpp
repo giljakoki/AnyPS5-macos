@@ -1,6 +1,9 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -15,6 +18,8 @@ extern "C" int* APS5_VABI __error_nid_postfix();
 namespace {
 
 constexpr unsigned MspaceThreadUnsafe = 1;
+constexpr unsigned MspaceQuietStats = 4;
+constexpr unsigned MspaceKnownFlags = MspaceThreadUnsafe | MspaceQuietStats;
 constexpr std::uintptr_t Granule = 16;
 constexpr std::uintptr_t MinimumAlignment = 32;
 constexpr std::uintptr_t ArenaHeaderBytes = 64;
@@ -39,13 +44,37 @@ std::map<std::uintptr_t, std::unique_ptr<Arena>> arenas;
 
 void Error(int value) { *__error_nid_postfix() = value; }
 
+bool Tracing() {
+    static const bool tracing = std::getenv("APS5_TRACE_MEMORY") != nullptr;
+    return tracing;
+}
+
 std::uintptr_t AlignUp(std::uintptr_t value, std::uintptr_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+void TraceArena(const char* what, const Arena& arena) {
+    std::size_t largest = 0, freeBytes = 0;
+    for (const auto& [size, start] : arena.free) { largest = std::max(largest, size); freeBytes += size; }
+    std::fprintf(stderr, "[mspace] %s: arena 0x%llx+0x%llx in use %zu MiB (peak %zu MiB), free %zu MiB in %zu chunks (largest %zu KiB), %zu chunks\n", what,
+        static_cast<unsigned long long>(arena.base), static_cast<unsigned long long>(arena.end - arena.base), arena.inUse >> 20, arena.peakInUse >> 20,
+        freeBytes >> 20, arena.free.size(), largest >> 10, arena.chunks.size());
+}
+
+void TraceAllocation(const char* what, Arena* arena, std::size_t size, std::size_t alignment, const void* result, const void* caller) {
+    if (!Tracing()) return;
+    static std::atomic<std::uint64_t> calls{0};
+    const auto count = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (result != nullptr && size < (1u << 20) && count % 100000 != 0) return;
+    std::fprintf(stderr, "[mspace] %s %zu bytes align %zu -> %p (caller %p, call %llu)\n", what, size, alignment, result, caller, static_cast<unsigned long long>(count));
+    if (arena == nullptr) std::fprintf(stderr, "[mspace] unknown arena handle\n");
+    else if (result == nullptr || count % 100000 == 0) TraceArena(what, *arena);
 }
 
 Arena* Find(void* handle) {
     const auto found = arenas.find(reinterpret_cast<std::uintptr_t>(handle));
     if (found != arenas.end()) return found->second.get();
+    if (Tracing()) std::fprintf(stderr, "[mspace] unknown handle %p (%zu arenas)\n", handle, arenas.size());
     Error(22);
     return nullptr;
 }
@@ -157,7 +186,7 @@ void* APS5_VABI sceLibcMspaceCreate_nid_postfix(const char* name, void* base,
     (void)name;
     const auto start = reinterpret_cast<std::uintptr_t>(base);
     if (!base || (start & (Granule - 1)) || size < ArenaHeaderBytes + 2 * Granule ||
-        size > std::numeric_limits<std::uintptr_t>::max() - start || (flags & ~MspaceThreadUnsafe) != 0) {
+        size > std::numeric_limits<std::uintptr_t>::max() - start || (flags & ~MspaceKnownFlags) != 0) {
         Error(22);
         return nullptr;
     }
@@ -174,12 +203,14 @@ void* APS5_VABI sceLibcMspaceCreate_nid_postfix(const char* name, void* base,
     const auto first = start + ArenaHeaderBytes;
     const auto last = start + (size & ~(Granule - 1));
     AddFree(*arena, first, last);
+    if (Tracing()) std::fprintf(stderr, "[mspace] create %s: 0x%llx+0x%zx flags 0x%x (caller %p)\n", name ? name : "", static_cast<unsigned long long>(start), size, flags, __builtin_return_address(0));
     arenas.emplace(start, std::move(arena));
     return base;
 }
 
 int APS5_VABI sceLibcMspaceDestroy_nid_postfix(void* handle) {
     std::lock_guard lock(arenaMutex);
+    if (Tracing()) std::fprintf(stderr, "[mspace] destroy %p (caller %p)\n", handle, __builtin_return_address(0));
     if (arenas.erase(reinterpret_cast<std::uintptr_t>(handle)) != 0) return 0;
     Error(22);
     return -1;
@@ -187,7 +218,10 @@ int APS5_VABI sceLibcMspaceDestroy_nid_postfix(void* handle) {
 
 void* APS5_VABI sceLibcMspaceMalloc_nid_postfix(void* handle, std::size_t size) {
     std::lock_guard lock(arenaMutex);
-    return Allocate(Find(handle), size, Granule);
+    auto* arena = Find(handle);
+    void* result = Allocate(arena, size, Granule);
+    TraceAllocation("malloc", arena, size, Granule, result, __builtin_return_address(0));
+    return result;
 }
 
 void APS5_VABI sceLibcMspaceFree_nid_postfix(void* handle, void* pointer) {
@@ -204,7 +238,9 @@ void* APS5_VABI sceLibcMspaceCalloc_nid_postfix(void* handle, std::size_t count,
         return nullptr;
     }
     std::lock_guard lock(arenaMutex);
-    void* result = Allocate(Find(handle), count * size, Granule);
+    auto* arena = Find(handle);
+    void* result = Allocate(arena, count * size, Granule);
+    TraceAllocation("calloc", arena, count * size, Granule, result, __builtin_return_address(0));
     if (result) std::memset(result, 0, count * size);
     return result;
 }
@@ -238,6 +274,7 @@ void* APS5_VABI sceLibcMspaceRealloc_nid_postfix(void* handle, void* pointer, st
     }
     const auto previousSize = chunk->second.requested;
     void* result = Allocate(arena, size, Granule);
+    TraceAllocation("realloc", arena, size, Granule, result, __builtin_return_address(0));
     if (result) {
         std::memcpy(result, pointer, previousSize);
         Release(*arena, arena->chunks.find(start));
@@ -252,6 +289,7 @@ int APS5_VABI sceLibcMspacePosixMemalign_nid_postfix(void* handle, void** result
     auto* arena = Find(handle);
     if (!arena) return 22;
     void* pointer = Allocate(arena, size, alignment);
+    TraceAllocation("posix_memalign", arena, size, alignment, pointer, __builtin_return_address(0));
     if (!pointer) return 12;
     *result = pointer;
     return 0;
@@ -263,7 +301,10 @@ void* APS5_VABI sceLibcMspaceMemalign_nid_postfix(void* handle, std::size_t alig
         return nullptr;
     }
     std::lock_guard lock(arenaMutex);
-    return Allocate(Find(handle), size, alignment);
+    auto* arena = Find(handle);
+    void* result = Allocate(arena, size, alignment);
+    TraceAllocation("memalign", arena, size, alignment, result, __builtin_return_address(0));
+    return result;
 }
 
 void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void* handle, void* pointer, std::size_t size, std::size_t alignment) {
@@ -287,6 +328,7 @@ void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void* handle, void* pointe
     }
     const auto previousSize = chunk->second.requested;
     void* result = Allocate(arena, size, effective);
+    TraceAllocation("reallocalign", arena, size, effective, result, __builtin_return_address(0));
     if (result) {
         std::memcpy(result, pointer, std::min(previousSize, size));
         Release(*arena, arena->chunks.find(start));

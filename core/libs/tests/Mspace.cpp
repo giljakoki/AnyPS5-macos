@@ -159,10 +159,16 @@ int main() {
     Require(inner > region && inner < static_cast<unsigned char*>(region) + 8192);
     Require(sceLibcMspaceMallocUsableSize_nid_postfix(inner) == 64 && sceLibcMspaceMallocUsableSize_nid_postfix(region) == 8192);
     Require(sceLibcMspaceCreate_nid_postfix("flags", storage.data(), storage.size(), 2) == nullptr);
+    Require(sceLibcMspaceCreate_nid_postfix("flags", storage.data(), storage.size(), 8) == nullptr);
     Require(sceLibcMspaceDestroy_nid_postfix(nested) == 0);
     sceLibcMspaceFree_nid_postfix(arena, region);
     Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
     Require(sceLibcMspaceMalloc_nid_postfix(arena, 8) == nullptr);
     Require(sceLibcMspaceCreate_nid_postfix("reuse", storage.data(), storage.size(), 0) == arena);
+    Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
+    Require(sceLibcMspaceCreate_nid_postfix("quiet", storage.data(), storage.size(), 5) == arena);
+    void* quiet = sceLibcMspaceMalloc_nid_postfix(arena, 48);
+    Require(quiet != nullptr && sceLibcMspaceMallocStatsFast_nid_postfix(arena, &stats) == 0 && stats.currentInuseSize >= 48);
+    sceLibcMspaceFree_nid_postfix(arena, quiet);
     Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
 }
