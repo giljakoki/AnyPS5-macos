@@ -6,6 +6,8 @@
 #include "prx/libc/include/FilesystemError.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -21,6 +23,11 @@ extern "C" {
 #include <libavutil/mem.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
+}
+
+static bool TraceIo() {
+    static const bool enabled = std::getenv("APS5_TRACE_AVPLAYER") != nullptr;
+    return enabled;
 }
 
 namespace AvPlayer {
@@ -91,6 +98,7 @@ public:
         if (file.open(file.object_ptr, path.c_str()) < 0) return false;
         opened = true;
         size = file.size(file.object_ptr);
+        if (TraceIo()) std::fprintf(stderr, "[avplayer] file %s size %llu\n", path.c_str(), static_cast<unsigned long long>(size));
         auto* buffer = static_cast<std::uint8_t*>(av_malloc(AvioBufferSize));
         if (!buffer) return false;
         context = avio_alloc_context(buffer, AvioBufferSize, 0, this, &FileReplacementStream::read, nullptr, &FileReplacementStream::seek);
@@ -106,6 +114,10 @@ private:
         if (self->position >= self->size) return AVERROR_EOF;
         const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint64_t>(size), self->size - self->position));
         const auto read = self->file.read_offset(self->file.object_ptr, buffer, self->position, length);
+        if (TraceIo()) {
+            static unsigned count = 0;
+            if (++count <= 24 || read != static_cast<int>(length)) std::fprintf(stderr, "[avplayer] read offset %llu length %u -> %d (#%u)\n", static_cast<unsigned long long>(self->position), length, read, count);
+        }
         if (read < 0) return AVERROR(EIO);
         if (read == 0) return AVERROR_EOF;
         self->position += static_cast<std::uint64_t>(read);
@@ -123,6 +135,10 @@ private:
         default: return -1;
         }
         const auto target = std::clamp<std::int64_t>(base + offset, 0, static_cast<std::int64_t>(self->size));
+        if (TraceIo()) {
+            static unsigned count = 0;
+            if (++count <= 24) std::fprintf(stderr, "[avplayer] seek whence %d offset %lld -> %lld (#%u)\n", whence & ~AVSEEK_FORCE, static_cast<long long>(offset), static_cast<long long>(target), count);
+        }
         self->position = static_cast<std::uint64_t>(target);
         return target;
     }
