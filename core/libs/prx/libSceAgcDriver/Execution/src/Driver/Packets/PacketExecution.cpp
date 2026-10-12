@@ -148,7 +148,7 @@ void Driver::execute(const Submission& submission) {
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
         timing.Mark("flush_between_packets");
-        PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
+        PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : header & 0xfffcu, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 
         if (profilePackets) {
             packetStartedAt() = packetTimer.start;

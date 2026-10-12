@@ -408,7 +408,7 @@ void ThreadCancel::EndWait() {
 }
 
 static void RunThread(std::unique_ptr<ThreadArgs> args) {
-    APS5_LOG_OUT("RunThread entry=0x%llx arg=%p self=%p", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(args->entry)), args->arg, static_cast<void*>(args->self));
+    APS5_LOG_OUT("RunThread entry=0x%llx arg=%p self=%p name=%s", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(args->entry)), args->arg, static_cast<void*>(args->self), args->self->name.c_str());
     const auto entry = args->entry;
     void* arg = args->arg;
     PthreadPrivate* self = args->self;
