@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <mutex>
@@ -170,10 +171,22 @@ void ApplicationHeapInitialize_nid_no_patch(const void* processParameters) {
     if (heapFailure) std::rethrow_exception(heapFailure);
 }
 
+void TraceLargeAllocation(const char* what, std::size_t bytes, const void* result, const void* caller) {
+    static const bool trace = std::getenv("APS5_TRACE_MEMORY") != nullptr;
+    if (!trace) return;
+    static std::atomic<std::uint64_t> total{0}, calls{0};
+    total.fetch_add(bytes, std::memory_order_relaxed);
+    const auto count = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (bytes >= (1u << 20) || result == nullptr || count % 100000 == 0)
+        std::fprintf(stderr, "[heap] %s %zu bytes -> %p (caller %p, %llu calls, %llu MiB requested so far)\n", what, bytes, result, caller, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total.load(std::memory_order_relaxed) >> 20));
+}
+
 void* ApplicationHeapAllocate_nid_no_patch(std::size_t bytes) {
     const auto allocate = callback<Allocate>(0);
     CallbackScope scope;
-    return requireAllocation(allocate(bytes), bytes);
+    void* result = allocate(bytes);
+    TraceLargeAllocation("allocate", bytes, result, __builtin_return_address(0));
+    return requireAllocation(result, bytes);
 }
 
 void ApplicationHeapFree_nid_no_patch(void* pointer) {
@@ -190,14 +203,18 @@ void* ApplicationHeapReallocate_nid_no_patch(void* pointer, std::size_t bytes) {
     }
     const auto reallocate = callback<Reallocate>(3);
     CallbackScope scope;
-    return requireAllocation(reallocate(pointer, bytes), bytes);
+    void* result = reallocate(pointer, bytes);
+    TraceLargeAllocation("reallocate", bytes, result, __builtin_return_address(0));
+    return requireAllocation(result, bytes);
 }
 
 void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes) {
     requireAlignment(alignment);
     const auto align = callback<Align>(4);
     CallbackScope scope;
-    void* pointer = requireAllocation(align(alignment, bytes), bytes);
+    void* aligned = align(alignment, bytes);
+    TraceLargeAllocation("align", bytes, aligned, __builtin_return_address(0));
+    void* pointer = requireAllocation(aligned, bytes);
     if (reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");
     return pointer;
 }
