@@ -88,6 +88,7 @@ public:
             av_freep(&context->buffer);
             avio_context_free(&context);
         }
+        if (TraceIo()) std::fprintf(stderr, "[avplayer] close opened=%d reads=%u furthest=%llu\n", opened ? 1 : 0, reads, static_cast<unsigned long long>(furthest));
         if (opened) file.close(file.object_ptr);
     }
 
@@ -95,7 +96,9 @@ public:
     FileReplacementStream& operator=(const FileReplacementStream&) = delete;
 
     bool Open(const std::string& path) {
-        if (file.open(file.object_ptr, path.c_str()) < 0) return false;
+        const int openResult = file.open(file.object_ptr, path.c_str());
+        if (TraceIo()) std::fprintf(stderr, "[avplayer] open %s -> %d\n", path.c_str(), openResult);
+        if (openResult < 0) return false;
         opened = true;
         size = file.size(file.object_ptr);
         if (TraceIo()) std::fprintf(stderr, "[avplayer] file %s size %llu\n", path.c_str(), static_cast<unsigned long long>(size));
@@ -120,6 +123,7 @@ private:
         if (read < 0) return AVERROR(EIO);
         if (read == 0) return AVERROR_EOF;
         self->position += static_cast<std::uint64_t>(read);
+        self->furthest = std::max(self->furthest, self->position);
         return read;
     }
 
@@ -147,6 +151,7 @@ private:
     std::uint64_t position = 0;
     unsigned reads = 0;
     unsigned seeks = 0;
+    std::uint64_t furthest = 0;
     AVIOContext* context = nullptr;
 };
 

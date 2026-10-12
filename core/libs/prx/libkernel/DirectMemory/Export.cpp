@@ -32,6 +32,7 @@
 #include <iterator>
 #include <map>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 extern "C" std::uint64_t GuestImageSegmentBytes_nid_no_patch();
@@ -132,7 +133,9 @@ int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search
   || (len & (PS5_PAGE_SIZE - 1)) || !phys_addr_out
   || (alignment != 0 && (alignment & (PS5_PAGE_SIZE - 1))))
   return SCE_KERNEL_ERROR_EINVAL;
- return DirectMemoryAlloc(search_start, search_end, len, alignment, memory_type, phys_addr_out);
+ const int result = DirectMemoryAlloc(search_start, search_end, len, alignment, memory_type, phys_addr_out);
+ if (result != 0 && std::getenv("APS5_TRACE_MEMORY") != nullptr) std::fprintf(stderr, "[memory] allocate physical failed: search 0x%llx..0x%llx len 0x%zx align 0x%zx type %d -> 0x%x\n", static_cast<unsigned long long>(search_start), static_cast<unsigned long long>(search_end), len, alignment, memory_type, static_cast<unsigned>(result));
+ return result;
 }
 
 int APS5_VABI sceKernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type, int64_t* phys_addr_out) {
@@ -143,7 +146,11 @@ int APS5_VABI sceKernelAvailableDirectMemorySize(int64_t search_start, int64_t s
  if (!phys_addr_out || !size_out) return SCE_KERNEL_ERROR_EINVAL;
  int64_t start = 0;
  size_t size = 0;
- if (!DirectMemoryLargestFree(search_start, search_end, alignment, &start, &size)) { *phys_addr_out = 0; *size_out = 0; return SCE_KERNEL_ERROR_EAGAIN; }
+ if (!DirectMemoryLargestFree(search_start, search_end, alignment, &start, &size)) {
+  if (std::getenv("APS5_TRACE_MEMORY") != nullptr) std::fprintf(stderr, "[memory] available direct memory: none in 0x%llx..0x%llx align 0x%zx\n", static_cast<unsigned long long>(search_start), static_cast<unsigned long long>(search_end), alignment);
+  *phys_addr_out = 0; *size_out = 0; return SCE_KERNEL_ERROR_EAGAIN;
+ }
+ if (std::getenv("APS5_TRACE_MEMORY") != nullptr) std::fprintf(stderr, "[memory] available direct memory: 0x%llx+0x%zx in 0x%llx..0x%llx\n", static_cast<unsigned long long>(start), size, static_cast<unsigned long long>(search_start), static_cast<unsigned long long>(search_end));
  *phys_addr_out = start;
  *size_out = size;
  return 0;
