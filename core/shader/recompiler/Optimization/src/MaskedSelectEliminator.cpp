@@ -360,6 +360,93 @@ bool everyRunningLane(const IrValue* value, std::uint32_t waveSize, std::uint32_
     return bit && runningLanesWord(bit->low, 0u, depth) && (waveSize == 32u || runningLanesWord(bit->high, 1u, depth));
 }
 
+const IrValue* ballotOfWord(const IrValue* word, std::uint32_t half, std::uint32_t depth) {
+    word = word->Resolve();
+    if (depth > DepthLimit) return nullptr;
+    if (word->IsPhi()) {
+        const IrValue* common = nullptr;
+        for (std::size_t index = 0; index < word->ArgumentCount(); ++index) {
+            const IrValue* incoming = word->Argument(index)->Resolve();
+            if (incoming == word) continue;
+            const IrValue* ballot = ballotOfWord(incoming, half, depth + 1u);
+            if (ballot == nullptr || (common != nullptr && ballot != common)) return nullptr;
+            common = ballot;
+        }
+        return common;
+    }
+    if (word->Opcode() == IrOpcode::BitwiseAnd32) {
+        if (allLanesWord(word->Argument(1), half)) return ballotOfWord(word->Argument(0), half, depth + 1u);
+        if (allLanesWord(word->Argument(0), half)) return ballotOfWord(word->Argument(1), half, depth + 1u);
+        return nullptr;
+    }
+    if (word->Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediate(word->Argument(1)->Resolve(), half)) return nullptr;
+    const IrValue* ballot = word->Argument(0)->Resolve();
+    return ballot->Opcode() == IrOpcode::Ballot ? ballot : nullptr;
+}
+
+struct OwnLaneMask {
+    const IrValue* mask = nullptr;
+    bool hostLanesOnly = false;
+};
+
+OwnLaneMask ownLaneMask(const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth = 0) {
+    mask = mask->Resolve();
+    if (mask->HasImmediate() || depth > DepthLimit) return {mask, false};
+    if (mask->IsPhi()) {
+        OwnLaneMask common;
+        for (std::size_t index = 0; index < mask->ArgumentCount(); ++index) {
+            const IrValue* incoming = mask->Argument(index)->Resolve();
+            if (incoming == mask) continue;
+            const OwnLaneMask own = ownLaneMask(incoming, waveSize, depth + 1u);
+            if (common.mask != nullptr && own.mask != common.mask) return {mask, false};
+            common.mask = own.mask;
+            common.hostLanesOnly = common.hostLanesOnly || own.hostLanesOnly;
+        }
+        return common.mask != nullptr ? common : OwnLaneMask{mask, false};
+    }
+    const auto bit = threadBit(mask, waveSize);
+    if (!bit) return {mask, false};
+    const IrValue* ballot = ballotOfWord(bit->low, 0u, depth);
+    if (ballot == nullptr || (waveSize != 32u && ballotOfWord(bit->high, 1u, depth) != ballot)) return {mask, false};
+    return {ownLaneMask(ballot->Argument(0), waveSize, depth + 1u).mask, true};
+}
+
+bool hostLanesWord(const IrValue* word, std::uint32_t half, std::uint32_t depth) {
+    word = word->Resolve();
+    if (depth > DepthLimit) return false;
+    if (word->IsPhi()) {
+        bool incomings = false;
+        for (std::size_t index = 0; index < word->ArgumentCount(); ++index) {
+            const IrValue* incoming = word->Argument(index)->Resolve();
+            if (incoming == word) continue;
+            if (!hostLanesWord(incoming, half, depth + 1u)) return false;
+            incomings = true;
+        }
+        return incomings;
+    }
+    if (word->Opcode() == IrOpcode::BitwiseAnd32) return hostLanesWord(word->Argument(0), half, depth + 1u) || hostLanesWord(word->Argument(1), half, depth + 1u);
+    return word->Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediate(word->Argument(1)->Resolve(), half) && word->Argument(0)->Resolve()->Opcode() == IrOpcode::Ballot;
+}
+
+bool falseOffHost(const IrValue* value, std::uint32_t waveSize, std::uint32_t depth = 0) {
+    value = value->Resolve();
+    if (value->HasImmediate()) return value->Type() == IrType::Bool && !value->ImmediateBool();
+    if (depth > DepthLimit) return false;
+    if (value->Opcode() == IrOpcode::LogicalAnd) return falseOffHost(value->Argument(0), waveSize, depth + 1u) || falseOffHost(value->Argument(1), waveSize, depth + 1u);
+    if (value->IsPhi()) {
+        bool incomings = false;
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+            const IrValue* incoming = value->Argument(index)->Resolve();
+            if (incoming == value) continue;
+            if (!falseOffHost(incoming, waveSize, depth + 1u)) return false;
+            incomings = true;
+        }
+        return incomings;
+    }
+    const auto bit = threadBit(value, waveSize);
+    return bit && hostLanesWord(bit->low, 0u, depth) && (waveSize == 32u || hostLanesWord(bit->high, 1u, depth));
+}
+
 const IrValue* quadWordOfPredicate(const IrValue* predicate, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth);
 
 const IrValue* quadWord(const IrValue* word, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth) {
@@ -661,12 +748,16 @@ class MaskedLaneWalk {
 public:
     MaskedLaneWalk(const IrProgram& program, const std::vector<Region>& regions) : program(program), regions(regions), uniform(uniformEntryBlocks(program)), limit(walkLimit(program)), implications(regions, uniform, program.WaveSize(), work) {}
 
-    bool UnobservedWhereMasked(const IrValue& select, const IrValue* mask) {
+    bool UnobservedWhereMasked(const IrValue& select, const OwnLaneMask& own) {
+        const IrValue* mask = own.mask;
         const bool acrossLoops = mask->HasImmediate() || regionOf(regions, mask->Parent()) == Region::Once;
         work = limit;
         implications.Reset(mask, acrossLoops);
         const bool running = implications.HoldsForRunningLanes();
         const bool quadMasked = program.Resources().stage == IrShaderStage::Pixel && (running || wholeQuadSource(mask, program.WaveSize()) != nullptr);
+        const auto impliesMask = [&](const IrValue* condition) {
+            return implications.Implies(condition) && (!own.hostLanesOnly || falseOffHost(condition, program.WaveSize()));
+        };
         startVisits();
         pending.clear();
         pending.push_back(&select);
@@ -677,8 +768,8 @@ public:
             for (const IrUse& use : value->OperandUses()) {
                 const IrValue* user = use.user;
                 if (!followable(regions, user->Parent(), acrossLoops)) return false;
-                if (isSelect(user->Opcode()) && use.operand == 1u && implications.Implies(user->Argument(0))) continue;
-                if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implications.Implies(user->Argument(1u - use.operand))) continue;
+                if (isSelect(user->Opcode()) && use.operand == 1u && impliesMask(user->Argument(0))) continue;
+                if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && impliesMask(user->Argument(1u - use.operand))) continue;
                 if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && (running || implications.Implies(user->Argument(user->ArgumentCount() - 1u)))) continue;
                 if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user) && !(quadMasked && user->Opcode() == IrOpcode::ImageSampleRaw)) return false;
                 if (firstVisit(*user)) {
@@ -734,8 +825,8 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
                 --it;
                 IrValue* inst = *it;
                 if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses()) continue;
-                const IrValue* mask = inst->Argument(0)->Resolve();
-                if (!alwaysTrue(mask, program.WaveSize()) && (!single || !walk.UnobservedWhereMasked(*inst, mask))) continue;
+                const OwnLaneMask mask = ownLaneMask(inst->Argument(0), program.WaveSize());
+                if ((mask.hostLanesOnly || !alwaysTrue(mask.mask, program.WaveSize())) && (!single || !walk.UnobservedWhereMasked(*inst, mask))) continue;
                 inst->ReplaceAllUsesWith(inst->Argument(1));
                 inst->Invalidate();
                 inst->SetParent(nullptr);

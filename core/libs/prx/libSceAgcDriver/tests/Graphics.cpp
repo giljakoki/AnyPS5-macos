@@ -3719,6 +3719,11 @@ void barycentricEmulationTests() {
     static constexpr std::array<std::uint32_t, 15> restoresExecCopy{0xbe90047eu, 0xbefe0a7eu, 0xbf071080u, 0xbf840004u, 0xbeea047eu, 0x7c3804f0u, 0x7e0402f2u, 0xbefe046au, 0xc8000000u, 0xc8010001u, 0x10000500u, 0xbefe0410u, 0xf800180fu, 0x00000000u, 0xbf810000u};
     const auto restored = compile(restoresExecCopy, false);
     Require(!restored.barycentricEmulation.active && !barycentricCapability(restored), "interpolating into the I VGPR after a branched v_cmpx region that restores EXEC from its copy lost host interpolation");
+    static constexpr std::array<std::uint32_t, 16> packsAfterRestoredOrSkippedRegion{0xbe8c047eu, 0x7d840480u, 0xbf870007u, 0xc8080000u, 0xc8090001u, 0xbeea047eu, 0x7c2204f2u, 0xbf880001u, 0x7e0402f2u, 0xbefe046au, 0x5e000502u, 0x5e020502u, 0xbefe040cu, 0xf8001c0fu, 0x00000100u, 0xbf810000u};
+    const auto packed = compile(packsAfterRestoredOrSkippedRegion, false);
+    Require(!packed.barycentricEmulation.active && !barycentricCapability(packed), "overwriting the I/J VGPRs at a join whose EXEC is the entry EXEC on one edge and its copy restored after a v_cmpx region on the other, exported under the saved entry EXEC, lost host interpolation");
+    static constexpr std::array<std::uint32_t, 14> packsAfterNarrowedOrSkippedRegion{0xbe8c047eu, 0x7d840480u, 0xbf870005u, 0xc8080000u, 0xc8090001u, 0x7c2204f2u, 0xbf880001u, 0x7e0402f2u, 0x5e000502u, 0x5e020502u, 0xbefe040cu, 0xf8001c0fu, 0x00000100u, 0xbf810000u};
+    Require(compile(packsAfterNarrowedOrSkippedRegion, false).barycentricEmulation.active, "overwriting the I/J VGPRs at a join whose EXEC stays narrowed by v_cmpx on one edge, exported under the saved entry EXEC, lost exact barycentrics");
     static constexpr std::array<std::uint32_t, 7> widensExec{0xbefe0381u, 0xc8080000u, 0xbefe03c1u, 0xc8090001u, 0xf800180fu, 0x02020202u, 0xbf810000u};
     Require(compile(widensExec, false).barycentricEmulation.active, "v_interp_p2_f32 under a wider EXEC than its v_interp_p1_f32 lost exact barycentrics");
     static constexpr std::array<std::uint32_t, 6> sharedSlot{0xc8080000u, 0xc8090001u, 0xc80e0402u, 0xf800180fu, 0x03030202u, 0xbf810000u};
