@@ -22,6 +22,8 @@ struct HitchWork {
     double waitMs = 0;
     std::string slowest;
     double slowestMs = 0;
+    std::string longestWait;
+    double longestWaitMs = 0;
 };
 
 class FrameHitchTracker {

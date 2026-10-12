@@ -48,9 +48,9 @@ std::optional<std::string> FrameHitchTracker::WorkFinished(const HitchWork& work
     workBusyMs += work.busyMs;
     workWaitMs += work.waitMs;
     if (work.busyMs >= longestWork.busyMs) longestWork = work;
-    if (work.busyMs < thresholdMs) return std::nullopt;
-    char text[320];
-    std::snprintf(text, sizeof(text), "[hitch] queue 0 submission %llu: %.1f ms of packets, %.1f ms waiting; slowest %s %.1f ms\n", static_cast<unsigned long long>(work.serial), work.busyMs, work.waitMs, work.slowest.empty() ? "none" : work.slowest.c_str(), work.slowestMs);
+    if (work.busyMs < thresholdMs && work.longestWaitMs < thresholdMs) return std::nullopt;
+    char text[384];
+    std::snprintf(text, sizeof(text), "[hitch] queue 0 submission %llu: %.1f ms of packets, %.1f ms waiting; slowest %s %.1f ms, longest wait %s %.1f ms\n", static_cast<unsigned long long>(work.serial), work.busyMs, work.waitMs, work.slowest.empty() ? "none" : work.slowest.c_str(), work.slowestMs, work.longestWait.empty() ? "none" : work.longestWait.c_str(), work.longestWaitMs);
     return std::string(text);
 }
 
@@ -66,8 +66,8 @@ double ParseHitchThresholdMs(const char* text) {
 FrameHitchTracker* FrameHitches() {
     static const double threshold = ParseHitchThresholdMs(std::getenv("APS5_TRACE_HITCHES"));
     if (threshold == 0) return nullptr;
-    static FrameHitchTracker tracker(threshold);
-    return &tracker;
+    static auto* const tracker = new FrameHitchTracker(threshold);
+    return tracker;
 }
 
 }

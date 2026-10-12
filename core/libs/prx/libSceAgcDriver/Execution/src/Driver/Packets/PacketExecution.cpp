@@ -327,8 +327,13 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         if (hitches != nullptr) {
             const auto packetMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - packetTimer.start).count();
-            if (waitPacket) hitchWork.waitMs += packetMs;
-            else {
+            if (waitPacket) {
+                hitchWork.waitMs += packetMs;
+                if (packetMs > hitchWork.longestWaitMs) {
+                    hitchWork.longestWaitMs = packetMs;
+                    hitchWork.longestWait = Pm4::Name(header);
+                }
+            } else {
                 hitchWork.busyMs += packetMs;
                 if (packetMs > hitchWork.slowestMs) {
                     hitchWork.slowestMs = packetMs;

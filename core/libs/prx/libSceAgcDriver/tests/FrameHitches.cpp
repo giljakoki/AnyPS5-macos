@@ -24,7 +24,7 @@ void PeriodTests() {
     Require(!tracker.FlipSubmitted(At(base, 0, 14, 13, 0)).has_value(), "the first flip has no period to report");
     Require(!tracker.FlipSubmitted(At(base, 16.7, 30, 12, 0)).has_value(), "a 16.7 ms frame is below a 25 ms threshold");
     tracker.OtherSubmitted();
-    tracker.WorkFinished({7, 4, 12, "DRAW_INDEX_2", 0.5});
+    tracker.WorkFinished({7, 4, 12, "DRAW_INDEX_2", 0.5, "WAIT_FLIP_DONE", 11});
     const auto report = tracker.FlipSubmitted(At(base, 76.7, 80, 3, 0));
     Require(report.has_value(), "a 60 ms frame must be reported");
     Require(report->find("60.0 ms between flip submissions") != std::string::npos, "the report must give the period: " + *report);
@@ -37,9 +37,11 @@ void PeriodTests() {
 
 void WorkTests() {
     FrameHitchTracker tracker(25);
-    Require(!tracker.WorkFinished({1, 24.9, 0, "flip", 1}).has_value(), "work below the threshold is quiet");
-    const auto report = tracker.WorkFinished({2, 30, 5, "DRAW_INDEX_AUTO", 28});
-    Require(report.has_value() && report->find("submission 2: 30.0 ms of packets, 5.0 ms waiting; slowest DRAW_INDEX_AUTO 28.0 ms") != std::string::npos, "long work must be reported");
+    Require(!tracker.WorkFinished({1, 24.9, 20, "flip", 1, "WAIT_FLIP_DONE", 20}).has_value(), "work and waits below the threshold are quiet");
+    const auto report = tracker.WorkFinished({2, 30, 5, "DRAW_INDEX_AUTO", 28, "WAIT_REG_MEM", 5});
+    Require(report.has_value() && report->find("submission 2: 30.0 ms of packets, 5.0 ms waiting; slowest DRAW_INDEX_AUTO 28.0 ms, longest wait WAIT_REG_MEM 5.0 ms") != std::string::npos, "long work must be reported");
+    const auto waited = tracker.WorkFinished({3, 1, 40, "flip", 0.4, "WAIT_FLIP_DONE", 38});
+    Require(waited.has_value() && waited->find("longest wait WAIT_FLIP_DONE 38.0 ms") != std::string::npos, "a long wait must be reported");
 }
 
 void ParseTests() {
