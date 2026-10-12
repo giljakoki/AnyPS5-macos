@@ -37,6 +37,7 @@ unsigned frees = 0;
 bool fail = false;
 bool recurse = false;
 bool nullPosixResult = false;
+bool failInitialize = false;
 
 void require(bool condition) {
     if (!condition) throw std::runtime_error("application heap test failed");
@@ -49,8 +50,8 @@ void reject(TAction action) {
     require(rejected);
 }
 
-void APS5_VABI initialize() { ++initializes; }
-void APS5_VABI finalize() { require(initializes == 1); }
+int APS5_VABI initialize() { ++initializes; return failInitialize ? 1 : 0; }
+int APS5_VABI finalize() { require(initializes == 1); return 0; }
 void APS5_VABI exitCallbackAllocates() {
     if (ApplicationHeapAllocate_nid_no_patch(16) != storage.data()) throw std::runtime_error("application heap test failed");
 }
@@ -124,6 +125,15 @@ int main(int argc, char** argv) {
     write(replacement, 0x40, &align);
     write(replacement, 0x48, &realign);
     write(replacement, 0x50, &posixAlign);
+    if (argc > 1 && std::strcmp(argv[1], "initializer-failure") == 0) {
+        failInitialize = true;
+        reject([&] { ApplicationHeapInitialize_nid_no_patch(process.data()); });
+        require(initializes == 1);
+        reject([] { ApplicationHeapAllocate_nid_no_patch(64); });
+        reject([&] { ApplicationHeapInitialize_nid_no_patch(process.data()); });
+        require(initializes == 1);
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "exit-order") == 0) {
         require(atexit_nid_postfix(exitCallbackAllocates) == 0);
         ApplicationHeapInitialize_nid_no_patch(process.data());
