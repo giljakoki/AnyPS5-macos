@@ -11,6 +11,40 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+struct DrawCacheGovernor {
+    static constexpr std::uint32_t Window = 4096;
+    static constexpr std::uint32_t MinimumHits = 41;
+    static constexpr std::uint32_t Pause = 16384;
+    std::uint32_t lookups = 0;
+    std::uint32_t hits = 0;
+    std::uint32_t paused = 0;
+
+    bool Use() {
+        static const bool disabled = std::getenv("APS5_NO_DRAW_CACHE_GOVERNOR") != nullptr;
+        if (disabled || paused == 0) return true;
+        --paused;
+        return false;
+    }
+
+    void Note(bool hit) {
+        ++lookups;
+        if (hit) ++hits;
+        if (lookups < Window) return;
+        if (hits < MinimumHits) {
+            paused = Pause;
+            std::fprintf(stderr, "[draw-cache] %u of the last %u lookups hit: draw entries are skipped for the next %u draws of this queue\n", hits, Window, Pause);
+        }
+        lookups = 0;
+        hits = 0;
+    }
+};
+
+thread_local DrawCacheGovernor drawCacheGovernor;
+
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -64,7 +98,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0 && drawCacheGovernor.Use();
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -173,6 +207,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
+    if (useDrawEntries) drawCacheGovernor.Note(drawHit);
 
     if (registerKey) {
 
