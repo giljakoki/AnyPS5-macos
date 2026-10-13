@@ -192,6 +192,104 @@ private:
 #endif
 };
 
+class LockWaiters {
+public:
+    LockWaiters() = default;
+    LockWaiters(const LockWaiters&) = delete;
+    LockWaiters& operator=(const LockWaiters&) = delete;
+
+    template <class TTryLock>
+    void Acquire(TTryLock tryLock) {
+        if (tryLock()) return;
+        RaiseCritical critical(CurrentRaiseState());
+        std::unique_lock guard(lock);
+        Waiting waiting(waiters);
+        while (!tryLock()) released.Wait(guard);
+    }
+
+    template <class TTryLock>
+    bool AcquireUntil(std::uint64_t deadlineNanos, TTryLock tryLock) {
+        if (tryLock()) return true;
+        RaiseCritical critical(CurrentRaiseState());
+        std::unique_lock guard(lock);
+        Waiting waiting(waiters);
+        while (!tryLock()) {
+            if (!released.WaitUntil(guard, deadlineNanos)) return tryLock();
+        }
+        return true;
+    }
+
+    void Released() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (waiters.load(std::memory_order_seq_cst) == 0) return;
+        RaiseCritical critical(CurrentRaiseState());
+        std::lock_guard guard(lock);
+        released.NotifyAll();
+    }
+
+private:
+    struct Waiting {
+        explicit Waiting(std::atomic<int>& count) : count(count) {
+            count.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
+        ~Waiting() { count.fetch_sub(1, std::memory_order_seq_cst); }
+        Waiting(const Waiting&) = delete;
+        Waiting& operator=(const Waiting&) = delete;
+        std::atomic<int>& count;
+    };
+
+    std::mutex lock;
+    Condition released;
+    std::atomic<int> waiters{0};
+};
+
+template <class TNative>
+class GuestLock {
+public:
+    void lock() {
+#ifdef __APPLE__
+        waiters.Acquire([this] { return native.try_lock(); });
+#else
+        native.lock();
+#endif
+    }
+
+    bool try_lock() { return native.try_lock(); }
+
+    bool try_lock_for(std::chrono::microseconds timeout) {
+#ifdef __APPLE__
+        return waiters.AcquireUntil(DeadlineNanos(timeout.count() > 0 ? static_cast<std::uint64_t>(timeout.count()) : 0), [this] { return native.try_lock(); });
+#else
+        return native.try_lock_for(timeout);
+#endif
+    }
+
+    template <class TClock, class TDuration>
+    bool try_lock_until(const std::chrono::time_point<TClock, TDuration>& deadline) {
+#ifdef __APPLE__
+        const auto now = TClock::now();
+        if (deadline <= now) return native.try_lock();
+        return try_lock_for(std::chrono::ceil<std::chrono::microseconds>(deadline - now));
+#else
+        return native.try_lock_until(deadline);
+#endif
+    }
+
+    void unlock() {
+        native.unlock();
+#ifdef __APPLE__
+        waiters.Released();
+#endif
+    }
+
+private:
+    TNative native;
+#ifdef __APPLE__
+    LockWaiters waiters;
+#endif
+};
+
 }  // namespace TimedWait
 
 #endif
