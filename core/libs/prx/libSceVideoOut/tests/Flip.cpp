@@ -667,6 +667,56 @@ void testFlipAfterGpuWork() {
     LibcRunShutdown_nid_postfix();
 }
 
+void testEarlyFirstFlip() {
+    check(VideoOutDriver::Get().EarlyFlipEvents(), "APS5_EARLY_FIRST_FLIPS=1 did not enable early flip events");
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    std::vector<std::byte> allocation(6 * 65536 + 65535);
+    const auto storage = alignedBuffer(allocation);
+    fillBuffer(storage, 259, 137);
+    VideoOutBuffers buffer{storage.data(), nullptr, {nullptr, nullptr}};
+    VideoOutBufferAttribute2 attribute{};
+    sceVideoOutSetBufferAttribute2(&attribute, 0x8000000000000000ull, 0, 259, 137, 0, 0, 0);
+    sceVideoOutRegisterBuffers2(handle, 0, 0, &buffer, 1, &attribute, 0, nullptr);
+    constexpr std::uint32_t iterations = 100000000u;
+    auto busy = prepareBusyLoop(iterations);
+    auto& label = *busy.label;
+    Packet packet{busy.commands.data(), static_cast<std::uint32_t>(busy.commands.size()), 0, {}};
+    std::atomic<std::int64_t> landed{0};
+    const auto start = std::chrono::steady_clock::now();
+    const auto since = [&] { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count(); };
+    std::thread poller([&] {
+        while (label != 1 && since() < 30000000) std::this_thread::yield();
+        if (label == 1) landed.store(since());
+    });
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "the GPU work was not accepted");
+    check(sceVideoOutSubmitFlip(handle, 0, 1, 7) == 0, "the first flip was not accepted");
+    std::int64_t flipped = 0;
+    {
+        std::unique_lock lock(cfg->mutex);
+        const bool done = cfg->vblankCond.wait_for(lock, std::chrono::seconds(30), [&] { return cfg->failure || cfg->flipStatus.count == 1; });
+        flipped = since();
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(done, "the first flip did not complete");
+        check(cfg->flipStatus.flipArg == 7 && cfg->flipStatus.flipPendingNum == 0, "the early flip status is wrong");
+    }
+    poller.join();
+    std::printf("GPU work landed at %.1f ms, early flip event at %.1f ms\n", landed.load() / 1000.0, flipped / 1000.0);
+    check(landed.load() >= 100000, "the GPU work did not land or was too short to order against the flip");
+    check(flipped + 20000 >= landed.load(), "the early flip event came before the GPU work submitted ahead of it");
+    check(sceVideoOutSubmitFlip(handle, 0, 1, 8) == 0, "the second flip was not accepted");
+    {
+        std::unique_lock lock(cfg->mutex);
+        const bool done = cfg->vblankCond.wait_for(lock, std::chrono::seconds(30), [&] { return cfg->failure || cfg->flipStatus.count == 2; });
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(done && cfg->flipStatus.flipArg == 8 && cfg->flipStatus.flipPendingNum == 0, "the flip after the first present did not complete");
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    sceVideoOutUnregisterBuffers(handle, 0);
+    sceVideoOutClose(handle);
+    LibcRunShutdown_nid_postfix();
+}
+
 void testOneDevice() {
     const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
@@ -714,6 +764,7 @@ int runTests(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "dcc") testCompressedPresentation();
         else if (argc == 2 && std::string(argv[1]) == "pacing") testReleaseVblank();
         else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
+        else if (argc == 2 && std::string(argv[1]) == "early") testEarlyFirstFlip();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testUnavailable();
         else if (argc == 2 && std::string(argv[1]) == "onedevice") testOneDevice();
         else if (argc == 2 && std::string(argv[1]) == "overlay") testOverlay();

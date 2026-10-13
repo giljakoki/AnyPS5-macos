@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
@@ -194,9 +195,9 @@ FlipRequest::~FlipRequest() {
 
 void FlipRequest::ReleaseLocked() noexcept {
     if (!reserved || terminal) return;
-    --cfg->flipStatus.flipPendingNum;
+    if (!eventSent) --cfg->flipStatus.flipPendingNum;
     --queue->reservations;
-    if (index >= 0) {
+    if (index >= 0 && !eventSent) {
         --cfg->bufferPending[index];
         cfg->bufferReuse[index].Complete(reuseTicket);
     }
@@ -213,7 +214,7 @@ void FlipRequest::Cancel() noexcept {
 }
 
 void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) {
-    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d GPU work complete", static_cast<long long>(flipArg), index);
+    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d reached by the queue worker", static_cast<long long>(flipArg), index);
     require(frameTiming != nullptr, "missing frame timing");
     timing = frameTiming;
     {
@@ -249,12 +250,46 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
     require(gpuComplete, "flip preparation did not complete on GPU");
 }
 
+void FlipRequest::GpuFinished() {
+    std::lock_guard lock(cfg->mutex);
+    if (cfg->Closed() || !ready || terminal || eventSent || !VideoOutDriver::Get().EarlyFlipEvents()) return;
+    VideoOutDriver::Get().SignalFlipLocked(*this);
+}
+
 void FlipRequest::Fail(std::exception_ptr error) noexcept {
     if (!error) std::terminate();
     std::lock_guard lock(cfg->mutex);
     if (!cfg->failure) cfg->failure = error;
     ReleaseLocked();
     queue->changed.NotifyAll();
+}
+
+bool VideoOutDriver::EarlyFlipEvents() const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_EARLY_FIRST_FLIPS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled && !presentedOnce.load(std::memory_order_acquire);
+}
+
+void VideoOutDriver::SignalFlipLocked(FlipRequest& req) {
+    if (req.eventSent) return;
+    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d completed (flip event%s)", static_cast<long long>(req.flipArg), req.index, presentedOnce.load(std::memory_order_acquire) ? "" : ", before the first present");
+    triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
+    ++req.cfg->flipStatus.count;
+    req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
+    req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
+    req.cfg->flipStatus.flipArg = req.flipArg;
+    req.cfg->flipStatus.currentBuffer = req.index;
+    req.cfg->width = req.width;
+    req.cfg->height = req.height;
+    --req.cfg->flipStatus.flipPendingNum;
+    if (req.index >= 0) {
+        --req.cfg->bufferPending[req.index];
+        req.cfg->bufferReuse[req.index].Complete(req.reuseTicket);
+    }
+    req.eventSent = true;
+    req.cfg->vblankCond.notify_all();
 }
 
 VideoOutDriver& VideoOutDriver::Get() {
@@ -546,21 +581,9 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
     require(req.cfg->flipStatus.count != std::numeric_limits<uint64_t>::max(), "flip counter overflow");
-    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d completed (flip event)", static_cast<long long>(req.flipArg), req.index);
-    triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
-    ++req.cfg->flipStatus.count;
-    req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
-    req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
-    req.cfg->flipStatus.flipArg = req.flipArg;
-    req.cfg->flipStatus.currentBuffer = req.index;
-    req.cfg->width = req.width;
-    req.cfg->height = req.height;
-    --req.cfg->flipStatus.flipPendingNum;
+    if (!req.eventSent) SignalFlipLocked(req);
+    presentedOnce.store(true, std::memory_order_release);
     --req.queue->reservations;
-    if (req.index >= 0) {
-        --req.cfg->bufferPending[req.index];
-        req.cfg->bufferReuse[req.index].Complete(req.reuseTicket);
-    }
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");

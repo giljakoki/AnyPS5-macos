@@ -178,11 +178,13 @@ struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this
     bool ready = false;
     bool gpuComplete = false;
     bool terminal = false;
+    bool eventSent = false;
 
     std::shared_ptr<AgcDriver::FrameTiming> timing;
     std::chrono::steady_clock::time_point queuedAt;
 
     ~FlipRequest() override;
+    void GpuFinished() override;
     void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) override;
     void Fail(std::exception_ptr error) noexcept override;
     void Cancel() noexcept;
@@ -201,6 +203,8 @@ struct FlipQueue {
 class VideoOutDriver {
 public:
     static VideoOutDriver& Get();
+    void SignalFlipLocked(FlipRequest& req);
+    [[nodiscard]] bool EarlyFlipEvents() const;
 
     VideoOutDriver();
     ~VideoOutDriver();
@@ -219,6 +223,7 @@ public:
     int SubmitFlip(int handle, int index, int flipMode, int64_t flipArg);
 
 private:
+    std::atomic<bool> presentedOnce{false};
     bool close(int handle);
     void presentLoop(std::stop_token token, std::promise<void>& started);
     void vblankLoop(std::stop_token token);
