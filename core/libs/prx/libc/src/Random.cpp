@@ -36,7 +36,7 @@ struct AdditiveFeedbackState {
     int rear;
 };
 
-std::mutex g_randomLock;
+std::mutex& g_randomLock = *new std::mutex();
 AdditiveFeedbackState g_random {reinterpret_cast<char*>(g_defaultTable), 3, 31, 3, 3, 0};
 
 std::uint32_t LoadWord(const char* table, int index) {

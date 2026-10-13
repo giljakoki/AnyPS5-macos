@@ -20,19 +20,19 @@
 
 namespace {
 
-std::mutex shutdownMutex;
-std::condition_variable shutdownChanged;
+std::mutex& shutdownMutex = *new std::mutex();
+std::condition_variable& shutdownChanged = *new std::condition_variable();
 std::vector<void (*)()> shutdownCallbacks;
 std::thread::id shutdownThread;
 bool shutdownStarted = false;
 bool shutdownFinished = false;
-std::exception_ptr shutdownFailure;
-std::stop_source shutdownSource;
+std::exception_ptr& shutdownFailure = *new std::exception_ptr();
+std::stop_source& shutdownSource = *new std::stop_source();
 std::atomic<bool> exitRequested{false};
 std::atomic<bool> exitStarted{false};
 using GuestExitCallback = void (APS5_VABI*)();
-std::mutex exitCallbackMutex;
-std::vector<GuestExitCallback> exitCallbacks;
+std::mutex& exitCallbackMutex = *new std::mutex();
+std::vector<GuestExitCallback>& exitCallbacks = *new std::vector<GuestExitCallback>();
 
 void runGuestExitCallback() {
     GuestExitCallback callback;
@@ -174,8 +174,8 @@ int APS5_VABI atexit_nid_postfix(GuestExitCallback func) {
 }
 
 namespace {
-std::mutex quickExitMutex;
-std::vector<GuestExitCallback> quickExitCallbacks;
+std::mutex& quickExitMutex = *new std::mutex();
+std::vector<GuestExitCallback>& quickExitCallbacks = *new std::vector<GuestExitCallback>();
 }
 
 int APS5_VABI at_quick_exit_nid_postfix(GuestExitCallback func) {

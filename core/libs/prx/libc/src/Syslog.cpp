@@ -22,7 +22,7 @@ constexpr int internalLogPriority = 3 | 0x02 | 0x20 | 0x01;
 int logMask = 0xff;
 
 std::mutex& OutputMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 

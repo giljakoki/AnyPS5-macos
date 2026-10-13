@@ -112,7 +112,7 @@ private:
 };
 
 ProcessArguments& getProcessArguments() {
-    static ProcessArguments arguments;
+    static ProcessArguments& arguments = *new ProcessArguments();
     return arguments;
 }
 

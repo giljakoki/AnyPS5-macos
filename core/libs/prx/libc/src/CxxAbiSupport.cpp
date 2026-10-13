@@ -106,7 +106,7 @@ const std::error_category* _ZSt17iostream_categoryv_nid_postfix() { return &std:
 int APS5_VABI _ZSt13_Execute_onceRSt9once_flagPFiPvS1_PS1_ES1__nid_postfix(
     int* flag, int (APS5_VABI *callback)(void*, void*, void**), void* arg
 ) {
-    static std::recursive_mutex mutex;
+    static std::recursive_mutex& mutex = *new std::recursive_mutex();
     std::lock_guard lock(mutex);
     if (*flag != 0) return 1;
     if (callback(nullptr, arg, nullptr) == 0) return 0;

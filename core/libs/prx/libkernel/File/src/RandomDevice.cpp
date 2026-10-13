@@ -16,8 +16,8 @@
 
 namespace {
 
-std::mutex g_mutex;
-std::set<int> g_descriptors;
+std::mutex& g_mutex = *new std::mutex();
+std::set<int>& g_descriptors = *new std::set<int>();
 
 }
 
@@ -47,7 +47,7 @@ bool IsRandomDevice(int fd) {
 bool ReadRandomDevice(int fd, void* buf, std::size_t nbytes) {
     std::lock_guard lock(g_mutex);
     if (!g_descriptors.contains(fd)) return false;
-    static std::random_device device;
+    static std::random_device& device = *new std::random_device();
     auto* bytes = static_cast<std::uint8_t*>(buf);
     for (std::size_t offset = 0; offset < nbytes; offset += sizeof(std::uint32_t)) {
         const std::uint32_t value = device();

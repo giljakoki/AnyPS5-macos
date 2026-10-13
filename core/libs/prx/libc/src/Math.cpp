@@ -205,7 +205,7 @@ int APS5_VABI __fpclassifyf_nid_postfix(float x) {
 }
 int APS5_VABI __signbitf_nid_postfix(float x) { return std::signbit(x) ? 1 : 0; }
 
-static std::mutex g_randLock;
+static std::mutex& g_randLock = *new std::mutex();
 static std::uint32_t g_randState = 1;
 
 static int NextRand_nid_no_patch(std::uint32_t& state) {

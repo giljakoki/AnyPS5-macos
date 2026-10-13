@@ -40,8 +40,8 @@ struct Arena {
     std::size_t peakInUse = 0;
 };
 
-std::mutex arenaMutex;
-std::map<std::uintptr_t, std::unique_ptr<Arena>> arenas;
+std::mutex& arenaMutex = *new std::mutex();
+std::map<std::uintptr_t, std::unique_ptr<Arena>>& arenas = *new std::map<std::uintptr_t, std::unique_ptr<Arena>>();
 
 void Error(int value) { *__error_nid_postfix() = value; }
 

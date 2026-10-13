@@ -32,7 +32,7 @@ inline void SonyDefaultConstraintHandler(const char* message, void* pointer, int
 }
 
 inline std::mutex& SonyConstraintMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 

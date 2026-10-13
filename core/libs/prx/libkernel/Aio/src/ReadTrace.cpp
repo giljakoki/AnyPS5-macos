@@ -44,11 +44,11 @@ constexpr std::size_t KindCount = 4;
 constexpr std::size_t TopFiles = 6;
 constexpr auto ReportInterval = std::chrono::seconds(10);
 
-std::mutex g_mutex;
+std::mutex& g_mutex = *new std::mutex();
 std::array<Counter, KindCount> g_counters;
-std::map<std::string, FileCounter> g_files;
+std::map<std::string, FileCounter>& g_files = *new std::map<std::string, FileCounter>();
 std::uint64_t g_largestBytes = 0;
-std::string g_largestFile;
+std::string& g_largestFile = *new std::string();
 std::chrono::steady_clock::time_point g_lastReport;
 std::chrono::steady_clock::time_point g_start;
 bool g_started = false;

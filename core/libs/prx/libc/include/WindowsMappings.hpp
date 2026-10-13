@@ -20,7 +20,7 @@ namespace GuestArena {
 class WindowsMappings {
 public:
     static WindowsMappings& Get() {
-        static WindowsMappings mappings;
+        static WindowsMappings& mappings = *new WindowsMappings();
         return mappings;
     }
 

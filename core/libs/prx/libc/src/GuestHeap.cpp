@@ -41,7 +41,7 @@ std::size_t alignUp(std::size_t value, std::size_t alignment) {
 class ArenaHeap {
 public:
     static ArenaHeap& Get() {
-        static ArenaHeap heap;
+        static ArenaHeap& heap = *new ArenaHeap();
         return heap;
     }
 
