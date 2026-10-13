@@ -5,6 +5,8 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/System/include/RaiseTrace.hpp"
+#include "prx/libkernel/System/include/UserContext.hpp"
+#include "prx/libkernel/Time/include/TimedWait.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -32,6 +34,7 @@
 #endif
 
 extern "C" Pthread APS5_VABI scePthreadSelf();
+extern "C" int APS5_VABI getcontext_nid_postfix(UserUcontext* context);
 #ifdef _WIN32
 extern "C" void Aps5RedirectedEntryStub();
 extern "C" [[noreturn]] void Aps5RedirectedExit(CONTEXT* context, const void* vectors, void (*restore)(CONTEXT*, EXCEPTION_RECORD*));
@@ -433,6 +436,7 @@ void TraceDelivery(const char* stage) {
 }
 
 void Deliver(int, siginfo_t*, void* context) {
+    if (TimedWait::ClaimRaiseSignal() != TimedWait::RaiseSignal::Run) return;
     RaiseTrace::Entered(scePthreadSelf());
     TraceDelivery("handler entered");
     const auto handler = Handler(RaisedSignal);
@@ -451,10 +455,31 @@ void Deliver(int, siginfo_t*, void* context) {
     TraceDelivery("handler returned");
 }
 
+void DeliverInWait() {
+    RaiseTrace::Entered(scePthreadSelf());
+    TraceDelivery("handler entered in a wait");
+    const auto handler = Handler(RaisedSignal);
+    if (handler == nullptr) throw std::runtime_error("sceKernelRaiseException: the handler was removed before the exception was delivered");
+    UserUcontext captured{};
+    if (getcontext_nid_postfix(&captured) != 0) throw std::runtime_error("sceKernelRaiseException: cannot capture the context of the waiting thread");
+    static_assert(offsetof(UserMcontext, len) == offsetof(GuestMcontext, len) && offsetof(UserMcontext, rsp) == offsetof(GuestMcontext, rsp));
+    GuestUcontext ucontext{};
+    auto& m = ucontext.mcontext;
+    std::memcpy(&m, &captured.mcontext, offsetof(GuestMcontext, len));
+    m.len = sizeof(GuestMcontext);
+    std::memcpy(m.fpstate, captured.mcontext.fpstate, FxsaveRegisterBytes);
+    CallHandler(handler, RaisedSignal, ucontext);
+    RaiseTrace::Returned(scePthreadSelf());
+    TraceDelivery("handler returned in a wait");
+}
+
 void InstallDelivery() {
     static const bool installed = [] {
         traceRaise.store(RaiseTrace::Enabled());
         RaiseTrace::Start();
+#ifdef __APPLE__
+        TimedWait::SetRaiseDelivery(DeliverInWait);
+#endif
         struct sigaction action{};
         action.sa_sigaction = Deliver;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -489,26 +514,32 @@ private:
     sigset_t previous;
 };
 
-bool RaiseOnLocked(Pthread thread) {
-    if (thread == scePthreadSelf()) return Send(thread);
+enum class Raised { Finished, InWait, Signaled };
+
+Raised RaiseOnLocked(Pthread thread) {
+    if (thread == scePthreadSelf()) {
+        if (TimedWait::RequestRaise(thread->raiseState) == TimedWait::RaiseRoute::Queued) return Raised::InWait;
+        return Send(thread) ? Raised::Signaled : Raised::Finished;
+    }
     HostSignalBlock block;
     std::lock_guard lock(thread->_join_mtx);
-    if (thread->_finished.load(std::memory_order_acquire)) return false;
-    return Send(thread);
+    if (thread->_finished.load(std::memory_order_acquire)) return Raised::Finished;
+    if (TimedWait::RequestRaise(thread->raiseState) == TimedWait::RaiseRoute::Queued) return Raised::InWait;
+    return Send(thread) ? Raised::Signaled : Raised::Finished;
 }
 
 bool RaiseOn(Pthread thread) {
     InstallDelivery();
-    const bool sent = RaiseOnLocked(thread);
+    const Raised raised = RaiseOnLocked(thread);
     if (traceRaise.load(std::memory_order_relaxed)) {
         std::string name;
         {
             std::lock_guard lock(thread->nameLock);
             name = thread->name;
         }
-        RaiseTrace::Sent(thread, name.c_str(), sent);
+        RaiseTrace::Sent(thread, name.c_str(), raised == Raised::Finished ? nullptr : raised == Raised::InWait ? "queued for its wait" : "signaled");
     }
-    return sent;
+    return raised != Raised::Finished;
 }
 #endif
 

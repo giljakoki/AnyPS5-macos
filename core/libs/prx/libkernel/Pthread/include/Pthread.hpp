@@ -121,6 +121,7 @@ struct PthreadPrivate {
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
     std::atomic<int> waitCount{0};
+    TimedWait::RaiseState raiseState;
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
     int cpuClockThread = 0;

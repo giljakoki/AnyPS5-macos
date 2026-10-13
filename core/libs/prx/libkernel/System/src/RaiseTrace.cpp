@@ -256,7 +256,8 @@ void Start() {
 #endif
 }
 
-void Sent(Pthread thread, const char* name, bool sent) {
+void Sent(Pthread thread, const char* name, const char* how) {
+    const bool sent = how != nullptr;
     if (!Enabled()) return;
     Slot* slot = Claim(thread);
     std::string state = "untracked";
@@ -271,7 +272,7 @@ void Sent(Pthread thread, const char* name, bool sent) {
             slot->sent.fetch_add(1);
         }
     }
-    std::fprintf(stderr, "[raise] %.3f s signal to guest thread %p '%s' %s; %s\n", Seconds(Now()), static_cast<void*>(thread), name, sent ? "sent" : "not sent, the thread has finished", state.c_str());
+    std::fprintf(stderr, "[raise] %.3f s exception for guest thread %p '%s' %s; %s\n", Seconds(Now()), static_cast<void*>(thread), name, sent ? how : "not raised, the thread has finished", state.c_str());
 }
 
 void Entered(Pthread self) {

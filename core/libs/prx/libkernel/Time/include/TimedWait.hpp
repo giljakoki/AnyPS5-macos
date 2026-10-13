@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 
 namespace TimedWait {
@@ -47,6 +48,43 @@ bool AcquireUntil(std::uint64_t deadlineNanos, TTryLock tryLock, TTryLockFor try
 }
 
 struct Waiter;
+class Condition;
+
+struct RaiseState {
+    std::mutex lock;
+    std::atomic<int> pending{0};
+    std::atomic<int> signalsInFlight{0};
+    std::atomic<int> waitDepth{0};
+    std::atomic<bool> delivering{false};
+    Condition* waitingOn = nullptr;
+};
+
+enum class RaiseRoute { Queued, Signal };
+enum class RaiseSignal { Run, Deferred, Stale };
+
+void BindThreadRaiseState(RaiseState* state);
+void SetRaiseDelivery(void (*deliver)());
+RaiseRoute RequestRaise(RaiseState& target);
+RaiseSignal ClaimRaiseSignal();
+RaiseState* CurrentRaiseState();
+bool EnterWait(RaiseState* state, Condition* condition);
+void LeaveWait(RaiseState* state);
+void DrainRaises(RaiseState* state);
+
+class RaiseCritical {
+public:
+    explicit RaiseCritical(RaiseState* state) : state(state) {
+        if (state != nullptr) state->waitDepth.fetch_add(1, std::memory_order_seq_cst);
+    }
+    ~RaiseCritical() noexcept(false) {
+        if (state != nullptr && state->waitDepth.fetch_sub(1, std::memory_order_seq_cst) == 1) DrainRaises(state);
+    }
+    RaiseCritical(const RaiseCritical&) = delete;
+    RaiseCritical& operator=(const RaiseCritical&) = delete;
+
+private:
+    RaiseState* state;
+};
 
 class Condition {
 public:
@@ -69,7 +107,22 @@ public:
             return;
         }
 #endif
+#ifdef _WIN32
         coarse.wait(lock);
+#else
+        RaiseState* raise = CurrentRaiseState();
+        const std::uint64_t observed = generation.load(std::memory_order_seq_cst);
+        lock.unlock();
+        {
+            RaiseCritical critical(raise);
+            const auto guard = internal;
+            std::unique_lock inner(*guard);
+            const bool published = EnterWait(raise, this);
+            if (generation.load(std::memory_order_seq_cst) == observed && (!published || raise->pending.load(std::memory_order_seq_cst) == 0)) signal.wait(inner);
+            LeaveWait(raise);
+        }
+        lock.lock();
+#endif
     }
 
     template <class TLock>
@@ -83,7 +136,25 @@ public:
             return signaled;
         }
 #endif
+#ifdef _WIN32
         return coarse.wait_for(lock, std::chrono::microseconds(RemainingMicros(deadlineNanos))) == std::cv_status::no_timeout;
+#else
+        RaiseState* raise = CurrentRaiseState();
+        const std::uint64_t observed = generation.load(std::memory_order_seq_cst);
+        lock.unlock();
+        bool signaled = true;
+        {
+            RaiseCritical critical(raise);
+            const auto guard = internal;
+            std::unique_lock inner(*guard);
+            const bool published = EnterWait(raise, this);
+            if (generation.load(std::memory_order_seq_cst) == observed && (!published || raise->pending.load(std::memory_order_seq_cst) == 0))
+                signaled = signal.wait_for(inner, std::chrono::microseconds(RemainingMicros(deadlineNanos))) == std::cv_status::no_timeout;
+            LeaveWait(raise);
+        }
+        lock.lock();
+        return signaled;
+#endif
     }
 
     template <class TLock, class TPredicate>
@@ -100,6 +171,7 @@ public:
     }
 
 private:
+    friend RaiseRoute RequestRaise(RaiseState& target);
 #ifdef _WIN32
     Waiter* enqueue();
     void unlink(Waiter* waiter);
@@ -109,8 +181,12 @@ private:
     std::mutex queueLock;
     Waiter* head = nullptr;
     Waiter* tail = nullptr;
-#endif
     std::condition_variable_any coarse;
+#else
+    std::shared_ptr<std::mutex> internal = std::make_shared<std::mutex>();
+    std::condition_variable signal;
+    std::atomic<std::uint64_t> generation{0};
+#endif
 };
 
 }  // namespace TimedWait

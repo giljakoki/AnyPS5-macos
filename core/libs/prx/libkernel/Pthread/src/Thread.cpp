@@ -219,6 +219,7 @@ PthreadPrivate::PthreadPrivate(const PthreadAttrPrivate* attr) : _finished(false
 }
 
 PthreadPrivate::~PthreadPrivate() {
+    if (TimedWait::CurrentRaiseState() == &raiseState) TimedWait::BindThreadRaiseState(nullptr);
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);
     registry.threads.erase(cpuClockThread);
@@ -440,6 +441,7 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     PthreadPrivate* self = args->self;
     BindHostCpuClock(self);
     TimedWait::BindThreadWaitState(&self->waitCount);
+    TimedWait::BindThreadRaiseState(&self->raiseState);
     CurrentGuestState().current = self;
     RegisterStack(self);
 #ifndef _WIN32
@@ -453,6 +455,7 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     pthread_sigmask(SIG_SETMASK, &signalMask, nullptr);
 #endif
     finishThread(self, entry(arg));
+    TimedWait::BindThreadRaiseState(nullptr);
     CurrentGuestState().current = nullptr;
 }
 
@@ -718,6 +721,7 @@ void APS5_VABI scePthreadExit(void* retval) {
     CurrentGuestState().exiting = true;
     while (CurrentGuestState().cleanupHandlers) __pthread_cleanup_pop_imp_nid_postfix(1);
     finishThread(self, retval);
+    TimedWait::BindThreadRaiseState(nullptr);
     CurrentGuestState().current = nullptr;
 #ifdef _WIN32
     ReleaseThread(self);
@@ -742,6 +746,7 @@ Pthread APS5_VABI scePthreadSelf() {
         adopted->_detached = true;
         adopted->references.store(1, std::memory_order_relaxed);
         TimedWait::BindThreadWaitState(&adopted->waitCount);
+        TimedWait::BindThreadRaiseState(&adopted->raiseState);
         SetStackFromHost(adopted.get());
         CurrentGuestState().current = adopted.release();
     }
@@ -753,6 +758,7 @@ Pthread APS5_VABI scePthreadSelf() {
         BindHostCpuClock(adoptedThread.get());
         adoptedThread->threadId = std::this_thread::get_id();
         adoptedThread->hostThread = pthread_self();
+        TimedWait::BindThreadRaiseState(&adoptedThread->raiseState);
         SetStackFromHost(adoptedThread.get());
         CurrentGuestState().current = adoptedThread.get();
     }
