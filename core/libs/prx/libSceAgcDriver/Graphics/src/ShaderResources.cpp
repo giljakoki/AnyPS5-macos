@@ -129,7 +129,22 @@ struct ImportedHash {
     bool inFlight = false;
     bool adopt = false;
     bool known = false;
+    bool changedEver = false;
+    std::uint64_t changedPresent = 0;
 };
+
+std::uint64_t importedRefreshRecentPresents() {
+    static const std::uint64_t presents = [] {
+        const char* text = std::getenv("APS5_IMPORTED_REFRESH_RECENT_PRESENTS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 120ull;
+    }();
+    return presents;
+}
+
+void noteImportedChange(ImportedHash& hash) {
+    hash.changedEver = true;
+    hash.changedPresent = Recorder::Presents();
+}
 
 struct SnapshotProofCounts {
     std::atomic<std::uint64_t> hits{0};
@@ -143,6 +158,7 @@ struct SnapshotProofCounts {
     std::atomic<std::uint64_t> compareNanoseconds{0};
     std::atomic<std::uint64_t> refreshedBytes{0};
     std::atomic<std::uint64_t> hashes{0};
+    std::atomic<std::uint64_t> recentRefreshes{0};
     std::atomic<std::uint64_t> unchanged{0};
     std::atomic<std::uint64_t> hashedBytes{0};
     std::array<std::atomic<std::uint64_t>, 8> phaseCalls{};
@@ -217,7 +233,7 @@ void reportSnapshotProofs() {
         phases += text;
     }
     std::fprintf(stderr, "[resources] snapshot lookup CPU time since the last line:%s\n", phases.c_str());
-    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface), %llu imported refreshes on the GPU (%.1f MiB), %llu imported hash passes (%.1f MiB, %llu unchanged); since the last line %.1f MiB compared at %.2f GB/s, %ld minor and %ld major page faults\n", count(counts.hits), count(counts.compares), static_cast<double>(compared) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written), count(counts.refreshes), static_cast<double>(counts.refreshedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.hashes), static_cast<double>(counts.hashedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unchanged), static_cast<double>(comparedSince) / 1048576.0, nanosecondsSince != 0 ? static_cast<double>(comparedSince) / static_cast<double>(nanosecondsSince) : 0.0, minorFaults, majorFaults);
+    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface), %llu imported refreshes on the GPU (%.1f MiB), %llu imported hash passes (%.1f MiB, %llu unchanged), %llu refreshed without a hash after a recent change; since the last line %.1f MiB compared at %.2f GB/s, %ld minor and %ld major page faults\n", count(counts.hits), count(counts.compares), static_cast<double>(compared) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written), count(counts.refreshes), static_cast<double>(counts.refreshedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.hashes), static_cast<double>(counts.hashedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unchanged), count(counts.recentRefreshes), static_cast<double>(comparedSince) / 1048576.0, nanosecondsSince != 0 ? static_cast<double>(comparedSince) / static_cast<double>(nanosecondsSince) : 0.0, minorFaults, majorFaults);
 }
 
 std::chrono::milliseconds snapshotProofLifetime() {
@@ -357,6 +373,7 @@ void consumeImportedHash(const Context& context, CachedTexture& entry, const Hos
         hash.digest->Invalidate();
         std::memcpy(digest.data(), hash.digest->Bytes().data(), sizeof(digest));
         if (std::exchange(hash.adopt, false)) {
+            if (hash.known && digest != hash.stored) noteImportedChange(hash);
             hash.stored = digest;
             hash.known = true;
             return;
@@ -365,6 +382,7 @@ void consumeImportedHash(const Context& context, CachedTexture& entry, const Hos
             snapshotProofCounts().unchanged.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        noteImportedChange(hash);
         changed = true;
     }
     if (changed) hashThenRefresh(context, entry, import, address, bytes);
@@ -378,7 +396,10 @@ void refreshImportedSnapshot(const Context& context, CachedTexture& entry, const
     const auto state = proofState(entry, proof, address, bytes);
     proofTimer.reset();
     if (state != ProofState::Holds) {
-        if (state == ProofState::Written || !importedSnapshotHash()) {
+        const auto& hash = *entry.hash;
+        const bool recent = hash.changedEver && Recorder::Presents() - hash.changedPresent <= importedRefreshRecentPresents();
+        if (state == ProofState::Written || !importedSnapshotHash() || recent) {
+            if (recent && state != ProofState::Written) snapshotProofCounts().recentRefreshes.fetch_add(1, std::memory_order_relaxed);
             hashThenRefresh(context, entry, import, address, bytes);
         } else if (!entry.hash->inFlight && !recordImportedHash(context, *entry.hash, import, address, bytes, false)) {
             hashThenRefresh(context, entry, import, address, bytes);

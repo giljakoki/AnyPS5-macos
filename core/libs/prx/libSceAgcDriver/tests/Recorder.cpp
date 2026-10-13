@@ -4644,6 +4644,14 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
             Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
             Require(SampledSnapshotTotals().refreshes - refreshesBeforeSecond == 1 && SampledSnapshotTotals().unchanged == unchangedBeforeSecond, "a changed digest did not refresh an imported snapshot exactly once");
             Require(readBlock(stored, bytes / 2) == 0x55, "a CPU store detected by the hash was not visible");
+            for (const std::uint8_t value : {std::uint8_t{0x66}, std::uint8_t{0x67}, std::uint8_t{0x68}}) {
+                const auto refreshesBeforeFrame = SampledSnapshotTotals().refreshes;
+                static_cast<volatile std::uint8_t*>(block)[bytes / 4] = value;
+                order();
+                Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+                Require(SampledSnapshotTotals().refreshes == refreshesBeforeFrame + 1, "the first draw after a present did not refresh an imported atlas that changed recently");
+                Require(readBlock(stored, bytes / 4) == value, "the first draw after a present sampled stale bytes of an imported atlas that changed recently");
+            }
         }
     } else {
         Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
