@@ -269,7 +269,39 @@ void verifyRequest(const char* path) {
     std::printf("%s: structured with %zu added blocks, %zu cloned instructions, %zu route variables\n", path, result.addedBlocks, result.clonedInstructions, result.routeVariables);
 }
 
+std::vector<std::uint32_t> recompileWords(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t subgroupSize);
+
+void verifyLoopContinueTargetsAreLatches() {
+    const std::vector<std::uint32_t> code{0xbe840380u, 0x7e020280u, 0xbf0a0204u, 0xbf840004u, 0x060202f2u, 0x10020301u, 0x80048104u, 0xbf82fffau, 0xbf810000u};
+    const auto spirv = recompileWords("counted loop", code, 64u);
+    constexpr std::uint32_t opLabel = 248u;
+    constexpr std::uint32_t opBranch = 249u;
+    constexpr std::uint32_t opLoopMerge = 246u;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> loops;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> blocks;
+    std::uint32_t current = 0;
+    for (std::size_t offset = 5; offset < spirv.size();) {
+        const auto count = spirv[offset] >> 16u;
+        const auto opcode = spirv[offset] & 0xffffu;
+        require(count != 0, "counted loop: malformed SPIR-V");
+        if (opcode == opLabel) current = spirv[offset + 1];
+        else if (current != 0) blocks[current].push_back(opcode);
+        if (opcode == opLoopMerge) loops.emplace_back(current, spirv[offset + 2]);
+        if (opcode == opBranch && blocks.contains(current) && blocks[current].size() == 1u) blocks[current].push_back(spirv[offset + 1]);
+        offset += count;
+    }
+    require(!loops.empty(), "counted loop: no OpLoopMerge");
+    for (const auto& [header, latch] : loops) {
+        const auto found = blocks.find(latch);
+        require(found != blocks.end() && found->second.size() == 2u && found->second[0] == opBranch && found->second[1] == header, "counted loop: the continue target of loop " + std::to_string(header) + " is not a block that only branches back to the header");
+    }
+}
+
 std::size_t recompile(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t subgroupSize) {
+    return recompileWords(name, code, subgroupSize).size();
+}
+
+std::vector<std::uint32_t> recompileWords(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t subgroupSize) {
     const std::array<std::uint32_t, 4> userData{0x10000000u, 0x00100000u, 0x40u, 0x00027facu};
     const std::array<std::uint32_t, 2> capabilities{1u, 61u};
     const std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
@@ -292,7 +324,7 @@ std::size_t recompile(const std::string& name, std::span<const std::uint32_t> co
     request.useCache = false;
     const auto result = Recompile(request);
     require(!result.spirv.empty(), name + ": no SPIR-V for a " + std::to_string(subgroupSize) + "-lane subgroup");
-    return result.spirv.size();
+    return result.spirv;
 }
 
 void verifyLargeLoopExitFallback() {
@@ -1247,6 +1279,7 @@ done:
     try {
         verifyNullSwappc();
         verifyLargeLoopExitFallback();
+        verifyLoopContinueTargetsAreLatches();
         verifyNestedExitForwarders();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

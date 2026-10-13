@@ -176,15 +176,21 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
     return result;
 }
 
-void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& program, const BlockInfo& info) {
+void EmitStructuredTerminator(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrProgram& program, const BlockInfo& info, const IrBlock* current) {
     auto& state = ctx.state;
     const Terminator& term = info.terminator;
+    const auto latch = functionState.loopLatches.find(current);
+    const auto label = [&](const IrBlock* target) {
+        if (latch != functionState.loopLatches.end() && latch->second.header == target) return latch->second.label;
+        return ctx.Label(target);
+    };
     const auto emitMerge = [&]() {
         if (term.loopHeader) {
             const IrBlock* merge = TargetBlock(program, term.mergeBlock);
             const IrBlock* cont = TargetBlock(program, term.continueBlock);
             if (merge != nullptr && cont != nullptr) {
-                state.module.AddFunction(spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont), spv::LoopControlMaskNone);
+                const auto own = functionState.loopLatches.find(cont);
+                state.module.AddFunction(spv::OpLoopMerge, ctx.Label(merge), own != functionState.loopLatches.end() ? own->second.label : ctx.Label(cont), spv::LoopControlMaskNone);
             }
         } else if (term.kind == TerminatorKind::ConditionalBranch && term.mergeBlock != InvalidControlFlowId) {
             if (const IrBlock* merge = TargetBlock(program, term.mergeBlock); merge != nullptr) {
@@ -200,7 +206,7 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
                 return;
             }
             emitMerge();
-            state.module.AddFunction(spv::OpBranch, ctx.Label(target));
+            state.module.AddFunction(spv::OpBranch, label(target));
             return;
         }
         case TerminatorKind::ConditionalBranch: {
@@ -223,7 +229,7 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
             static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
             if (debug) std::fprintf(stderr, "[spirv] block %u branches on %%%u = %s (kind %d)\n", static_cast<unsigned>(info.id), condition, std::string(IrOpcodeName(info.condition->Resolve()->Opcode())).c_str(), static_cast<int>(info.terminator.condition));
             emitMerge();
-            state.module.AddFunction(spv::OpBranchConditional, condition, ctx.Label(trueBlock), ctx.Label(falseBlock));
+            state.module.AddFunction(spv::OpBranchConditional, condition, label(trueBlock), label(falseBlock));
             return;
         }
         default:
@@ -774,7 +780,9 @@ void PatchStructuredPhis(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             if (found == functionState.blockExitLabels.end()) {
                 ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
             }
-            ctx.state.module.PatchDeferredPhi(deferred.phi, index, lane.Def(deferred.instruction->Argument(index)), found->second);
+            const auto latch = functionState.loopLatches.find(predecessor);
+            const bool backEdge = latch != functionState.loopLatches.end() && latch->second.header == deferred.instruction->Parent();
+            ctx.state.module.PatchDeferredPhi(deferred.phi, index, lane.Def(deferred.instruction->Argument(index)), backEdge ? latch->second.label : found->second);
         }
     }
 }
@@ -805,6 +813,14 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         state.module.AddFunction(spv::OpStore, state.loopGuardVisits, ConstantU32(state, 0u));
         state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
     }
+    for (const auto& info : program.Metadata().blockInfo) {
+        if (!info.terminator.loopHeader) continue;
+        const IrBlock* header = TargetBlock(program, info.id);
+        const IrBlock* cont = TargetBlock(program, info.terminator.continueBlock);
+        if (header == nullptr || cont == nullptr) continue;
+        if (functionState.loopLatches.contains(cont)) context.Fail("two loops share one continue block");
+        functionState.loopLatches.emplace(cont, StructuredLoopLatch{header, state.module.AllocateId()});
+    }
     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
@@ -829,7 +845,11 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         state.bdaStopsInvocations = stops && !state.continueTarget;
         EmitStructuredBlock(context, functionState, block);
         functionState.blockExitLabels.emplace(block, state.currentLabel);
-        EmitStructuredTerminator(context, program, *info);
+        EmitStructuredTerminator(context, functionState, program, *info, block);
+        if (const auto latch = functionState.loopLatches.find(block); latch != functionState.loopLatches.end()) {
+            EmitLabel(state, latch->second.label);
+            state.module.AddFunction(spv::OpBranch, context.Label(latch->second.header));
+        }
         state.bdaStopsInvocations = stops;
         state.continueTarget = false;
     }
