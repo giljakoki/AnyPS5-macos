@@ -12,8 +12,8 @@ struct GuestOnce {
     void* mutex;
 };
 static_assert(offsetof(GuestOnce, mutex) == 8 && sizeof(GuestOnce) == 16);
-std::mutex onceMutex;
-std::condition_variable onceChanged;
+std::mutex& onceMutex = *new std::mutex();
+std::condition_variable& onceChanged = *new std::condition_variable();
 }
 
 extern "C" int APS5_VABI pthread_once_nid_postfix(

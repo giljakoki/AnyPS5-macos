@@ -33,9 +33,9 @@ static constexpr std::uint16_t PORT_TYPE_MAIN = 0;
 static constexpr int PORT_ERROR_FORMAT_FLAG_WITHOUT_8_CHANNELS = static_cast<int>(0x80268001);
 static constexpr int PORT_ERROR_UNSUPPORTED_FORMAT = static_cast<int>(0x8026800E);
 
-static std::mutex g_portsLock;
+static std::mutex& g_portsLock = *new std::mutex();
 // Grows on demand: the title opens its bed ports plus max_object_ports object ports at once.
-static std::vector<AudioOut2Port> g_ports;
+static std::vector<AudioOut2Port>& g_ports = *new std::vector<AudioOut2Port>();
 static std::uint64_t g_portGeneration = 0;
 
 static AudioOut2Port* FromHandle(AudioOut2PortHandle handle) {

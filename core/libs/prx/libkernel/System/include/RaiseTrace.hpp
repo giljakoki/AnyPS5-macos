@@ -1,0 +1,17 @@
+#ifndef CORE_LIBS_PRX_LIBKERNEL_SYSTEM_INCLUDE_RAISETRACE_HPP
+#define CORE_LIBS_PRX_LIBKERNEL_SYSTEM_INCLUDE_RAISETRACE_HPP
+
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
+
+namespace RaiseTrace {
+
+bool Enabled();
+void Start();
+void Raising(Pthread thread);
+void Sent(Pthread thread, const char* name, const char* how);
+void Entered(Pthread self);
+void Returned(Pthread self);
+
+}
+
+#endif

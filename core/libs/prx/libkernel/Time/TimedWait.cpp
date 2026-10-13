@@ -3,6 +3,8 @@
 
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -242,14 +244,160 @@ void Condition::NotifyAll() {
 #else
 
 void Condition::NotifyOne() {
-    coarse.notify_one();
+    RaiseCritical critical(CurrentRaiseState());
+    const auto guard = internal;
+    std::lock_guard inner(*guard);
+    generation.fetch_add(1, std::memory_order_seq_cst);
+    signal.notify_one();
 }
 
 void Condition::NotifyAll() {
-    coarse.notify_all();
+    RaiseCritical critical(CurrentRaiseState());
+    const auto guard = internal;
+    std::lock_guard inner(*guard);
+    generation.fetch_add(1, std::memory_order_seq_cst);
+    signal.notify_all();
 }
 
 #endif
+
+namespace {
+
+std::atomic<void (*)()> raiseDelivery{nullptr};
+
+struct BoundRaise {
+    RaiseState* state = nullptr;
+};
+
+RaiseState*& BoundRaiseState() {
+#ifdef _WIN32
+    return WindowsThreadLocal<BoundRaise>::Get().state;
+#else
+    static thread_local RaiseState* state = nullptr;
+    return state;
+#endif
+}
+
+}
+
+void BindThreadRaiseState(RaiseState* state) {
+    BoundRaiseState() = state;
+}
+
+void SetRaiseDelivery(void (*deliver)()) {
+    raiseDelivery.store(deliver, std::memory_order_release);
+}
+
+RaiseState* CurrentRaiseState() {
+#ifdef __APPLE__
+    return BoundRaiseState();
+#else
+    return nullptr;
+#endif
+}
+
+bool EnterWait(RaiseState* state, Condition* condition) {
+    if (state == nullptr) return false;
+    std::lock_guard lock(state->lock);
+    state->pending.fetch_add(state->signalsInFlight.exchange(0, std::memory_order_seq_cst), std::memory_order_seq_cst);
+    if (state->delivering.load(std::memory_order_seq_cst)) return false;
+    state->waitingOn = condition;
+    return true;
+}
+
+void LeaveWait(RaiseState* state) {
+    if (state == nullptr) return;
+    std::lock_guard lock(state->lock);
+    state->waitingOn = nullptr;
+}
+
+void DrainRaises(RaiseState* state) {
+    for (;;) {
+        state->waitDepth.fetch_add(1, std::memory_order_seq_cst);
+        bool claimed = false;
+        {
+            std::lock_guard lock(state->lock);
+            if (!state->delivering.load(std::memory_order_seq_cst) && state->pending.load(std::memory_order_seq_cst) != 0) {
+                state->pending.fetch_sub(1, std::memory_order_seq_cst);
+                state->delivering.store(true, std::memory_order_seq_cst);
+                claimed = true;
+            }
+        }
+        state->waitDepth.fetch_sub(1, std::memory_order_seq_cst);
+        if (!claimed) {
+            if (state->delivering.load(std::memory_order_seq_cst) || state->pending.load(std::memory_order_seq_cst) == 0) return;
+            continue;
+        }
+        const auto deliver = raiseDelivery.load(std::memory_order_acquire);
+        if (deliver == nullptr) throw std::runtime_error("A raised exception is pending on a waiting thread without a delivery function");
+        deliver();
+        state->waitDepth.fetch_add(1, std::memory_order_seq_cst);
+        {
+            std::lock_guard lock(state->lock);
+            state->delivering.store(false, std::memory_order_seq_cst);
+        }
+        state->waitDepth.fetch_sub(1, std::memory_order_seq_cst);
+    }
+}
+
+void DrainRaisesInWait(RaiseState* state) {
+    if (state == nullptr) return;
+    const int outer = state->waitDepth.exchange(0, std::memory_order_seq_cst);
+    DrainRaises(state);
+    state->waitDepth.fetch_add(outer, std::memory_order_seq_cst);
+}
+
+RaiseSignal ClaimRaiseSignal() {
+#ifdef __APPLE__
+    RaiseState* state = BoundRaiseState();
+    if (state == nullptr) return RaiseSignal::Run;
+    int inFlight = state->signalsInFlight.load(std::memory_order_seq_cst);
+    do {
+        if (inFlight == 0) return RaiseSignal::Stale;
+    } while (!state->signalsInFlight.compare_exchange_weak(inFlight, inFlight - 1, std::memory_order_seq_cst));
+    if (state->waitDepth.load(std::memory_order_seq_cst) == 0 && !state->delivering.load(std::memory_order_seq_cst)) return RaiseSignal::Run;
+    state->pending.fetch_add(1, std::memory_order_seq_cst);
+    return RaiseSignal::Deferred;
+#else
+    return RaiseSignal::Run;
+#endif
+}
+
+RaiseRoute RequestRaise(RaiseState& target) {
+#ifdef __APPLE__
+    constexpr std::uint64_t RetryNanos = 100000000ULL;
+    const std::uint64_t deadline = NowNanos() + RetryNanos;
+    for (;;) {
+        {
+            std::lock_guard lock(target.lock);
+            if (target.delivering.load(std::memory_order_seq_cst)) {
+                target.pending.fetch_add(1, std::memory_order_seq_cst);
+                return RaiseRoute::Queued;
+            }
+            Condition* condition = target.waitingOn;
+            if (condition == nullptr) {
+                target.signalsInFlight.fetch_add(1, std::memory_order_seq_cst);
+                return RaiseRoute::Signal;
+            }
+            const auto guard = condition->internal;
+            if (guard->try_lock()) {
+                std::lock_guard inner(*guard, std::adopt_lock);
+                target.pending.fetch_add(1, std::memory_order_seq_cst);
+                condition->signal.notify_all();
+                return RaiseRoute::Queued;
+            }
+            if (NowNanos() >= deadline) {
+                target.signalsInFlight.fetch_add(1, std::memory_order_seq_cst);
+                return RaiseRoute::Signal;
+            }
+        }
+        std::this_thread::yield();
+    }
+#else
+    (void)target;
+    return RaiseRoute::Signal;
+#endif
+}
 
 void BindThreadWaitState(std::atomic<int>* state) {
     auto& local = WaitState();

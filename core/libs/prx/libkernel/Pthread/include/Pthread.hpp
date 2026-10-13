@@ -36,8 +36,13 @@ struct PthreadMutexattrPrivate {
 };
 
 struct PthreadMutexPrivate {
-    std::recursive_timed_mutex _rmtx;
-    std::timed_mutex _mtx;
+#ifdef __APPLE__
+    TimedWait::GuestLock<std::recursive_mutex> _rmtx;
+    TimedWait::GuestLock<std::mutex> _mtx;
+#else
+    TimedWait::GuestLock<std::recursive_timed_mutex> _rmtx;
+    TimedWait::GuestLock<std::timed_mutex> _mtx;
+#endif
     MutexType _type;
     std::atomic<std::thread::id> _owner;
     int _count;
@@ -57,6 +62,7 @@ struct PthreadRwlockPrivate {
         _lock.unlock();
     }
     std::shared_timed_mutex _lock;
+    TimedWait::LockWaiters _waiters;
     std::atomic<std::thread::id> _writer;
     std::atomic<int> _readers{0};
 };
@@ -121,6 +127,7 @@ struct PthreadPrivate {
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
     std::atomic<int> waitCount{0};
+    TimedWait::RaiseState raiseState;
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
     int cpuClockThread = 0;

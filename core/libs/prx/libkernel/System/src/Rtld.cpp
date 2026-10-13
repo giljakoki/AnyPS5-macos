@@ -23,9 +23,9 @@
 
 namespace {
 
-std::mutex rtldHeapMutex;
+std::mutex& rtldHeapMutex = *new std::mutex();
 std::array<void*, 10> rtldHeapApi{};
-std::mutex threadAtexitMutex;
+std::mutex& threadAtexitMutex = *new std::mutex();
 std::multimap<const void*, void*> threadAtexitReferences;
 
 const void* imageContaining(const void* address, bool reference, void*& handle, const char* caller) {

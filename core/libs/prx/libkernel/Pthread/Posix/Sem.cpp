@@ -67,12 +67,14 @@ int APS5_VABI sem_destroy_nid_postfix(void* sem) {
 }
 
 int APS5_VABI sem_wait_nid_postfix(void* sem) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     auto* semaphore = Get(sem);
     if (!semaphore) return Fail(PosixThread::GUEST_EINVAL);
     return WaitFor(semaphore, nullptr);
 }
 
 int APS5_VABI sem_trywait_nid_postfix(void* sem) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     auto* semaphore = Get(sem);
     if (!semaphore) return Fail(PosixThread::GUEST_EINVAL);
     std::lock_guard lock(semaphore->lock);
@@ -82,6 +84,7 @@ int APS5_VABI sem_trywait_nid_postfix(void* sem) {
 }
 
 int APS5_VABI sem_timedwait_nid_postfix(void* sem, const KernelTimespec* abstime) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     auto* semaphore = Get(sem);
     if (!semaphore) return Fail(PosixThread::GUEST_EINVAL);
     KernelUseconds usec = 0;
@@ -90,6 +93,7 @@ int APS5_VABI sem_timedwait_nid_postfix(void* sem, const KernelTimespec* abstime
 }
 
 int APS5_VABI sem_reltimedwait_np_nid_postfix(void* sem, uint32_t usec) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     auto* semaphore = Get(sem);
     if (!semaphore) return Fail(PosixThread::GUEST_EINVAL);
     const KernelUseconds timeout = usec;
@@ -97,6 +101,7 @@ int APS5_VABI sem_reltimedwait_np_nid_postfix(void* sem, uint32_t usec) {
 }
 
 int APS5_VABI sem_post_nid_postfix(void* sem) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     auto* semaphore = Get(sem);
     if (!semaphore) return Fail(PosixThread::GUEST_EINVAL);
     {
@@ -109,6 +114,7 @@ int APS5_VABI sem_post_nid_postfix(void* sem) {
 }
 
 int APS5_VABI sem_getvalue_nid_postfix(void* sem, int* value) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     auto* semaphore = Get(sem);
     if (!semaphore || !value) return Fail(PosixThread::GUEST_EINVAL);
     std::lock_guard lock(semaphore->lock);

@@ -92,6 +92,7 @@ int APS5_VABI sceKernelDeleteEventFlag(KernelEventFlag ef) {
 }
 
 int APS5_VABI sceKernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     if (!ef) return SCE_KERNEL_ERROR_ESRCH;
     std::lock_guard lock(ef->_mutex);
     if (ef->_deleted) return SCE_KERNEL_ERROR_ESRCH;
@@ -102,6 +103,7 @@ int APS5_VABI sceKernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
 }
 
 int APS5_VABI sceKernelClearEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     if (!ef) return SCE_KERNEL_ERROR_ESRCH;
     std::lock_guard lock(ef->_mutex);
     if (ef->_deleted) return SCE_KERNEL_ERROR_ESRCH;
@@ -110,6 +112,7 @@ int APS5_VABI sceKernelClearEventFlag(KernelEventFlag ef, uint64_t bit_pattern) 
 }
 
 int APS5_VABI sceKernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern, int* num_wait_threads) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     if (!ef) return SCE_KERNEL_ERROR_ESRCH;
     std::lock_guard lock(ef->_mutex);
     if (ef->_deleted) return SCE_KERNEL_ERROR_ESRCH;
@@ -121,6 +124,7 @@ int APS5_VABI sceKernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern,
 }
 
 int APS5_VABI sceKernelPollEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode, uint64_t* result_pat) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     if (!ef) return SCE_KERNEL_ERROR_ESRCH;
     if (bit_pattern == 0 || !IsValidWaitMode(wait_mode)) return SCE_KERNEL_ERROR_EINVAL;
     std::lock_guard lock(ef->_mutex);
@@ -135,6 +139,7 @@ int APS5_VABI sceKernelPollEventFlag(KernelEventFlag ef, uint64_t bit_pattern, u
 }
 
 int APS5_VABI sceKernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode, uint64_t* result_pat, KernelUseconds* timeout) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     if (!ef) return SCE_KERNEL_ERROR_ESRCH;
     if (bit_pattern == 0 || !IsValidWaitMode(wait_mode)) return SCE_KERNEL_ERROR_EINVAL;
     std::unique_lock lock(ef->_mutex);

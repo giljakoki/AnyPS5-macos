@@ -95,9 +95,9 @@ struct Port {
     SDL_AudioSpec spec = {};
 };
 
-static std::mutex g_mutex;
-static std::mutex g_outputMutex;
-static Port g_ports[PORTS_MAX];
+static std::mutex& g_mutex = *new std::mutex();
+static std::mutex& g_outputMutex = *new std::mutex();
+static std::array<Port, PORTS_MAX>& g_ports = *new std::array<Port, PORTS_MAX>();
 static bool g_sdlInitialized = false;
 
 static bool ensureSdlAudio() {

@@ -15,7 +15,7 @@
 extern "C" int APS5_VABI sceKernelDebugOutText(int channel, const char* text) {
     if (channel < 0) return static_cast<int>(0x80020016u);
     if (!text) return static_cast<int>(0x8002000eu);
-    static std::mutex outputMutex;
+    static std::mutex& outputMutex = *new std::mutex();
     const std::lock_guard lock(outputMutex);
     if (std::fprintf(stderr, "[debug:%d] %s", channel, text) < 0 || std::fflush(stderr) != 0)
         return static_cast<int>(0x80020005u);
@@ -48,7 +48,7 @@ extern "C" int APS5_VABI sceKernelSendNotificationRequest(int device, const void
     if (end == nullptr)
         return invalidArgument;
 
-    static std::mutex outputMutex;
+    static std::mutex& outputMutex = *new std::mutex();
     const std::lock_guard lock(outputMutex);
     std::array<char, messageCapacity + 32> output{};
     const auto length = std::snprintf(output.data(), output.size(), "[notification] %.*s\n", static_cast<int>(end - message), message);

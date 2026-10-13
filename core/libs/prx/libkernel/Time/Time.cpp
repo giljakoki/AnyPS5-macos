@@ -185,8 +185,8 @@ std::uint64_t APS5_VABI sceKernelGetProcessTimeCounterFrequency() {
 static void TraceSleep(const void* caller, std::uint64_t microseconds) {
     static const bool enabled = std::getenv("APS5_TRACE_USLEEP") != nullptr;
     if (!enabled) return;
-    static std::mutex mutex;
-    static std::unordered_map<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>> sites;
+    static std::mutex& mutex = *new std::mutex();
+    static std::unordered_map<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>>& sites = *new std::unordered_map<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>>();
     static std::uint64_t calls = 0;
     std::lock_guard lock(mutex);
     auto& site = sites[reinterpret_cast<std::uintptr_t>(caller)];
@@ -209,8 +209,8 @@ void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint
     static const bool enabled = std::getenv("APS5_TRACE_WAITS") != nullptr;
     if (!enabled) return;
     struct Site { std::uint64_t calls = 0; std::uint64_t timeouts = 0; std::uint64_t nanos = 0; std::uint64_t longest = 0; unsigned long lastThread = 0; };
-    static std::mutex mutex;
-    static std::unordered_map<std::string, Site> sites;
+    static std::mutex& mutex = *new std::mutex();
+    static std::unordered_map<std::string, Site>& sites = *new std::unordered_map<std::string, Site>();
     static std::uint64_t lastReport = 0;
     char key[96];
 #ifdef _WIN32

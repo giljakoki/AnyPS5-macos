@@ -53,6 +53,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Aio/src/ReadThrottle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Coredump.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Exception.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/RaiseTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Sanitizer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Rtld.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Process.cpp
@@ -626,6 +627,13 @@ if(BUILD_TESTING)
         target_link_libraries(guest_raise_inherited_mask_tests PRIVATE libkernel libc)
         add_test(NAME guest_raise_inherited_mask COMMAND guest_raise_inherited_mask_tests)
         set_tests_properties(guest_raise_inherited_mask PROPERTIES TIMEOUT 30)
+    endif()
+    if(APPLE)
+        add_test_executable(guest_raise_waiting_thread_tests ${LIBS_INCLUDE_DIR}/tests/GuestRaiseWaitingThread.cpp)
+        target_include_directories(guest_raise_waiting_thread_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_raise_waiting_thread_tests PRIVATE libkernel libc)
+        add_test(NAME guest_raise_waiting_thread COMMAND guest_raise_waiting_thread_tests)
+        set_tests_properties(guest_raise_waiting_thread PROPERTIES TIMEOUT 120)
     endif()
     add_test_executable(guest_raise_exception_tests ${LIBS_INCLUDE_DIR}/tests/GuestRaiseException.cpp)
     target_include_directories(guest_raise_exception_tests PRIVATE ${LIBS_INCLUDE_DIR})
