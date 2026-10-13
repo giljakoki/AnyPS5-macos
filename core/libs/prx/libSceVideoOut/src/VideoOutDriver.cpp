@@ -491,8 +491,10 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d dequeued by the presenter, waits for vblank %llu (now %llu, GPU complete %d)", static_cast<long long>(req.flipArg), req.index, static_cast<unsigned long long>(target), static_cast<unsigned long long>(req.cfg->vblankStatus.count), req.gpuComplete ? 1 : 0);
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d vblank reached", static_cast<long long>(req.flipArg), req.index);
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
@@ -513,6 +515,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         const auto extensions = windowExtensions(window.Handle());
         const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
         timing.Mark("window_prepare");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d window ready, presenting", static_cast<long long>(req.flipArg), req.index);
         const auto gpuReady = [](void* context) {
             auto& request = *static_cast<FlipRequest*>(context);
             std::lock_guard lock(request.cfg->mutex);
@@ -529,6 +532,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
         }
         timing.Mark("present");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d presented", static_cast<long long>(req.flipArg), req.index);
         OnMainThread([&] { window.UpdateTitle(); });
         timing.Mark("window_title");
     }
