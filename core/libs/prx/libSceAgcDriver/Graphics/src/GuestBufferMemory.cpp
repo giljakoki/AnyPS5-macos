@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -3548,7 +3549,20 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         current.direct = live;
         return addressRange(current);
     };
-    for (const auto& region : regions) result.push_back(rangeOf(region, regionsStale));
+    const auto verify = [&](const ShaderRecompiler::BdaAbi::Range& range, const char* origin) {
+        if (!StaleHandlesTraced()) return;
+        const auto* live = findImport(state, range.begin, range.end);
+        if (live == nullptr) return;
+        const auto expected = live->address + (range.begin - live->base);
+        if (range.deviceAddress == expected) return;
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+        std::fprintf(stderr, "[stale] address range [0x%llx, 0x%llx) from %s names device address 0x%llx, but the live import 0x%llx+0x%llx serves it at 0x%llx (space %s serial %llu epoch %llu, build epoch %llu, current epoch %llu, %zu build regions)\n", static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), origin, static_cast<unsigned long long>(range.deviceAddress), static_cast<unsigned long long>(live->base), static_cast<unsigned long long>(live->bytes), static_cast<unsigned long long>(expected), space != nullptr ? "held" : "none", static_cast<unsigned long long>(space != nullptr ? space->serial : 0), static_cast<unsigned long long>(space != nullptr ? space->importsEpoch : 0), static_cast<unsigned long long>(importsEpoch), static_cast<unsigned long long>(state.epoch), regions.size());
+    };
+    for (const auto& region : regions) {
+        result.push_back(rangeOf(region, regionsStale));
+        if (region.direct != nullptr) verify(result.back(), region.mirror != nullptr ? "a build region with a mirror" : "a build region");
+    }
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> spaceRanges;
         if (spaceStale) {
@@ -3557,6 +3571,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
             }
         }
         const auto& served = spaceStale ? spaceRanges : space->ranges;
+        for (const auto& range : served) verify(range, spaceStale ? "the address space, re-resolved" : "the address space's cached ranges");
         std::vector<ShaderRecompiler::BdaAbi::Range> combined;
         combined.reserve(result.size() + served.size());
         std::merge(served.begin(), served.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
