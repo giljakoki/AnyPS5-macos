@@ -207,6 +207,7 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
     const auto bufferTableAddr = static_cast<std::uint64_t>(userData[bufferWord]) | (static_cast<std::uint64_t>(userData[bufferWord + 1u]) << 32u);
     if (!staticAbi && attribTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex attribute table address");
     if (!staticAbi && bufferTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex buffer table address");
+    if (reads != nullptr && !staticAbi) reads->reserve(reads->size() + 2u * shader.num_input_semantics);
     info.fetchEmbedded = true;
     info.fetchAttribReg = static_cast<std::uint32_t>(vertexAttribReg);
     info.fetchBufferReg = static_cast<std::uint32_t>(vertexBufferReg);
