@@ -1,3 +1,4 @@
+#include "prx/libkernel/Aio/include/ReadThrottle.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -955,6 +956,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     const auto started = ReadTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto result = NativePread(d, nbytes == 0 && buf == nullptr ? &empty : buf, nbytes, offset);
     if (ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Pread, d, result < 0 ? 0 : static_cast<std::uint64_t>(result), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+    if (result > 0) ReadThrottle::After(static_cast<std::uint64_t>(result));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1002,6 +1004,7 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
             const auto result = offset != nullptr ? NativePositioned_nid_no_patch(d, base + position, chunk, *offset + done, write) : NativeTransfer(d, base + position, chunk, write);
             if (result < 0) return done != 0 ? done : SceErrorFromErrno(errno);
             done += result;
+            if (!write && result > 0) ReadThrottle::After(static_cast<std::uint64_t>(result));
             position += static_cast<std::size_t>(result);
             if (static_cast<std::size_t>(result) < chunk || !whole) return done;
         }
@@ -1037,6 +1040,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     const auto started = ReadTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto result = NativePread(d, buf, nbytes, offset);
     if (ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Pread, d, result < 0 ? 0 : static_cast<std::uint64_t>(result), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+    if (result > 0) ReadThrottle::After(static_cast<std::uint64_t>(result));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 

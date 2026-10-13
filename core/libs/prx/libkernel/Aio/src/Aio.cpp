@@ -1,3 +1,4 @@
+#include "prx/libkernel/Aio/include/ReadThrottle.hpp"
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -93,6 +94,7 @@ bool RunRequest(KernelAioRwRequest& req, bool write) {
         ? NativePwrite(req.fd, req.buf, req.nbyte, req.offset)
         : NativePread(req.fd, req.buf, req.nbyte, req.offset);
     if (!write && ReadTrace::Enabled()) ReadTrace::Record(ReadTrace::Kind::Aio, req.fd, done < 0 ? 0 : static_cast<std::uint64_t>(done), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+    if (!write && done > 0) ReadThrottle::After(static_cast<std::uint64_t>(done));
     if (done < 0) {
         const int error = errno;
         req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EIO);

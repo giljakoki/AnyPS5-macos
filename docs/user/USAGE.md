@@ -147,6 +147,10 @@ Do not disable Dozen if it is the only Vulkan driver available; the application 
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. Any other value stops the title at its first flip.
 
+### Slowing a title's loader
+
+Some titles stream data into fixed-size staging pools that they recycle once per rendered frame and do not check for exhaustion. When the title renders more slowly than on the console (for example while it runs translated), its loader can fill a pool before a frame returns it, and the title crashes. `APS5_LOADER_THROTTLE_US=<n>` delays every file read (`sceKernelRead`, `sceKernelPread`, `sceKernelPreadv` and asynchronous reads) by n microseconds per MiB read during the first `APS5_LOADER_THROTTLE_SECONDS` seconds of the process (20 by default), which caps the read rate at about 1,000,000 / n MiB/s. Loading takes longer; values that are not non-negative integers stop the title at its first read ([TechnicalDebt](../dev/TechnicalDebt.md)).
+
 ### Flip events before the first present
 
 `APS5_EARLY_FIRST_FLIPS=1` reports the title's flips as completed as soon as the GPU has finished the work before them, until the first frame has actually been presented. Titles that free loading memory only on flip events then get it back during the window's first present instead of after it; one of the first frames may show later contents ([TechnicalDebt](../dev/TechnicalDebt.md)). Any other value leaves it off.
