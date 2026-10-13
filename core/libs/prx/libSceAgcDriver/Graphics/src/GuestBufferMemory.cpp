@@ -1827,7 +1827,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         if (!collect(probe.writtenAfterFill)) return "the collect after the fill";
         probe.fillVisible = true;
         for (std::uint64_t offset = 0; offset < bytes; offset += 4096) probe.fillVisible = probe.fillVisible && *reinterpret_cast<volatile std::uint8_t*>(base + offset) == 2;
-        *reinterpret_cast<volatile std::uint8_t*>(base) = 2;
+        *reinterpret_cast<volatile std::uint8_t*>(base) = 3;
         if (!collect(probe.writtenByCpu)) return "the collect after a CPU store";
         return nullptr;
     };

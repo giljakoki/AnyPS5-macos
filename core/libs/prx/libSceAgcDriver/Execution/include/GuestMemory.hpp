@@ -34,6 +34,8 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+std::uint64_t ComparedBytes();
+std::uint64_t WalkedBytes();
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
 // validation's per-run compare): one walk of the page states, one memcmp per mapped run, no profile
 // counter and no reason string. Unmapped: some page of the range is not readable (or the address
@@ -101,6 +103,7 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
+std::uint64_t DriverStoreSerial();
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label

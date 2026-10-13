@@ -80,6 +80,9 @@ std::atomic<std::uint64_t> forgetCalls{0};
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> comparedBytes{0};
+std::atomic<std::uint64_t> walkedBytes{0};
+std::atomic<std::uint64_t> driverStoreSerial{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -1131,6 +1134,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
+    walkedBytes.fetch_add(bytes, std::memory_order_relaxed);
 #ifndef _WIN32
     if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
@@ -1164,6 +1168,18 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ComparedBytes() {
+    return comparedBytes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DriverStoreSerial() {
+    return driverStoreSerial.load(std::memory_order_acquire);
+}
+
+std::uint64_t WalkedBytes() {
+    return walkedBytes.load(std::memory_order_relaxed);
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -1268,6 +1284,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
+        driverStoreSerial.fetch_add(1, std::memory_order_release);
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
@@ -1313,6 +1330,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
+    driverStoreSerial.fetch_add(1, std::memory_order_release);
     if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
 #ifndef _WIN32
     {
@@ -1834,6 +1852,7 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
+    comparedBytes.fetch_add(bytes.size(), std::memory_order_relaxed);
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
         if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;

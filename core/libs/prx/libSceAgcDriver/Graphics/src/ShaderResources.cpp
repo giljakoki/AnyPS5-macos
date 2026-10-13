@@ -108,7 +108,17 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    std::array<std::uint64_t, 6> proven{};
 };
+
+std::array<std::uint64_t, 6> snapshotProofStamp(std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto forget = GuestMemory::ForgetSerial();
+    if (disabled || epoch == 0 || (forget & 1u) != 0) return {};
+    const auto* recorder = Recorder::Active();
+    return {epoch, GuestMemory::DriverStoreSerial(), forget, reinterpret_cast<std::uintptr_t>(recorder), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0, recorder != nullptr ? recorder->Submissions() : 0};
+}
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
@@ -652,7 +662,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                GuestMemory::FlushGpuWrites(address, it->bytes.size());
+                const auto stamp = snapshotProofStamp(address, bytes);
+                if (stamp[0] != 0 && stamp == it->proven) return true;
+                if (!GuestMemory::EqualsCommittedUnsynced(address, it->bytes)) return false;
+                it->proven = stamp;
+                return true;
             };
             if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
