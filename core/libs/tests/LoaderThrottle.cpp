@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -44,15 +45,46 @@ int main() {
         check(ReadThrottle::DelayMicros(settings, 1024 * 1024, 5.0, carry) == 0, "reads after the window are not delayed");
         check(ReadThrottle::DelayMicros(ReadThrottle::Settings{0, 5.0}, 1024 * 1024, 0.0, carry) == 0, "a zero rate is off");
 
+        check(ReadThrottle::FlipAllows(0, 1u << 30, 0), "a zero flip budget is off");
+        check(ReadThrottle::FlipAllows(1024, 2047, 0) && !ReadThrottle::FlipAllows(1024, 2048, 0), "two flips of headroom before the first counted flip");
+        check(ReadThrottle::FlipAllows(1024, 2048, 1) && !ReadThrottle::FlipAllows(1024, 3072, 1), "each flip adds one budget");
+
         setenv("APS5_LOADER_THROTTLE_US", "20000", 1);
-        setenv("APS5_LOADER_THROTTLE_SECONDS", "30", 1);
+        setenv("APS5_LOADER_THROTTLE_SECONDS", "1", 1);
+        setenv("APS5_LOADER_MIB_PER_FLIP", "1", 1);
         const auto current = ReadThrottle::Current();
-        check(current.microsPerMiB == 20000 && current.windowSeconds == 30.0, "the environment sets the rate and the window");
+        check(current.microsPerMiB == 20000 && current.windowSeconds == 1.0, "the environment sets the rate and the window");
+        check(current.bytesPerFlip == 1024u * 1024u, "the environment sets the flip budget");
         const auto start = std::chrono::steady_clock::now();
         ReadThrottle::After(4u * 1024u * 1024u);
         const auto waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         std::printf("4 MiB at 20000 us/MiB waited %.1f ms\n", waited);
         check(waited >= 79.0 && waited < 1000.0, "a read waits for its share of the rate");
+
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(1100));
+        LoaderFlipCompleted_nid_no_patch();
+        check(ReadThrottle::Flips() == 1, "a completed flip is counted");
+        const auto heldStart = std::chrono::steady_clock::now();
+        std::thread flipper([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            LoaderFlipCompleted_nid_no_patch();
+            LoaderFlipCompleted_nid_no_patch();
+        });
+        ReadThrottle::After(2u * 1024u * 1024u);
+        ReadThrottle::After(2u * 1024u * 1024u);
+        const auto held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - heldStart).count();
+        flipper.join();
+        std::printf("4 MiB over a 3 MiB flip allowance waited %.1f ms\n", held);
+        check(held >= 30.0 && held < 90.0, "a read over the flip budget waits for the next flip");
+        const auto stallStart = std::chrono::steady_clock::now();
+        ReadThrottle::After(8u * 1024u * 1024u);
+        const auto stalled = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stallStart).count();
+        std::printf("a read without flips waited %.1f ms\n", stalled);
+        check(stalled >= 90.0 && stalled < 1000.0, "a read held without any flip goes on after the stall limit");
+        const auto freeStart = std::chrono::steady_clock::now();
+        ReadThrottle::After(1024u * 1024u);
+        const auto free = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - freeStart).count();
+        check(free < 50.0, "after a stall the allowance starts again");
     } catch (const std::exception& error) {
         std::printf("FAIL %s\n", error.what());
         return 1;

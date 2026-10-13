@@ -1,6 +1,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Pthread/Posix/Common.hpp"
+#include "prx/libkernel/System/include/CrashReport.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
 #include <chrono>
@@ -76,6 +77,10 @@ bool Install(int guest, const GuestSigaction& action) {
     if (!native) return true;
     const auto previous = handlers[guest].exchange(Delivered(action) ? reinterpret_cast<GuestHandler>(action.handler) : nullptr);
     auto hostHandler = action.handler == 1 ? SIG_IGN : Delivered(action) ? Dispatch : SIG_DFL;
+    if (CrashReport::Owns(native)) {
+        if (hostHandler == SIG_DFL) return CrashReport::Restore(native);
+        std::fprintf(stderr, "[crash] the guest replaced the host disposition of signal %d; faults on it are no longer reported\n", guest);
+    }
     if (std::signal(native, hostHandler) == SIG_ERR) {
         handlers[guest].store(previous);
         return false;

@@ -8,7 +8,15 @@ namespace ReadThrottle {
 struct Settings {
     std::uint64_t microsPerMiB = 0;
     double windowSeconds = 0.0;
+    std::uint64_t bytesPerFlip = 0;
 };
+
+constexpr std::uint64_t FlipHeadroom = 2;
+constexpr unsigned FlipStallMillis = 100;
+
+inline bool FlipAllows(std::uint64_t bytesPerFlip, std::uint64_t consumed, std::uint64_t flipsSinceBase) {
+    return bytesPerFlip == 0 || consumed < bytesPerFlip * (flipsSinceBase + FlipHeadroom);
+}
 
 inline std::uint64_t DelayMicros(const Settings& settings, std::uint64_t bytes, double elapsedSeconds, double& carryMicros) {
     if (settings.microsPerMiB == 0 || elapsedSeconds >= settings.windowSeconds || bytes == 0) return 0;
@@ -20,6 +28,13 @@ inline std::uint64_t DelayMicros(const Settings& settings, std::uint64_t bytes, 
 
 Settings Current();
 void After(std::uint64_t bytes);
+std::uint64_t Flips();
+
+}
+
+extern "C" void LoaderFlipCompleted_nid_no_patch();
+
+namespace ReadThrottle {
 
 }
 

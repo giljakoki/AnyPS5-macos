@@ -5,6 +5,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include "prx/libkernel/System/include/CrashReport.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -81,6 +82,10 @@ static GuestThreadState& CurrentGuestState() {
     return state;
 #endif
 }
+const PthreadPrivate* CurrentGuestThread() {
+    return CurrentGuestState().current;
+}
+
 static std::mutex& stackLock = *new std::mutex();
 static std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>>& liveStacks = *new std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>>();
 static std::map<std::uintptr_t, std::size_t>& protectedStackPages = *new std::map<std::uintptr_t, std::size_t>();
@@ -453,6 +458,7 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     if (traceRaise && sigismember(&signalMask, SIGUSR1) == 1) std::fprintf(stderr, "[raise] guest thread %p '%s' was created by a thread with the host's SIGUSR1 blocked; unblocked\n", static_cast<void*>(self), self->name.c_str());
     for (const int emulatorSignal : {SIGUSR1, SIGBUS, SIGSEGV}) sigdelset(&signalMask, emulatorSignal);
     pthread_sigmask(SIG_SETMASK, &signalMask, nullptr);
+    CrashReport::PrepareThread();
 #endif
     finishThread(self, entry(arg));
     TimedWait::BindThreadRaiseState(nullptr);
