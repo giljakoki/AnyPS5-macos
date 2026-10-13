@@ -229,6 +229,32 @@ int main() {
         return all == 1000u && some != 0u && some <= 100u;
     });
 
+    const auto rebuiltOwnWords = [](bool narrowed) {
+        Builder b;
+        const auto [firstLow, firstHigh] = b.ballotWords(b.mask(40u));
+        const auto [secondLow, secondHigh] = b.ballotWords(b.mask(24u));
+        auto& low = b.wordAnd(*firstLow, *secondLow);
+        auto& high = b.wordAnd(*firstHigh, *secondHigh);
+        auto& exec = b.threadBit(low, high);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [runLow, runHigh] = b.ballotWords(b.truth());
+        auto& readLow = narrowed ? b.wordAnd(low, *runLow) : *firstLow;
+        auto& readHigh = narrowed ? b.wordAnd(high, *runHigh) : *firstHigh;
+        auto& read = b.threadBit(readLow, readHigh);
+        b.keep(b.select(read, b.add(written, 2u), old));
+        static_cast<void>(b.eliminate());
+        return removed(written);
+    };
+
+    passed &= run("an exec rebuilt from the write's own mask words implies the write's exec", [&] {
+        return rebuiltOwnWords(true);
+    });
+
+    passed &= run("an exec rebuilt from one ballot of the write's mask words keeps the select", [&] {
+        return !rebuiltOwnWords(false);
+    });
+
     passed &= run("a write read under a wider exec must keep its select", [] {
         Builder b;
         auto& wide = b.mask(32u);

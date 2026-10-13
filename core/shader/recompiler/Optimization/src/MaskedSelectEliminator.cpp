@@ -564,6 +564,7 @@ public:
 
     void Reset(const IrValue* writeMask, bool acrossLoops) {
         mask = writeMask;
+        maskWords = threadBit(writeMask, waveSize);
         loops = acrossLoops;
         always = alwaysTrue(writeMask, waveSize);
         running = always || everyRunningLane(writeMask, waveSize);
@@ -651,6 +652,7 @@ private:
 
     bool wordsImply(const IrValue* low, const IrValue* high, std::uint32_t depth) {
         if (isImmediate(low, 0u) && (waveSize == 32u || isImmediate(high, 0u))) return true;
+        if (maskWords && low == maskWords->low && (waveSize == 32u || high == maskWords->high)) return true;
         const ImplicationKey key{low, high};
         if (const auto known = lookup(key)) return *known;
         if (depth > ImplicationDepthLimit || work == 0) return false;
@@ -690,6 +692,7 @@ private:
     std::uint32_t waveSize;
     std::size_t& work;
     const IrValue* mask = nullptr;
+    std::optional<ThreadBit> maskWords;
     bool loops = false;
     bool always = false;
     bool running = false;
