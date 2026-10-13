@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -524,6 +525,84 @@ DrawProfile& Profile() {
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
+enum BatchBreak : std::size_t { BreakIneligible, BreakPass, BreakPipeline, BreakDescriptors, BreakCount };
+constexpr std::array<const char*, BreakCount> BatchBreakNames{"indirect, mesh, instanced or split", "render pass", "pipeline", "descriptors"};
+
+struct BatchProbeCounts {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> batchable{0};
+    std::atomic<std::uint64_t> longest{0};
+    std::array<std::atomic<std::uint64_t>, 8> lengths{};
+    std::array<std::atomic<std::uint64_t>, BreakCount> breaks{};
+    std::atomic<std::uint64_t> pushDiffers{0};
+};
+
+BatchProbeCounts& BatchProbe() {
+    static BatchProbeCounts& counts = *new BatchProbeCounts();
+    return counts;
+}
+
+struct BatchRun {
+    const void* pipeline = nullptr;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    const void* resources = nullptr;
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    bool pushKnown = false;
+    std::uint64_t length = 0;
+};
+
+thread_local BatchRun batchRun;
+
+void closeBatchRun() {
+    auto& counts = BatchProbe();
+    const auto length = batchRun.length;
+    if (length >= 2) {
+        counts.runs.fetch_add(1, std::memory_order_relaxed);
+        counts.batchable.fetch_add(length, std::memory_order_relaxed);
+        counts.lengths[std::min<std::size_t>(std::bit_width(length) - 1, counts.lengths.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+        auto longest = counts.longest.load(std::memory_order_relaxed);
+        while (length > longest && !counts.longest.compare_exchange_weak(longest, length, std::memory_order_relaxed)) {}
+    }
+    batchRun.length = 0;
+}
+
+void probeBatch(bool eligible, bool continued, const void* pipeline, VkDescriptorSet set, const void* resources, const std::array<std::byte, PipelinePushConstantBytes>* push) {
+    auto& counts = BatchProbe();
+    counts.draws.fetch_add(1, std::memory_order_relaxed);
+    BatchBreak why = BreakCount;
+    if (!eligible) why = BreakIneligible;
+    else if (batchRun.length == 0 || !continued) why = BreakPass;
+    else if (pipeline != batchRun.pipeline) why = BreakPipeline;
+    else if (set != batchRun.set || (set == VK_NULL_HANDLE && resources != batchRun.resources)) why = BreakDescriptors;
+    if (why == BreakCount) {
+        if (push != nullptr && batchRun.pushKnown && *push != batchRun.push) counts.pushDiffers.fetch_add(1, std::memory_order_relaxed);
+        ++batchRun.length;
+    } else {
+        if (batchRun.length != 0) counts.breaks[why].fetch_add(1, std::memory_order_relaxed);
+        closeBatchRun();
+        if (eligible) batchRun.length = 1;
+    }
+    batchRun.pipeline = pipeline;
+    batchRun.set = set;
+    batchRun.resources = resources;
+    batchRun.pushKnown = push != nullptr;
+    if (push != nullptr) batchRun.push = *push;
+}
+
+void reportBatchProbe() {
+    auto& counts = BatchProbe();
+    const auto draws = counts.draws.exchange(0, std::memory_order_relaxed);
+    if (draws == 0) return;
+    const auto runs = counts.runs.exchange(0, std::memory_order_relaxed);
+    const auto batchable = counts.batchable.exchange(0, std::memory_order_relaxed);
+    std::string lengths;
+    for (std::size_t i = 1; i < counts.lengths.size(); ++i) lengths += " " + std::to_string(1u << i) + (i + 1 == counts.lengths.size() ? "+:" : "-" + std::to_string((2u << i) - 1) + ":") + std::to_string(counts.lengths[i].exchange(0, std::memory_order_relaxed));
+    std::string breaks;
+    for (std::size_t i = 0; i < BreakCount; ++i) breaks += std::string(i == 0 ? " " : ", ") + BatchBreakNames[i] + " " + std::to_string(counts.breaks[i].exchange(0, std::memory_order_relaxed));
+    std::fprintf(stderr, "[draw-batch] %llu recorded draws (10 s): %llu in %llu runs of 2 or more that one multi-draw could record (%.0f%%, average run %.1f, longest %llu; runs by length%s); %llu of the joined draws changed their push constants; a run ended by:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(batchable), static_cast<unsigned long long>(runs), 100.0 * static_cast<double>(batchable) / static_cast<double>(draws), runs != 0 ? static_cast<double>(batchable) / static_cast<double>(runs) : 0.0, static_cast<unsigned long long>(counts.longest.exchange(0, std::memory_order_relaxed)), lengths.c_str(), static_cast<unsigned long long>(counts.pushDiffers.exchange(0, std::memory_order_relaxed)), breaks.c_str());
+}
+
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
@@ -621,6 +700,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    reportBatchProbe();
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -1839,6 +1919,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    if (timer.profile) probeBatch(!gpuIndirect && !meshIndirect && !state.stages.mesh && draw.instanceCount == 1 && !record.pipeline->SplitsFaces() && !record.pipeline->SplitsSecondChannel(), continued, record.pipeline.get(), drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE, &resources, record.pushBytes);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
