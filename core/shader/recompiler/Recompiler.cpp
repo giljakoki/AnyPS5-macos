@@ -1242,7 +1242,16 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 
 std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key) {
     if (handle == nullptr || !MatchesPreparedShader(request, *handle, key)) return std::nullopt;
-    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) {
+        static const bool always = std::getenv("APS5_VALIDATE_INPUT_INFO_EACH_USE") != nullptr;
+        thread_local std::unordered_map<const SourceHandle*, std::weak_ptr<const SourceHandle>> validated;
+        const auto found = validated.find(handle.get());
+        if (always || found == validated.end() || found->second.lock() != handle) {
+            static_cast<void>(RequestInputInfo(request));
+            if (validated.size() >= 4096) validated.clear();
+            validated[handle.get()] = handle;
+        }
+    }
     return PreparedShaderInvocation(request, handle);
 }
 
