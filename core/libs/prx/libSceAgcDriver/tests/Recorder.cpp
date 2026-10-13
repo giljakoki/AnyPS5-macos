@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -5845,8 +5846,45 @@ void pipelineLibraryTests(const Device& device) {
     std::cout << "Pipeline library reuse tests passed\n";
 }
 
+std::atomic<int> fakeFrees{0};
+
+VKAPI_ATTR void VKAPI_CALL fakeFreeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+    fakeFrees.fetch_add(1);
+}
+
+VKAPI_ATTR void VKAPI_CALL fakeDestroyDevice(VkDevice, const VkAllocationCallbacks*) {}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fakeDeviceProc(VkDevice, const char* name) {
+    if (std::string_view(name) == "vkFreeMemory") return reinterpret_cast<PFN_vkVoidFunction>(&fakeFreeMemory);
+    if (std::string_view(name) == "vkDestroyDevice") return reinterpret_cast<PFN_vkVoidFunction>(&fakeDestroyDevice);
+    return nullptr;
+}
+
+int gpuFreeDeferTests() {
+    const auto guarded = GuardDeviceProc(&fakeDeviceProc);
+    if (std::getenv("APS5_DEFER_GPU_FREES") == nullptr) {
+        Require(guarded == &fakeDeviceProc, "the device resolver was wrapped without a free knob");
+        std::cout << "skipped, APS5_DEFER_GPU_FREES is not set\n";
+        return 77;
+    }
+    Require(guarded != &fakeDeviceProc, "APS5_DEFER_GPU_FREES did not wrap the device resolver");
+    auto* device = reinterpret_cast<VkDevice>(std::uintptr_t{0x1000});
+    const auto freeMemory = reinterpret_cast<PFN_vkFreeMemory>(guarded(device, "vkFreeMemory"));
+    Require(freeMemory != &fakeFreeMemory, "vkFreeMemory is not guarded");
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x10}), nullptr);
+    Require(fakeFrees.load() == 0, "a free was not deferred");
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::strtoull(std::getenv("APS5_DEFER_GPU_FREES"), nullptr, 10) + 20));
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x20}), nullptr);
+    Require(fakeFrees.load() == 1, "a deferred free was not made once its delay passed (or the new one was not deferred)");
+    reinterpret_cast<PFN_vkDestroyDevice>(guarded(device, "vkDestroyDevice"))(device, nullptr);
+    Require(fakeFrees.load() == 2, "destroying the device did not make the deferred frees first");
+    std::cout << "GPU free deferral tests passed\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-free-defer-only") return gpuFreeDeferTests();
         std::unique_ptr<Device> created;
         try {
             created = std::make_unique<Device>();
