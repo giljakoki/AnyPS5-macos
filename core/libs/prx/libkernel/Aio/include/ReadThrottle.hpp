@@ -12,10 +12,19 @@ struct Settings {
 };
 
 constexpr std::uint64_t FlipHeadroom = 2;
-constexpr unsigned FlipStallMillis = 100;
+constexpr unsigned FlipStallMillis = 2000;
 
-inline bool FlipAllows(std::uint64_t bytesPerFlip, std::uint64_t consumed, std::uint64_t flipsSinceBase) {
-    return bytesPerFlip == 0 || consumed < bytesPerFlip * (flipsSinceBase + FlipHeadroom);
+inline std::int64_t FlipCapacity(std::uint64_t bytesPerFlip) {
+    return static_cast<std::int64_t>(bytesPerFlip * FlipHeadroom);
+}
+
+inline std::int64_t FlipRefill(std::int64_t credit, std::uint64_t bytesPerFlip) {
+    const auto refilled = credit + static_cast<std::int64_t>(bytesPerFlip);
+    return refilled < FlipCapacity(bytesPerFlip) ? refilled : FlipCapacity(bytesPerFlip);
+}
+
+inline bool FlipAdmits(std::uint64_t bytesPerFlip, std::int64_t credit) {
+    return bytesPerFlip == 0 || credit > 0;
 }
 
 inline std::uint64_t DelayMicros(const Settings& settings, std::uint64_t bytes, double elapsedSeconds, double& carryMicros) {
@@ -31,6 +40,7 @@ struct PacingTotals {
     std::uint64_t heldReads = 0;
     std::uint64_t releasedByFlip = 0;
     std::uint64_t stalls = 0;
+    std::int64_t credit = 0;
 };
 
 Settings Current();
