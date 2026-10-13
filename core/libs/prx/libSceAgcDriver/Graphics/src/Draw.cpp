@@ -1730,17 +1730,31 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-std::string describePrograms(std::span<const CompiledShader> shaders) {
-    std::string text;
-    for (const auto& shader : shaders) {
-        char address[48];
-        std::snprintf(address, sizeof(address), "%s0x%llx", text.empty() ? "" : ", ", static_cast<unsigned long long>(shader.guestAddress));
-        text += address;
+struct ProgramAddresses {
+    std::array<std::uint64_t, 6> addresses{};
+    std::size_t count = 0;
+
+    std::string Text() const {
+        std::string text;
+        for (std::size_t index = 0; index < count; ++index) {
+            char address[48];
+            std::snprintf(address, sizeof(address), "%s0x%llx", text.empty() ? "" : ", ", static_cast<unsigned long long>(addresses[index]));
+            text += address;
+        }
+        return text;
     }
-    return text;
+};
+
+ProgramAddresses describePrograms(std::span<const CompiledShader> shaders) {
+    ProgramAddresses programs;
+    for (const auto& shader : shaders) {
+        if (programs.count == programs.addresses.size()) break;
+        programs.addresses[programs.count++] = shader.guestAddress;
+    }
+    return programs;
 }
 
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::string programs) {
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, ProgramAddresses programs) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1766,12 +1780,12 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
         // registration (a throw there leaves nothing behind).
         auto writers = DrawCopiedWriters();
-        recorder.OnComplete([resources, writers, programs = std::move(programs)] {
+        recorder.OnComplete([resources, writers, programs] {
             writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
             try {
                 resources->WriteBackBuffers();
             } catch (const std::exception& error) {
-                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs + ")");
+                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs.Text() + ")");
             }
         });
         writers->push_back(resources);
@@ -1780,14 +1794,14 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             try {
                 resources->CheckFaults();
             } catch (const std::exception& error) {
-                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs + ")");
+                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs.Text() + ")");
             }
         });
-        else recorder.OnComplete([resources, programs = std::move(programs)] {
+        else recorder.OnComplete([resources, programs] {
             try {
                 resources->WriteBackBuffers();
             } catch (const std::exception& error) {
-                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs + ")");
+                throw std::runtime_error(std::string(error.what()) + " (draw programs " + programs.Text() + ")");
             }
         });
     }

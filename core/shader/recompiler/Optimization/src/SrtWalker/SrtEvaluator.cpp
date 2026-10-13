@@ -191,6 +191,11 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
                 return false;
             }
             result = _runtime.userData[reg - _program.userDataBase];
+            if (_runtime.userDataRead != nullptr) {
+                auto& read = *_runtime.userDataRead;
+                if (read.size() <= reg - _program.userDataBase) read.resize(reg - _program.userDataBase + 1u, 0u);
+                read[reg - _program.userDataBase] = 1u;
+            }
             return true;
         }
         case IrOpcode::GetShaderBase: result = _runtime.shaderBase; return true;

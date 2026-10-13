@@ -534,6 +534,32 @@ void verifyCaptureMemo() {
     const auto holdsSecond = std::ranges::any_of(changedCapture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(second.begin(), second.end(), value.dwords.begin()); });
     require(holdsSecond, "capture memo: the walk after the change did not read the new T#");
     std::copy(first.begin(), first.end(), srt.begin());
+    if (std::getenv("APS5_CAPTURE_MEMO_ALL_USER_DATA") == nullptr) {
+        std::array<std::uint32_t, 4> wide{userData[0], userData[1], 0x1111u, 0x2222u};
+        auto wideRequest = request;
+        wideRequest.context.userData = wide;
+        const auto widePrepared = PrepareShader(wideRequest);
+        require(widePrepared != nullptr, "capture memo: the four-word shader was not prepared");
+        const auto wideInvocation = PreparedShaderInvocation::TryCreate(wideRequest, widePrepared);
+        require(wideInvocation.has_value(), "capture memo: no four-word prepared invocation");
+        AgcDriver::ShaderMemory before({});
+        const auto original = before.Capture(*wideInvocation);
+        wide[3] = 0x3333u;
+        const auto hitsBefore = AgcDriver::ShaderMemory::CaptureMemoHits();
+        AgcDriver::ShaderMemory after({});
+        const auto reused = after.Capture(*wideInvocation);
+        require(AgcDriver::ShaderMemory::CaptureMemoHits() == hitsBefore + 1, "capture memo: a user-data word the walk never read made it walk again");
+        require(reused->snapshot.userData.size() == 4 && reused->snapshot.userData[3] == 0x3333u && original->snapshot.userData[3] == 0x2222u, "capture memo: the reused capture does not carry the draw's own user data");
+        require(std::ranges::equal(original->snapshot.images, reused->snapshot.images, [](const auto& left, const auto& right) { return left.dwords == right.dwords; }), "capture memo: the reused capture holds other T#s");
+        const auto copied = srt;
+        const auto table = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(copied.data()));
+        wide[0] = static_cast<std::uint32_t>(table);
+        wide[1] = static_cast<std::uint32_t>(table >> 32u);
+        const auto hitsMoved = AgcDriver::ShaderMemory::CaptureMemoHits();
+        AgcDriver::ShaderMemory moved({});
+        static_cast<void>(moved.Capture(*wideInvocation));
+        require(AgcDriver::ShaderMemory::CaptureMemoHits() == hitsMoved, "capture memo: a walk was reused after a user-data word it read changed");
+    }
     if (std::getenv("APS5_NO_CAPTURE_PAGE_MEMO") == nullptr) {
         static std::uint64_t state = 1;
         static int queries = 0;
