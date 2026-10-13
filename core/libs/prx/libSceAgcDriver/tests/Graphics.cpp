@@ -4800,6 +4800,31 @@ void validationTests() {
         attribute.components = 2;
         attribute.resource.fields[1] |= 0x80000000u;
         expectFailure([&] { AgcDriver::Graphics::BuildVertexInputLayout(context, std::span(&attribute, 1)); }, "descriptor flags");
+        attribute.resource.fields[1] &= ~0x80000000u;
+        static int queries = 0;
+        context.formatProperties = [](VkPhysicalDevice physical, VkFormat format, VkFormatProperties* properties) {
+            ++queries;
+            *properties = {};
+            if (format == VK_FORMAT_R32G32_SFLOAT && physical == reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x10})) properties->bufferFeatures = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+        };
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x10});
+        context.limits.maxVertexInputAttributes = 128;
+        context.limits.maxVertexInputBindings = 128;
+        std::array<ShaderRecompiler::VertexAttribute, 3> several{attribute, attribute, attribute};
+        several[1].location = 63;
+        several[2].location = 100;
+        for (int round = 0; round < 3; ++round) {
+            const auto built = AgcDriver::Graphics::BuildVertexInputLayout(context, several);
+            Require(built.bindings.size() == 3 && built.attributes[1].location == 63 && built.attributes[2].location == 100 && built.attributes[2].binding == 2, "a layout with locations past 63 lost an attribute");
+        }
+        Require(!AgcDriver::Graphics::VertexFormatMemoEnabled() || queries == 1, "the vertex format support was queried again for a known device and format");
+        several[2].location = 63;
+        expectFailure([&] { AgcDriver::Graphics::BuildVertexInputLayout(context, several); }, "duplicate vertex attribute location");
+        several[2].location = 100;
+        several[1].location = 100;
+        expectFailure([&] { AgcDriver::Graphics::BuildVertexInputLayout(context, several); }, "duplicate vertex attribute location");
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x20});
+        expectFailure([&] { AgcDriver::Graphics::BuildVertexInputLayout(context, std::span(&attribute, 1)); }, "device does not support vertex format");
     }
     for (const auto capability : {spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT}) {
         ShaderRecompiler::RecompileResult vertex;
