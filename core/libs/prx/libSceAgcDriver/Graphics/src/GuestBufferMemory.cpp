@@ -159,6 +159,7 @@ struct HostImports {
     std::map<VkDevice, std::vector<std::shared_ptr<RetiredImport>>> parked;
     std::vector<std::shared_ptr<RetiredImport>> retiredUnlocked;
     std::uint64_t liveBytes = 0;
+    std::uint64_t partialWindowsSkipped = 0;
     std::set<std::uint64_t> failed;
     std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
@@ -2183,9 +2184,14 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     }
     bool declined = false;
+    static const bool eagerPartial = std::getenv("APS5_EAGER_PARTIAL_IMPORTS") != nullptr;
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
+        if (!eagerPartial && window != 0 && importRun(current, range->address).bytes < window) {
+            ++state.partialWindowsSkipped;
+            continue;
+        }
         try {
             if (importAllocation(context, state, range->address, current, locked ? nullptr : &declined) == nullptr && !declined && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
             declined = false;

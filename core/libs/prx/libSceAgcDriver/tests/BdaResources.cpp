@@ -195,6 +195,37 @@ void importWindowTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
+void partialWindowMappingTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    void* block = ::operator new(window, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto map = [&](std::uint8_t* range) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(reinterpret_cast<std::uintptr_t>(range), piece);
+        GuestAllocations::Mapped mapped(lease.begin(), lease.end());
+        ImportMappedRanges(importing, mapped, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true);
+    };
+    map(guest);
+    Require(!HostImportCovers(importing, first, piece), "a mapping that leaves its import window partly unmapped was imported at once");
+    map(guest + piece);
+    Require(HostImportCovers(importing, first, window), "a mapping that completes its import window was not imported as the whole window");
+    for (auto* range : {guest, guest + piece}) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    HostImportFor(importing, first, piece);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1153,6 +1184,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     retiredImportAddressTests(context, access);
+    partialWindowMappingTests(context);
     importSpanTests(context);
     importWindowTests(context);
     heapMirrorTests(context, access);
