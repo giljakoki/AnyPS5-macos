@@ -83,6 +83,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 entry.address = label->address;
                 entry.size = bytes.size();
                 std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
+                if (Graphics::UploadTraceEnabled()) entry.queuedAt = std::chrono::steady_clock::now();
                 ++queuedLabels;
                 wroteOnGpu = true;
             } else {

@@ -536,6 +536,7 @@ private:
         std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
         std::uint32_t tracedLabels = 0;
+        std::vector<std::tuple<std::uint64_t, std::uint32_t, std::chrono::steady_clock::time_point>> tracedLabelTimes;
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
         std::shared_ptr<void> samplePool;
