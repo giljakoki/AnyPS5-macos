@@ -350,17 +350,29 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
 }
 
+bool releasedWithin(const std::function<bool()>& released, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!released()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 void keepPastNextBatchTests(Recorder& recorder) {
+    Require(recorder.Idle(), "the recorder is busy before the keep tests");
     auto object = std::make_shared<int>(7);
     const std::weak_ptr<int> watched = object;
     recorder.KeepPastNextBatch(std::move(object));
+    Require(recorder.CarriedObjects() == 1, "an object kept past the next batch while no batch was open is not carried");
     recorder.Sync();
     recorder.FlushDeferredReleases();
-    Require(!watched.expired(), "an object kept past the next batch was released with the batch open when it was kept");
+    Require(!releasedWithin([&] { return watched.expired(); }, std::chrono::milliseconds(50)), "an object kept past the next batch was released with the batch open when it was kept");
     recorder.Keep(std::make_shared<int>(0));
+    Require(recorder.CarriedObjects() == 0, "the next batch did not take the carried object");
     recorder.Sync();
     recorder.FlushDeferredReleases();
-    Require(watched.expired(), "an object kept past the next batch outlived that batch");
+    Require(releasedWithin([&] { return watched.expired(); }, std::chrono::seconds(5)), "an object kept past the next batch outlived that batch");
 }
 
 void writeSettledTests(const Device& device, Recorder& recorder) {
@@ -973,6 +985,117 @@ void remappedImportTests(const Device& device) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+}
+
+void* allocateImportBlock(std::size_t alignment, std::size_t bytes) {
+#ifdef _WIN32
+    static_cast<void>(alignment);
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    return std::aligned_alloc(alignment, bytes);
+#endif
+}
+
+void releaseImportBlock(void* block) {
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+}
+
+int importLifetimeTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "skipped, host imports are unavailable\n";
+        return 77;
+    }
+    const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536u, context.hostImportAlignment));
+    {
+        void* block = allocateImportBlock(alignment, alignment);
+        Require(block != nullptr, "cannot allocate the remap block");
+        std::memset(block, 0, alignment);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, alignment, true, true, true);
+        }
+        const auto* import = HostImportFor(context, address, alignment);
+        if (import == nullptr) {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+            std::cout << "skipped, the host import was refused\n";
+            return 77;
+        }
+        const auto serial = HostImportSerial(context, address, alignment, true);
+        const std::array<std::byte, 4> value{std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12}};
+        recorder.RecordStore(import->buffer, 64, value, address + 64);
+        recorder.Submit();
+        Require(!recorder.Idle(), "the store's batch is not in flight");
+        const auto alive = RetiredImportsAlive();
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+            mutation.Add(block, alignment, true, true, true);
+        }
+        Require(std::memcmp(static_cast<const std::byte*>(block) + 64, value.data(), value.size()) == 0, "the remap proceeded before the batch storing through the old import ran");
+        const auto work = recorder.Summary();
+        Require(recorder.Idle() && work.submitQueue.jobs == 0 && work.carried == 0, "the remap proceeded with batches queued on the submit thread or objects carried");
+        Require(RetiredImportsAlive() == alive, "the remap proceeded before the retired import was destroyed");
+        Require(HostImportFor(context, address, alignment) != nullptr && HostImportSerial(context, address, alignment, true) != serial, "the remapped range kept its old import");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        HostImportFor(context, address, alignment);
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        releaseImportBlock(block);
+    }
+    {
+        void* block = allocateImportBlock(alignment, 2 * alignment);
+        Require(block != nullptr, "cannot allocate the merge block");
+        std::memset(block, 0, 2 * alignment);
+        auto* second = static_cast<std::byte*>(block) + alignment;
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, alignment, true, true, true);
+        }
+        Require(HostImportFor(context, address, alignment) != nullptr, "the first half was not imported");
+        const auto serial = HostImportSerial(context, address, alignment, false);
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        const auto alive = RetiredImportsAlive();
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(second, alignment, true, true, true);
+        }
+        std::thread unlocked([&] { HostImportFor(context, address, 2 * alignment); });
+        unlocked.join();
+        Require(HostImportSerial(context, address, alignment, false) != serial, "the import of the first half survived its run growing");
+        Require(recorder.Idle() && recorder.CarriedObjects() == 0, "a retirement outside the device lock reached the recorder");
+        Require(RetiredImportsAlive() == alive + 1, "an import retired outside the device lock was not kept");
+        Require(HostImportFor(context, address, alignment) != nullptr, "the merged run has no import");
+        Require(recorder.CarriedObjects() == 1 && RetiredImportsAlive() == alive + 1, "the device lock's next import lookup did not hand the retired import to the recorder");
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        Require(!releasedWithin([&] { return RetiredImportsAlive() == alive; }, std::chrono::milliseconds(50)), "the retired import was released with the batch open when it was handed over");
+        recorder.SettleCarried();
+        recorder.FlushDeferredReleases();
+        Require(recorder.CarriedObjects() == 0 && releasedWithin([&] { return RetiredImportsAlive() == alive; }, std::chrono::seconds(5)), "settling the carried objects did not release the retired import");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(second);
+            mutation.Remove(block);
+        }
+        HostImportFor(context, address, alignment);
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        releaseImportBlock(block);
+    }
+    std::cout << "Host import lifetime tests passed\n";
+    return 0;
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -5753,6 +5876,7 @@ int main(int argc, char** argv) {
             unitShadowTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--import-lifetime-only") return importLifetimeTests(device, recorder);
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
             cmaskPassTests(device, recorder);
             std::cout << "CMASK copied clear, write-back and failure tests passed\n";

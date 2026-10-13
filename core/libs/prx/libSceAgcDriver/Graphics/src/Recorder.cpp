@@ -2519,8 +2519,8 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
 }
 
 void Recorder::KeepPastNextBatch(std::shared_ptr<void> object) {
-    carriedToNextBatch.push_back(object);
-    Keep(std::move(object));
+    Keep(object);
+    carriedToNextBatch.push_back(std::move(object));
 }
 
 void Recorder::SettleCarried() {
