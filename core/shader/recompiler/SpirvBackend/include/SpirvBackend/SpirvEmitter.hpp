@@ -21,6 +21,7 @@ struct SpirvTargetOptions {
     bool nonConstantImageOffsets = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool float64AsFloat32 = false;
     bool stageSubgroups = true;
 };
 

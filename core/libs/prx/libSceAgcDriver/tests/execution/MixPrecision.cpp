@@ -22,6 +22,7 @@ constexpr std::uint32_t Float64Capability = 10;
 constexpr std::uint32_t Threads = 64;
 constexpr std::uint32_t Inputs = 4;
 constexpr std::uint32_t Results = 16;
+bool Float64AsFloat32 = false;
 alignas(256) std::array<std::uint32_t, Threads * Inputs> Input{};
 alignas(256) std::array<std::uint32_t, Threads * Results> Output{};
 
@@ -210,10 +211,12 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, c
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0, {false, false, false}, false, 1};
+    auto target = device.Target();
+    target.float64AsFloat32 = Float64AsFloat32;
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        target,
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -287,17 +290,15 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto capabilities = device->Target().supportedCapabilities;
-        if (std::find(capabilities.begin(), capabilities.end(), Float64Capability) == capabilities.end()) {
-            std::puts("skipped, v_fma_mixlo_f16 and v_fma_mixhi_f16 are computed in f64 and the device has no shaderFloat64");
-            return VulkanTestSkipped;
-        }
+        Float64AsFloat32 = std::find(capabilities.begin(), capabilities.end(), Float64Capability) == capabilities.end();
+        if (Float64AsFloat32) std::puts("the device has no shaderFloat64: checking the f32 lowering of APS5_F64_AS_F32");
         FillInput();
         Run(*device, MixCode);
         Check();
         FillRoundingInput();
         Run(*device, RoundingCode);
         CheckRounding();
-        for (std::uint32_t rounding = 0; rounding < 4u; ++rounding) {
+        for (std::uint32_t rounding = 0; rounding < (Float64AsFloat32 ? 1u : 4u); ++rounding) {
             FillDirectedInput();
             Run(*device, RoundingCode, ShaderRecompiler::ShaderFloatMode{0xc0u | (rounding << 2u), true, false, false});
             CheckDirected(rounding);

@@ -2952,6 +2952,11 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    static const bool float64AsFloat32 = [] {
+        const char* value = std::getenv("APS5_F64_AS_F32");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    target.float64AsFloat32 = float64AsFloat32 && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFloat64)) == state->capabilities.end();
     target.subgroupStages = state->subgroup.supportedStages;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
