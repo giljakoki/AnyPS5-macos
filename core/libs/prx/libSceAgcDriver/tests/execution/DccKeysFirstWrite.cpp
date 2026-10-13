@@ -563,6 +563,56 @@ void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 
 }
 
+void RunWriteBackLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, userData, false);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr, "the looped image has no pending results");
+    const auto require = [](bool held, const char* what, int frame) {
+        if (held) return;
+        char message[160];
+        std::snprintf(message, sizeof(message), "%s (frame %d)", what, frame);
+        throw std::runtime_error(message);
+    };
+    for (int frame = 0; frame < 18; ++frame) {
+        if (frame == 12) {
+            device.WaitIdle();
+            std::memset(block + SurfaceBytes, 0x67, SurfaceBytes);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            AgcDriver::Graphics::Recorder::CountPresent();
+            require(!image->Refresh(), "a CPU store beside pending results was missed", frame);
+        }
+        if (frame == 6) {
+            StorageTexture::FlushAllPending("idle");
+            device.WaitIdle();
+            std::memset(block, 0x66, BlockBytes);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            AgcDriver::Graphics::Recorder::CountPresent();
+            require(!image->Refresh(), "a CPU store over the whole target was missed", frame);
+            Dispatch(device, WriteCode, userData, false);
+        }
+        StorageTexture::FlushAllPending("idle");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::Graphics::Recorder::CountPresent();
+        require(image->Refresh(), "a target was uploaded again after its idle write-back and a present", frame);
+        Dispatch(device, WriteCode, userData, false);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        require(image->Refresh(), "a target drawn again after its idle write-back was uploaded again", frame);
+    }
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test write-back loop");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u && Count(block + SurfaceBytes, SurfaceBytes, 0x67) == SurfaceBytes, "the looped GPU results were lost");
+    std::cout << "draw, idle write-back, present, draw again: ok\n";
+}
+
 int main() {
     try {
         std::optional<GuestBlock> block;
@@ -579,6 +629,9 @@ int main() {
         std::optional<GuestBlock> unwaited;
         unwaited.emplace(false);
         RunUntrackedRefreshWithoutWait(*device, unwaited->Data());
+        std::optional<GuestBlock> looped;
+        looped.emplace(false);
+        RunWriteBackLoop(*device, looped->Data());
         std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());
