@@ -153,6 +153,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/DepthStoreClear.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/CaptureDiagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/CaptureValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WriteEvidence.cpp
@@ -197,6 +198,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/QueueSubmitter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GpuFreeTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StaleHandleTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -863,6 +866,14 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_host_import_unmap COMMAND agc_driver_recorder_tests --host-import-unmap-only)
     set_tests_properties(agc_host_import_unmap PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME agc_gpu_free_defer COMMAND agc_driver_recorder_tests --gpu-free-defer-only)
+    set_tests_properties(agc_gpu_free_defer PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_DEFER_GPU_FREES=50;APS5_TRACE_GPU_FREES=1")
+    add_test(NAME agc_gpu_free_batch_defer COMMAND agc_driver_recorder_tests --gpu-free-batch-defer-only)
+    set_tests_properties(agc_gpu_free_batch_defer PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_DEFER_GPU_FREES=batches:0")
+    add_test(NAME agc_stale_handles COMMAND agc_driver_recorder_tests --stale-handles-only)
+    set_tests_properties(agc_stale_handles PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_TRACE_STALE_HANDLES=1")
+    add_test(NAME agc_import_lifetime COMMAND agc_driver_recorder_tests --import-lifetime-only)
+    set_tests_properties(agc_import_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_PIN_WAIT_MS=10000")
     add_test(NAME agc_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
     set_tests_properties(agc_unit_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     add_test(NAME agc_descriptor_pool_recycling COMMAND agc_driver_recorder_tests --descriptor-pool-only)
@@ -872,7 +883,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_multisample_guest_access COMMAND agc_driver_recorder_tests --multisample-only)
     set_tests_properties(agc_multisample_guest_access PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_host_import_unmap agc_unit_shadow agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_multisample_guest_access agc_submit_signaling PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_host_import_unmap agc_import_lifetime agc_unit_shadow agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_multisample_guest_access agc_submit_signaling PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -908,6 +919,21 @@ target_link_libraries(agc_driver_pm4_tests PRIVATE
 set_target_properties(agc_driver_pm4_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_pm4_tests)
 
+add_test_executable(agc_free_gate_tests EXCLUDE_FROM_ALL tests/FreeGate.cpp)
+target_include_directories(agc_free_gate_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_free_gate_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_free_gate_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_free_gate_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_free_gate_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_free_gate COMMAND agc_free_gate_tests)
+    set_tests_properties(agc_free_gate PROPERTIES ENVIRONMENT "APS5_FREE_GATE=1")
+    if(WIN32)
+        set_tests_properties(agc_free_gate PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/Graphics.cpp
         tests/ColorTargetLayout.cpp
@@ -930,6 +956,8 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
         Graphics/src/QueueSubmitter.cpp
+        Graphics/src/GpuFreeTrace.cpp
+        Graphics/src/StaleHandleTrace.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/ShaderResources.cpp
         Graphics/src/ShaderAddressResources.cpp
@@ -989,6 +1017,8 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         Execution/src/BdaFeatures.cpp
         Graphics/src/Resources.cpp
         Graphics/src/QueueSubmitter.cpp
+        Graphics/src/GpuFreeTrace.cpp
+        Graphics/src/StaleHandleTrace.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/BufferAddress.cpp
 )

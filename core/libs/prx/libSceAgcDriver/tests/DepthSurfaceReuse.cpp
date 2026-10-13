@@ -2,10 +2,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -90,7 +92,17 @@ VKAPI_ATTR void VKAPI_CALL destroyImageView(VkDevice, VkImageView, const VkAlloc
 VKAPI_ATTR void VKAPI_CALL destroyImage(VkDevice, VkImage, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL freeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL cmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
-VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue*, std::uint32_t, const VkImageSubresourceRange*) {}
+float lastClearDepth = -1.0f;
+std::uint32_t lastClearStencil = 0;
+VkImageAspectFlags lastClearAspects = 0;
+std::uint32_t clears = 0;
+
+VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue* value, std::uint32_t, const VkImageSubresourceRange* ranges) {
+    lastClearDepth = value->depth;
+    lastClearStencil = value->stencil;
+    lastClearAspects = ranges->aspectMask;
+    ++clears;
+}
 
 VKAPI_ATTR void VKAPI_CALL formatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
     *properties = {};
@@ -187,6 +199,13 @@ void RunDepthSurfaceReuseTests() {
     Require(lookup(context, {stencil, FormatR32Float, 320, 180}) == nullptr, "an R32F view of a stencil plane's own extent must be read as reused memory");
 
     Require(DepthSurfaceAt(depth32) && DepthSurfaceAt(depth16) && DepthSurfaceAt(depthStencil) && DepthSurfaceAt(stencil), "every bound depth and stencil plane must be known as a depth surface");
+    {
+        const auto before = clears;
+        std::string refusal;
+        Require(!ClearDepthSurface(context, stencil, 320, 180, 0.5f, &refusal) && refusal.find("stencil plane") != std::string::npos && clears == before, "a depth clear of a stencil plane must be refused as one");
+        Require(ClearStencilSurface(context, stencil, 320, 180, 0x5a) && clears == before + 1 && lastClearStencil == 0x5a && lastClearAspects == VK_IMAGE_ASPECT_STENCIL_BIT, "a stencil clear by store must clear only the stencil aspect with the stored value");
+        Require(!ClearStencilSurface(context, stencil, 160, 180, 1) && !ClearStencilSurface(context, depthStencil, 320, 180, 1) && clears == before + 1, "a narrower stencil clear, or one of the depth plane, must be refused");
+    }
     static int otherDeviceTag = 0;
     auto otherDevice = context;
     otherDevice.device = reinterpret_cast<VkDevice>(&otherDeviceTag);
@@ -203,6 +222,43 @@ void RunDepthSurfaceReuseTests() {
     Require(DepthSurfaceAt(depth32) && first != VK_NULL_HANDLE, "a depth target bound again after its retirement gets a fresh surface");
     Require(DepthSurfaceView(context, {depth32, 0, {384, 384}, VK_FORMAT_D32_SFLOAT, 1.0f, 0}) == first, "the fresh surface serves the next binding of the same target");
     Require(lookup(context, {depth32, FormatR32Float, 384, 384}) != nullptr, "the fresh surface serves samples again");
+
+    static constexpr std::array<std::uint32_t, 12> storeKernel{0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u, 0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du, 0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u};
+    const auto storeUserData = [](std::uint64_t image, std::uint32_t width, std::uint32_t height, std::uint64_t value) {
+        std::array<std::uint32_t, 12> words{};
+        const auto descriptor = tsharp({image, FormatR32Float, width, height, TileDepth64KB, Type2DArray});
+        std::copy(descriptor.begin(), descriptor.end(), words.begin());
+        words[8] = static_cast<std::uint32_t>(value);
+        words[9] = static_cast<std::uint32_t>(value >> 32u);
+        words[10] = 16u;
+        return words;
+    };
+    const std::array<std::uint32_t, 3> threads{8u, 8u, 1u};
+    const auto covering = storeUserData(depth32, 384, 384, 0x7000);
+    const auto match = MatchDepthStoreClear(storeKernel, covering, threads, {48u, 48u, 1u});
+    Require(match && match->image == depth32 && match->width == 384 && match->height == 384 && match->value == 0x7000, "a constant image_store over a whole 2D surface must be recognised as a clear");
+    Require(!MatchDepthStoreClear(storeKernel, covering, threads, {47u, 48u, 1u}), "a constant image_store that misses a column must not be a clear");
+    Require(!MatchDepthStoreClear(storeKernel, covering, {8u, 4u, 1u}, {48u, 96u, 1u}), "another thread shape must not be recognised");
+    const auto odd = storeUserData(depth32, 380, 378, 0x7000);
+    const auto partialMatch = MatchDepthStoreClear(storeKernel, odd, threads, {48u, 48u, 1u}, {380u, 378u, 1u});
+    Require(partialMatch && partialMatch->width == 380 && partialMatch->height == 378, "a constant image_store whose partial last groups end at the image edge must be recognised as a clear");
+    const char* refusal = nullptr;
+    Require(!MatchDepthStoreClear(storeKernel, covering, threads, {48u, 48u, 1u}, {380u, 384u, 1u}, &refusal) && refusal != nullptr && std::string_view(refusal).find("cover") != std::string_view::npos, "partial last groups that stop short of the image must be refused as not covering it");
+    refusal = nullptr;
+    Require(!MatchDepthStoreClear(storeKernel, covering, {8u, 4u, 1u}, {48u, 96u, 1u}, {}, &refusal) && refusal != nullptr && std::string_view(refusal).find("thread group") != std::string_view::npos, "a refused thread shape must say so");
+    Require(DepthStoreKernel(storeKernel) && !DepthStoreKernel(std::span(storeKernel).first(11)), "only the whole store kernel is a depth store kernel");
+    static constexpr std::array<std::uint32_t, 15> storeVectorKernel{0xd7460004u, 0x0401060cu, 0xf4280404u, 0xfa000000u, 0xd7460005u, 0x0405060du, 0x7e0c020eu, 0xbf8cc07fu, 0x7e000210u, 0x7e020211u, 0x7e040212u, 0x7e060213u, 0xf0200f28u, 0x00000004u, 0xbf810000u};
+    const auto vectorMatch = MatchDepthStoreClear(storeVectorKernel, covering, threads, {48u, 48u, 1u});
+    Require(vectorMatch && vectorMatch->image == depth32 && vectorMatch->value == 0x7000, "a four-component constant image_store over a whole 2D surface must be recognised as a clear of its first component");
+    auto patched = storeKernel;
+    patched[5] = 0x7e060203u;
+    Require(!MatchDepthStoreClear(patched, covering, threads, {48u, 48u, 1u}), "a store of another value must not be recognised");
+    Require(!MatchDepthStoreClear(storeKernel, storeUserData(depth32, 384, 384, 0), threads, {48u, 48u, 1u}), "a null value buffer must not be recognised");
+    const auto before = clears;
+    Require(ClearDepthSurface(context, depth32, 384, 384, 0.25f) && clears == before + 1 && lastClearDepth == 0.25f, "a recognised clear of a depth surface must clear its depth plane with the stored value");
+    std::string narrow;
+    Require(!ClearDepthSurface(context, depth32, 192, 384, 0.5f, &narrow) && clears == before + 1 && narrow.find("192x384") != std::string::npos, "a clear narrower than the depth surface must be refused and say why");
+    Require(!ClearDepthSurface(context, 0x70000000, 384, 384, 0.5f), "a clear of memory without a depth surface must be refused");
 
     ClearDepthSurfaces(context.device);
 }

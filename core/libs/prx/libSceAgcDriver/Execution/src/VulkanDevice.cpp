@@ -28,6 +28,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -349,7 +350,7 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::mutex meshPassThroughMutex;
-    std::map<std::uint64_t, std::shared_ptr<const ShaderRecompiler::RecompileResult>> meshPassThrough;
+    std::map<std::pair<std::uint64_t, bool>, std::shared_ptr<const ShaderRecompiler::RecompileResult>> meshPassThrough;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::PlaceholderImages> placeholderImages;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -948,7 +949,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->window = window->context;
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
-    state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+    state->deviceProc = Graphics::GuardDeviceProc(state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr"));
     const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
     std::uint32_t count = 0;
     check(enumerate(state->instance, &count, nullptr), "vkEnumeratePhysicalDevices");
@@ -1119,6 +1120,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // A device that advertises VK_KHR_portability_subset (MoltenVK) must have it enabled.
     if (hasExtension("VK_KHR_portability_subset")) deviceExtensions.push_back("VK_KHR_portability_subset");
     state->invertedDepthBounds = !hasExtension("VK_KHR_portability_subset");
+    if (hasExtension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
+    }
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1217,7 +1223,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hostProperties};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
         state->hostImportAlignment = hostProperties.minImportedHostPointerAlignment;
-        if (!compileOnly) Graphics::SetHostImportWindow(8ull << 20u);
+        if (!compileOnly) {
+            const char* window = std::getenv("APS5_HOST_IMPORT_WINDOW_MIB");
+            Graphics::SetHostImportWindow((window != nullptr ? std::strtoull(window, nullptr, 10) : 8ull) << 20u);
+        }
 #ifdef _WIN32
         // Imported pages are locked; locking is bounded by the process working-set minimum.
         if (const char* value = std::getenv("APS5_WORKING_SET_MIB"); value != nullptr && !compileOnly) {
@@ -3033,6 +3042,14 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
 }
 
+bool VulkanDevice::ClearDepthSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth, std::string* refusal) {
+    return Graphics::ClearDepthSurface(graphicsContext(), address, width, height, depth, refusal);
+}
+
+bool VulkanDevice::ClearStencilSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint8_t stencil, std::string* refusal) {
+    return Graphics::ClearStencilSurface(graphicsContext(), address, width, height, stencil, refusal);
+}
+
 Graphics::Context VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
@@ -3767,8 +3784,9 @@ void VulkanDevice::DrawMeshEmulated(const Graphics::State& graphics, const Pm4::
     std::shared_ptr<const ShaderRecompiler::RecompileResult> passThrough;
     {
         std::lock_guard lock(state->meshPassThroughMutex);
-        auto& cached = state->meshPassThrough[prepassProgram.PipelineVariantId()];
-        if (cached == nullptr || prepassProgram.PipelineVariantId() == 0) cached = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshPassThroughVertexShader(prepassProgram, Target()));
+        const bool layered = Graphics::RenderLayers(graphics) > 1u;
+        auto& cached = state->meshPassThrough[{prepassProgram.PipelineVariantId(), layered}];
+        if (cached == nullptr || prepassProgram.PipelineVariantId() == 0) cached = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshPassThroughVertexShader(prepassProgram, Target(), layered));
         passThrough = cached;
     }
     const auto context = graphicsContext();
@@ -4020,6 +4038,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    Graphics::Require(resources.DirectImportsCurrent(), "a host import the dispatch's descriptor set reads in place was retired after the set was proved");
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {

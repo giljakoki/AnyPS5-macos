@@ -89,6 +89,50 @@ void importCrossingTests(const Context& context, const BdaTestAccess& access) {
     ::operator delete(block, std::align_val_t{half});
 }
 
+void retiredImportAddressTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t half = 65536;
+    void* block = ::operator new(2 * half, std::align_val_t{half});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(guest, 0x33, half);
+    std::memset(guest + half, 0x44, half);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto second = first + half;
+    auto importing = context;
+    importing.hostImportAlignment = half;
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, half, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, true);
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        const auto* alone = HostImportFor(importing, first, half);
+        Require(alone != nullptr && alone->base == first && alone->bytes == half, "the first range was not imported alone");
+        const auto aloneSerial = HostImportSerial(importing, first, half, false);
+        leased.AddReadable(first + 64, 16);
+        leased.Upload(true);
+        change(guest + half, true);
+        const auto* merged = HostImportFor(importing, second, half);
+        Require(merged != nullptr && merged->base == first && merged->bytes == 2 * half && HostImportSerial(importing, first, half, false) != aloneSerial, "the grown run did not replace the first range's import");
+        const auto mergedAddress = merged->address;
+        bool covered = false;
+        for (const auto& range : leased.AddressRanges()) {
+            if (range.end <= first || range.begin >= second) continue;
+            covered = true;
+            Require(range.deviceAddress == mergedAddress + (range.begin - first), "a BDA range still names the retired import of its guest range");
+            Require(access.addressBytes(range.deviceAddress).size() >= range.end - range.begin, "the BDA range over the first range runs past the import");
+        }
+        Require(covered, "no BDA range covers the first range");
+    }
+    change(guest + half, false);
+    change(guest, false);
+    HostImportFor(importing, first, half);
+    ::operator delete(block, std::align_val_t{half});
+}
+
 void importSpanTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     void* block = ::operator new(3 * piece, std::align_val_t{piece});
@@ -147,6 +191,37 @@ void importWindowTests(const Context& context) {
     const auto* kept = HostImportFor(importing, first, 16);
     Require(kept != nullptr && kept->buffer == lowBuffer, "growth in one window re-imported another");
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
+void partialWindowMappingTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    void* block = ::operator new(window, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto map = [&](std::uint8_t* range) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(reinterpret_cast<std::uintptr_t>(range), piece);
+        GuestAllocations::Mapped mapped(lease.begin(), lease.end());
+        ImportMappedRanges(importing, mapped, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true);
+    };
+    map(guest);
+    Require(!HostImportCovers(importing, first, piece), "a mapping that leaves its import window partly unmapped was imported at once");
+    map(guest + piece);
+    Require(HostImportCovers(importing, first, window), "a mapping that completes its import window was not imported as the whole window");
+    for (auto* range : {guest, guest + piece}) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    HostImportFor(importing, first, piece);
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});
 }
@@ -1108,6 +1183,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == dropped.waiterDrops, "the free did not drop the cached address space");
     }
     importCrossingTests(context, access);
+    retiredImportAddressTests(context, access);
+    partialWindowMappingTests(context);
     importSpanTests(context);
     importWindowTests(context);
     heapMirrorTests(context, access);

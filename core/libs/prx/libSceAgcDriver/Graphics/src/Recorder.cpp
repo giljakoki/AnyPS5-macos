@@ -3,6 +3,10 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecorderProgress.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1220,6 +1224,19 @@ Recorder* Recorder::Active() {
     return activeRecorder;
 }
 
+namespace {
+// The buffer pool and the free tracer read batch progress through these (RecorderProgress.hpp).
+const RecorderProgressHooks progressHooks{
+    [] { return static_cast<const Recorder*>(Recorder::Active()); },
+    [](const Recorder& recorder) { return recorder.NewestSubmitted(); },
+    [](const Recorder& recorder, std::uint64_t serial) { return recorder.BatchFinished(serial); },
+};
+[[maybe_unused]] const bool progressHooksInstalled = [] {
+    InstallRecorderProgress(progressHooks);
+    return true;
+}();
+}
+
 void Recorder::Activate() {
     activeRecorder = this;
     {
@@ -1524,6 +1541,8 @@ void Recorder::ensureOpen() {
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
+        batch->kept.insert(batch->kept.end(), std::make_move_iterator(carriedToNextBatch.begin()), std::make_move_iterator(carriedToNextBatch.end()));
+        carriedToNextBatch.clear();
         open = std::move(batch);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
@@ -2513,6 +2532,36 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
+}
+
+void Recorder::KeepPastNextBatch(std::shared_ptr<void> object) {
+    Keep(object);
+    carriedToNextBatch.push_back(std::move(object));
+}
+
+void Recorder::SettleCarried() {
+    if (carriedToNextBatch.empty()) return;
+    ensureOpen();
+    Sync();
+}
+
+Recorder::WorkSummary Recorder::Summary() const {
+    WorkSummary summary;
+    summary.open = open != nullptr;
+    summary.openSerial = submissions + 1;
+    summary.inFlight = inFlight.size();
+    if (!inFlight.empty()) {
+        summary.firstInFlight = inFlight.front()->serial;
+        summary.lastInFlight = inFlight.back()->serial;
+    }
+    summary.unsignaled = UnsignaledBatches();
+    if (submitter != nullptr) summary.submitQueue = submitter->Pending();
+    summary.carried = carriedToNextBatch.size();
+    return summary;
+}
+
+void Recorder::DrainSubmitQueue() {
+    if (submitter != nullptr) submitter->Drain();
 }
 
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
@@ -3664,6 +3713,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
+            ReportImportRetirements("recorder fence wait failed");
+            ReportGpuFrees("recorder fence wait failed");
+            StaleHandleDump("recorder fence wait failed");
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }

@@ -645,7 +645,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         static bool reported = false;
         if (!reported) {
             reported = true;
-            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
+            std::fprintf(stderr, "[gpu] vertex layer exports select a slice only of a color view of several array slices, and viewport index exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
@@ -925,6 +925,15 @@ std::uint32_t ColorWriteMask(const Registers& context) {
     return mask;
 }
 
+std::uint32_t RenderLayers(const State& state) {
+    std::uint32_t layers = 1;
+    for (const auto& color : state.colors) layers = std::max(layers, color.arraySliceCount);
+    if (layers == 1) return 1;
+    for (const auto& color : state.colors) Require(color.arraySliceCount == layers, "layered color targets of different slice counts are unsupported");
+    Require(!state.depth.has_value(), "a depth target with layered color targets is unsupported");
+    return layers;
+}
+
 ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto stride = slot * 0xfu;
     ColorTarget color{};
@@ -954,7 +963,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    const auto lastSlice = (view >> 13u) & 0x1fffu;
+    Require(lastSlice >= slice, "the color view's last slice precedes its first");
     const auto viewMip = (view >> 26u) & 0xfu;
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
@@ -968,11 +978,16 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         color.depth = (attrib3 & 0x1fffu) + 1u;
         Require(maxMip == 0 && (info & 0x10000000u) == 0, "mipmapped or DCC 3D color targets are unsupported");
         Require(slice < color.depth, "the color view slice is beyond the 3D surface");
+        Require(lastSlice == slice, "color views of several 3D slices are unsupported");
         color.depthSlice = slice;
     } else if ((attrib3 & 0x1fffu) != 0) {
-        Require(slice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
+        Require(lastSlice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
         color.arrayLastSlice = attrib3 & 0x1fffu;
         color.arraySlice = slice;
+        color.arraySliceCount = lastSlice - slice + 1u;
+        Require(color.guestSamples == 1u || color.arraySliceCount == 1u, "multisampled color views of several array slices are unsupported");
+    } else {
+        Require(lastSlice == slice, "the color view names several slices of a surface that is not an array");
     }
     Require(color.samples == color.guestSamples || (!volume && slice == 0u), "3D or array slices of multisampled color targets rendered with one sample are unsupported");
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
@@ -998,9 +1013,10 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         color.surfaceAddress -= color.pipeBankXor;
     }
     color.arrayAddress = color.arrayLastSlice != 0 ? color.surfaceAddress : 0;
-    if (slice != 0 && !volume) color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
+    const auto sliceBytes = !volume && (slice != 0 || color.arraySliceCount > 1u) ? ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1) : 0u;
+    if (slice != 0 && !volume) color.surfaceAddress += slice * sliceBytes;
     color.address = color.surfaceAddress + mipOffset;
-    color.bytes = colorLayout.Bytes();
+    color.bytes = colorLayout.Bytes() + static_cast<std::uint64_t>(color.arraySliceCount - 1u) * sliceBytes;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
     color.format = decoded.format;
     color.componentMapping = decoded.componentMapping;

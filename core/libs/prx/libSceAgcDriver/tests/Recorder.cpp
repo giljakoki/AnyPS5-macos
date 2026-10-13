@@ -11,6 +11,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -348,6 +350,31 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(Recorder::ReadCounts().hits[static_cast<std::size_t>(Kind::AddressBased)] >= 2, "address-based hits are not counted");
     recorder.Sync();
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
+}
+
+bool releasedWithin(const std::function<bool()>& released, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!released()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+void keepPastNextBatchTests(Recorder& recorder) {
+    Require(recorder.Idle(), "the recorder is busy before the keep tests");
+    auto object = std::make_shared<int>(7);
+    const std::weak_ptr<int> watched = object;
+    recorder.KeepPastNextBatch(std::move(object));
+    Require(recorder.CarriedObjects() == 1, "an object kept past the next batch while no batch was open is not carried");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(!releasedWithin([&] { return watched.expired(); }, std::chrono::milliseconds(50)), "an object kept past the next batch was released with the batch open when it was kept");
+    recorder.Keep(std::make_shared<int>(0));
+    Require(recorder.CarriedObjects() == 0, "the next batch did not take the carried object");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(releasedWithin([&] { return watched.expired(); }, std::chrono::seconds(5)), "an object kept past the next batch outlived that batch");
 }
 
 void writeSettledTests(const Device& device, Recorder& recorder) {
@@ -960,6 +987,242 @@ void remappedImportTests(const Device& device) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+}
+
+void* allocateImportBlock(std::size_t alignment, std::size_t bytes) {
+#ifdef _WIN32
+    static_cast<void>(alignment);
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    return std::aligned_alloc(alignment, bytes);
+#endif
+}
+
+void releaseImportBlock(void* block) {
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+}
+
+int importLifetimeTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "skipped, host imports are unavailable\n";
+        return 77;
+    }
+    const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536u, context.hostImportAlignment));
+    {
+        void* block = allocateImportBlock(alignment, alignment);
+        Require(block != nullptr, "cannot allocate the remap block");
+        std::memset(block, 0, alignment);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, alignment, true, true, true);
+        }
+        const auto* import = HostImportFor(context, address, alignment);
+        if (import == nullptr) {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+            std::cout << "skipped, the host import was refused\n";
+            return 77;
+        }
+        const auto serial = HostImportSerial(context, address, alignment, true);
+        const std::array<std::byte, 4> value{std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12}};
+        recorder.RecordStore(import->buffer, 64, value, address + 64);
+        recorder.Submit();
+        Require(!recorder.Idle(), "the store's batch is not in flight");
+        const auto alive = RetiredImportsAlive();
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+            mutation.Add(block, alignment, true, true, true);
+        }
+        Require(std::memcmp(static_cast<const std::byte*>(block) + 64, value.data(), value.size()) == 0, "the remap proceeded before the batch storing through the old import ran");
+        const auto work = recorder.Summary();
+        Require(recorder.Idle() && work.submitQueue.jobs == 0 && work.carried == 0, "the remap proceeded with batches queued on the submit thread or objects carried");
+        Require(RetiredImportsAlive() == alive, "the remap proceeded before the retired import was destroyed");
+        Require(HostImportFor(context, address, alignment) != nullptr && HostImportSerial(context, address, alignment, true) != serial, "the remapped range kept its old import");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        HostImportFor(context, address, alignment);
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        releaseImportBlock(block);
+    }
+    {
+        void* block = allocateImportBlock(alignment, 2 * alignment);
+        Require(block != nullptr, "cannot allocate the merge block");
+        std::memset(block, 0, 2 * alignment);
+        auto* second = static_cast<std::byte*>(block) + alignment;
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, alignment, true, true, true);
+        }
+        Require(HostImportFor(context, address, alignment) != nullptr, "the first half was not imported");
+        const auto serial = HostImportSerial(context, address, alignment, false);
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        const auto alive = RetiredImportsAlive();
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(second, alignment, true, true, true);
+        }
+        std::thread unlocked([&] { HostImportFor(context, address, 2 * alignment); });
+        unlocked.join();
+        Require(HostImportSerial(context, address, alignment, false) != serial, "the import of the first half survived its run growing");
+        Require(recorder.Idle() && recorder.CarriedObjects() == 0, "a retirement outside the device lock reached the recorder");
+        Require(RetiredImportsAlive() == alive + 1, "an import retired outside the device lock was not kept");
+        Require(HostImportFor(context, address, alignment) != nullptr, "the merged run has no import");
+        Require(recorder.CarriedObjects() == 1 && RetiredImportsAlive() == alive + 1, "the device lock's next import lookup did not hand the retired import to the recorder");
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        Require(!releasedWithin([&] { return RetiredImportsAlive() == alive; }, std::chrono::milliseconds(50)), "the retired import was released with the batch open when it was handed over");
+        recorder.SettleCarried();
+        recorder.FlushDeferredReleases();
+        Require(recorder.CarriedObjects() == 0 && releasedWithin([&] { return RetiredImportsAlive() == alive; }, std::chrono::seconds(5)), "settling the carried objects did not release the retired import");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(second);
+            mutation.Remove(block);
+        }
+        HostImportFor(context, address, alignment);
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        releaseImportBlock(block);
+    }
+    {
+        void* block = allocateImportBlock(alignment, alignment);
+        Require(block != nullptr, "cannot allocate the retake block");
+        std::memset(block, 0, alignment);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, alignment, true, true, true);
+        }
+        const auto* import = HostImportFor(context, address, alignment);
+        Require(import != nullptr, "the retake block was not imported");
+        const auto first = HostImportSerial(context, address, alignment, false);
+        auto epoch = HostImportsEpoch();
+        std::array<ImportBinding, 1> bindings{ImportBinding{address + 256, 1024, 4, import->buffer, 256}};
+        Require(!RetakeImportBindings(context, epoch, bindings) && bindings[0].buffer == import->buffer, "an unchanged import table changed a binding");
+        const std::array<std::byte, 4> value{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+        recorder.RecordStore(import->buffer, 512, value, address + 512);
+        recorder.Submit();
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+            mutation.Add(block, alignment, true, true, true);
+        }
+        Require(RetakeImportBindings(context, epoch, bindings), "a binding validated before its import was retired was not taken again");
+        const auto* current = HostImportFor(context, address, alignment);
+        Require(current != nullptr && HostImportSerial(context, address, alignment, false) != first, "the remapped range has no new import");
+        Require(bindings[0].buffer == current->buffer && bindings[0].offset == 256, "the binding taken again does not name the current import");
+        Require(!RetakeImportBindings(context, epoch, bindings), "a binding was taken again although no import was retired since");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        Require(RetakeImportBindings(context, epoch, bindings) && bindings[0].buffer == VK_NULL_HANDLE, "a binding whose range lost its import still names a buffer");
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        releaseImportBlock(block);
+    }
+    std::cout << "Host import lifetime tests passed\n";
+    return 0;
+}
+
+void pooledBufferQuarantineTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    constexpr std::size_t bytes = 12345;
+    VkBuffer first = VK_NULL_HANDLE;
+    {
+        Buffer buffer(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        first = buffer.Handle();
+        static_cast<void>(recorder.Commands());
+    }
+    {
+        Buffer again(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        Require(again.Handle() != first, "a pooled buffer released while a batch was open was reused before that batch completed");
+    }
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    static_cast<void>(recorder.Commands());
+    recorder.Sync();
+    bool reused = false;
+    std::vector<std::unique_ptr<Buffer>> taken;
+    for (int attempt = 0; attempt < 4 && !reused; ++attempt) {
+        taken.push_back(std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT));
+        reused = taken.back()->Handle() == first;
+    }
+    Require(reused, "a pooled buffer was not reused once the batch open at its release completed");
+    std::cout << "Pooled buffer quarantine tests passed\n";
+}
+
+void layeredAttachmentTests(const Device& device) {
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: layered attachments not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t sliceBytes = side * side * 4;
+    constexpr std::size_t bytes = 2 * sliceBytes;
+    void* block = allocateImportBlock(65536, bytes);
+    Require(block != nullptr, "cannot allocate the layered attachment block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    {
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = side;
+        resource.height = side;
+        resource.mipCount = 1;
+        resource.depthOrLastArray = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2DArray;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto array = CachedStorageSurface(context, resource);
+        const auto first = array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0);
+        const auto both = array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 2);
+        Require(first != VK_NULL_HANDLE && both != VK_NULL_HANDLE && first != both, "a view of both slices is not its own attachment view");
+        Require(array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 2) == both, "the view of both slices is not reused");
+        bool refused = false;
+        try {
+            static_cast<void>(array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 1, 2));
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused, "a view past the array's last slice was made");
+        Framebuffer layered(context, VK_NULL_HANDLE, std::span(&both, 1), {side, side}, 2);
+        Require(layered.Layers() == 2, "a framebuffer of two layers does not report them");
+    }
+    ClearCachedTextures(context.device);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    releaseImportBlock(block);
+    std::cout << "Layered attachment tests passed\n";
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -5672,8 +5935,217 @@ void pipelineLibraryTests(const Device& device) {
     std::cout << "Pipeline library reuse tests passed\n";
 }
 
+std::atomic<int> fakeFrees{0};
+
+VKAPI_ATTR void VKAPI_CALL fakeFreeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+    fakeFrees.fetch_add(1);
+}
+
+VKAPI_ATTR void VKAPI_CALL fakeDestroyDevice(VkDevice, const VkAllocationCallbacks*) {}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fakeDeviceProc(VkDevice, const char* name) {
+    if (std::string_view(name) == "vkFreeMemory") return reinterpret_cast<PFN_vkVoidFunction>(&fakeFreeMemory);
+    if (std::string_view(name) == "vkDestroyDevice") return reinterpret_cast<PFN_vkVoidFunction>(&fakeDestroyDevice);
+    return nullptr;
+}
+
+int gpuFreeDeferTests() {
+    const auto guarded = GuardDeviceProc(&fakeDeviceProc);
+    if (std::getenv("APS5_DEFER_GPU_FREES") == nullptr) {
+        Require(guarded == &fakeDeviceProc || FreeGateEnabled(), "the device resolver was wrapped without a free knob");
+        std::cout << "skipped, APS5_DEFER_GPU_FREES is not set\n";
+        return 77;
+    }
+    Require(guarded != &fakeDeviceProc, "APS5_DEFER_GPU_FREES did not wrap the device resolver");
+    auto* device = reinterpret_cast<VkDevice>(std::uintptr_t{0x1000});
+    const auto freeMemory = reinterpret_cast<PFN_vkFreeMemory>(guarded(device, "vkFreeMemory"));
+    Require(freeMemory != &fakeFreeMemory, "vkFreeMemory is not guarded");
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x10}), nullptr);
+    Require(fakeFrees.load() == 0, "a free was not deferred");
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::strtoull(std::getenv("APS5_DEFER_GPU_FREES"), nullptr, 10) + 20));
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x20}), nullptr);
+    Require(fakeFrees.load() == 1, "a deferred free was not made once its delay passed (or the new one was not deferred)");
+    reinterpret_cast<PFN_vkDestroyDevice>(guarded(device, "vkDestroyDevice"))(device, nullptr);
+    Require(fakeFrees.load() == 2, "destroying the device did not make the deferred frees first");
+    std::cout << "GPU free deferral tests passed\n";
+    return 0;
+}
+
+int gpuFreeBatchDeferTests(Recorder& recorder) {
+    const char* mode = std::getenv("APS5_DEFER_GPU_FREES");
+    if (mode == nullptr || std::string_view(mode) != "batches:0") {
+        std::cout << "skipped, APS5_DEFER_GPU_FREES is not batches:0\n";
+        return 77;
+    }
+    const auto guarded = GuardDeviceProc(&fakeDeviceProc);
+    auto* device = reinterpret_cast<VkDevice>(std::uintptr_t{0x2000});
+    const auto freeMemory = reinterpret_cast<PFN_vkFreeMemory>(guarded(device, "vkFreeMemory"));
+    recorder.Sync();
+    static_cast<void>(recorder.Commands());
+    const auto before = fakeFrees.load();
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x30}), nullptr);
+    Require(fakeFrees.load() == before, "a free made while a batch was open was not deferred");
+    recorder.Submit();
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x40}), nullptr);
+    Require(fakeFrees.load() == before, "a free was made before the batch open at its release completed");
+    recorder.Sync();
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x50}), nullptr);
+    Require(fakeFrees.load() >= before + 1, "a deferred free was not made once the batch open at its release completed");
+    reinterpret_cast<PFN_vkDestroyDevice>(guarded(device, "vkDestroyDevice"))(device, nullptr);
+    Require(fakeFrees.load() == before + 3, "destroying the device did not make the deferred frees first");
+    std::cout << "GPU free batch deferral tests passed\n";
+    return 0;
+}
+
+int staleHandleTests(const Device& device) {
+    if (!StaleHandlesTraced()) {
+        std::cout << "skipped, APS5_TRACE_STALE_HANDLES is not set\n";
+        return 77;
+    }
+    const auto& context = device.GetContext();
+    const auto guarded = GuardDeviceProc(context.deviceProc);
+    const auto resolve = [&](const char* name) { return guarded(context.device, name); };
+    const auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(resolve("vkAllocateMemory"));
+    const auto createBuffer = reinterpret_cast<PFN_vkCreateBuffer>(resolve("vkCreateBuffer"));
+    const auto bind = reinterpret_cast<PFN_vkBindBufferMemory>(resolve("vkBindBufferMemory"));
+    const auto freeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolve("vkFreeMemory"));
+    const auto destroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(resolve("vkDestroyBuffer"));
+    const auto begin = reinterpret_cast<PFN_vkBeginCommandBuffer>(resolve("vkBeginCommandBuffer"));
+    const auto fill = reinterpret_cast<PFN_vkCmdFillBuffer>(resolve("vkCmdFillBuffer"));
+    const auto end = reinterpret_cast<PFN_vkEndCommandBuffer>(resolve("vkEndCommandBuffer"));
+    const auto freeCommands = reinterpret_cast<PFN_vkFreeCommandBuffers>(resolve("vkFreeCommandBuffers"));
+    const auto getRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(resolve("vkGetBufferMemoryRequirements"));
+    const auto makeBuffer = [&](VkDeviceMemory& memory) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = 4096;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        Check(createBuffer(context.device, &info, nullptr, &buffer), "vkCreateBuffer stale test");
+        VkMemoryRequirements requirements{};
+        getRequirements(context.device, buffer, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, 0);
+        Check(allocate(context.device, &allocation, nullptr, &memory), "vkAllocateMemory stale test");
+        Check(bind(context.device, buffer, memory, 0), "vkBindBufferMemory stale test");
+        return buffer;
+    };
+    VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    commandInfo.commandPool = context.pool;
+    commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commandInfo.commandBufferCount = 1;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &commandInfo, &commands), "vkAllocateCommandBuffers stale test");
+    const VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkDeviceMemory used = VK_NULL_HANDLE;
+    const auto usedBuffer = makeBuffer(used);
+    const auto before = StaleHandleReports();
+    Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
+    fill(commands, usedBuffer, 0, 4096, 0);
+    freeMemory(context.device, used, nullptr);
+    Require(StaleHandleReports() == before + 1, "freeing memory a recording command buffer uses was not reported");
+    Check(end(commands), "vkEndCommandBuffer stale test");
+    Check(reinterpret_cast<PFN_vkResetCommandBuffer>(resolve("vkResetCommandBuffer"))(commands, 0), "vkResetCommandBuffer stale test");
+    destroyBuffer(context.device, usedBuffer, nullptr);
+    VkDeviceMemory early = VK_NULL_HANDLE;
+    const auto staleBuffer = makeBuffer(early);
+    freeMemory(context.device, early, nullptr);
+    Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
+    fill(commands, staleBuffer, 0, 4096, 0);
+    Require(StaleHandleReports() == before + 2, "recording a buffer whose memory was freed was not reported");
+    Check(end(commands), "vkEndCommandBuffer stale test");
+    destroyBuffer(context.device, staleBuffer, nullptr);
+    VkDeviceMemory clean = VK_NULL_HANDLE;
+    const auto cleanBuffer = makeBuffer(clean);
+    Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
+    fill(commands, cleanBuffer, 0, 4096, 0);
+    Check(end(commands), "vkEndCommandBuffer stale test");
+    Require(StaleHandleReports() == before + 2, "recording a live buffer was reported");
+    if (context.bufferDeviceAddress) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = 4096;
+        info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        VkBuffer addressed = VK_NULL_HANDLE;
+        Check(createBuffer(context.device, &info, nullptr, &addressed), "vkCreateBuffer stale address test");
+        VkMemoryRequirements requirements{};
+        getRequirements(context.device, addressed, &requirements);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, 0);
+        VkDeviceMemory addressedMemory = VK_NULL_HANDLE;
+        Check(allocate(context.device, &allocation, nullptr, &addressedMemory), "vkAllocateMemory stale address test");
+        Check(bind(context.device, addressed, addressedMemory, 0), "vkBindBufferMemory stale address test");
+        const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, addressed};
+        const auto address = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(resolve("vkGetBufferDeviceAddressKHR"))(context.device, &addressInfo);
+        freeMemory(context.device, addressedMemory, nullptr);
+        const std::array<std::uint64_t, 2> table{0, address + 64};
+        Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale address test");
+        reinterpret_cast<PFN_vkCmdUpdateBuffer>(resolve("vkCmdUpdateBuffer"))(commands, cleanBuffer, 0, sizeof(table), table.data());
+        Check(end(commands), "vkEndCommandBuffer stale address test");
+        Require(StaleHandleReports() == before + 3, "a command passing a device address into freed memory was not reported");
+        VkBufferCreateInfo tableInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        tableInfo.size = 256;
+        tableInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer tableBuffer = VK_NULL_HANDLE;
+        Check(createBuffer(context.device, &tableInfo, nullptr, &tableBuffer), "vkCreateBuffer stale table test");
+        VkMemoryRequirements tableRequirements{};
+        getRequirements(context.device, tableBuffer, &tableRequirements);
+        VkMemoryAllocateInfo tableAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        tableAllocation.allocationSize = tableRequirements.size + 4096;
+        tableAllocation.memoryTypeIndex = context.MemoryType(tableRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory tableMemory = VK_NULL_HANDLE;
+        Check(allocate(context.device, &tableAllocation, nullptr, &tableMemory), "vkAllocateMemory stale table test");
+        Check(bind(context.device, tableBuffer, tableMemory, 4096), "vkBindBufferMemory stale table test");
+        void* mapped = nullptr;
+        Check(reinterpret_cast<PFN_vkMapMemory>(resolve("vkMapMemory"))(context.device, tableMemory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory stale table test");
+        std::memset(mapped, 0, static_cast<std::size_t>(tableAllocation.allocationSize));
+        const std::uint64_t pointer = address + 128;
+        std::memcpy(static_cast<std::byte*>(mapped) + 4096 + 16, &pointer, sizeof(pointer));
+        Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale table test");
+        fill(commands, tableBuffer, 128, 64, 0);
+        Check(end(commands), "vkEndCommandBuffer stale table test");
+        VkFence fence = VK_NULL_HANDLE;
+        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence), "vkCreateFence stale table test");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        Check(reinterpret_cast<PFN_vkQueueSubmit>(resolve("vkQueueSubmit"))(context.queue, 1, &submit, fence), "vkQueueSubmit stale table test");
+        Check(reinterpret_cast<PFN_vkWaitForFences>(resolve("vkWaitForFences"))(context.device, 1, &fence, VK_TRUE, ~0ull), "vkWaitForFences stale table test");
+        Require(StaleHandleReports() == before + 4, "a submitted buffer whose mapped contents hold an address into freed memory was not reported");
+        context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+        destroyBuffer(context.device, tableBuffer, nullptr);
+        freeMemory(context.device, tableMemory, nullptr);
+        destroyBuffer(context.device, addressed, nullptr);
+    }
+    {
+        const auto beforePool = StaleHandleReports();
+        VkQueryPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        poolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        poolInfo.queryCount = 2;
+        VkQueryPool queries = VK_NULL_HANDLE;
+        Check(reinterpret_cast<PFN_vkCreateQueryPool>(resolve("vkCreateQueryPool"))(context.device, &poolInfo, nullptr, &queries), "vkCreateQueryPool stale test");
+        Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale query test");
+        reinterpret_cast<PFN_vkCmdResetQueryPool>(resolve("vkCmdResetQueryPool"))(commands, queries, 0, 2);
+        Check(end(commands), "vkEndCommandBuffer stale query test");
+        reinterpret_cast<PFN_vkDestroyQueryPool>(resolve("vkDestroyQueryPool"))(context.device, queries, nullptr);
+        Require(StaleHandleReports() == beforePool + 1, "destroying a query pool a command buffer uses was not reported");
+        Check(reinterpret_cast<PFN_vkResetCommandBuffer>(resolve("vkResetCommandBuffer"))(commands, 0), "vkResetCommandBuffer stale query test");
+    }
+    const auto counted = StaleHandleReports();
+    freeCommands(context.device, context.pool, 1, &commands);
+    freeMemory(context.device, clean, nullptr);
+    destroyBuffer(context.device, cleanBuffer, nullptr);
+    Require(StaleHandleReports() == counted, "a free after the command buffer was released was reported");
+    std::cout << "Stale handle tracer tests passed\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-free-defer-only") return gpuFreeDeferTests();
         std::unique_ptr<Device> created;
         try {
             created = std::make_unique<Device>();
@@ -5683,6 +6155,7 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--stale-handles-only") return staleHandleTests(device);
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-only") {
             pipelineLibraryTests(device);
             return 0;
@@ -5704,6 +6177,7 @@ int main(int argc, char** argv) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-free-batch-defer-only") return gpuFreeBatchDeferTests(recorder);
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -5740,6 +6214,7 @@ int main(int argc, char** argv) {
             unitShadowTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--import-lifetime-only") return importLifetimeTests(device, recorder);
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
             cmaskPassTests(device, recorder);
             std::cout << "CMASK copied clear, write-back and failure tests passed\n";
@@ -5767,6 +6242,7 @@ int main(int argc, char** argv) {
 
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
+        keepPastNextBatchTests(recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         directCompletionLabelTests(recorder);
@@ -5796,6 +6272,8 @@ int main(int argc, char** argv) {
         queuedWriteGroupTests();
         remappedImportTests(device);
         movedMetadataTests(device, recorder);
+        layeredAttachmentTests(device);
+        pooledBufferQuarantineTests(device, recorder);
         viewPastLastMipTests(device, recorder);
         keysFillTests(device, recorder);
         denormalClearTests(device, recorder);

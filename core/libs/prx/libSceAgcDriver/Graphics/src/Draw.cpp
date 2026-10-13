@@ -1142,6 +1142,16 @@ struct DrawInputs {
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
     std::vector<std::uint32_t> restartTable;
+    struct InPlaceBinding {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::size_t alignment = 1;
+        bool index = false;
+        Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+        std::vector<std::pair<std::size_t, VkDeviceSize>> vertexSlots;
+    };
+    std::uint64_t importEpoch = 0;
+    std::vector<InPlaceBinding> inPlace;
 };
 
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
@@ -1155,6 +1165,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRec
 // instead of computed.
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
     DrawInputs inputs;
+    inputs.importEpoch = HostImportsEpoch();
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height, state.viewport.minDepth, state.viewport.maxDepth);
@@ -1250,6 +1261,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = draw.indexAddress - import->base;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+            inputs.inPlace.push_back({draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, true, use, {}});
         } else {
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
@@ -1303,6 +1315,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     const auto plan = PlanVertexCopies(plannedFetches);
     std::vector<VkBuffer> rangeHandles;
     std::vector<VkDeviceSize> rangeOffsets;
+    std::vector<std::size_t> rangeInPlace(plan.copies.size(), std::numeric_limits<std::size_t>::max());
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
@@ -1313,6 +1326,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
             inputs.inPlaceReads.emplace_back(begin, end);
+            rangeInPlace[range] = inputs.inPlace.size();
+            inputs.inPlace.push_back({begin, bytes, plan.alignments[range], false, Recorder::SnapshotUse::Vertex, {}});
             continue;
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
@@ -1345,6 +1360,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto j = plannedOf[f];
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
+        if (const auto binding = rangeInPlace[plan.copyOf[j]]; binding != std::numeric_limits<std::size_t>::max()) inputs.inPlace[binding].vertexSlots.emplace_back(inputs.vertexHandles.size() - 1, plan.offsets[j]);
     }
     timer.phase(PhaseVertex);
     return inputs;
@@ -1497,6 +1513,52 @@ struct IndirectRecord {
     std::span<const Pm4::DrawArguments> records;
     double readMs = 0;
 };
+
+void retakeDrawInputs(const Context& context, DrawInputs& inputs, IndirectRecord* indirect) {
+    const bool gpuIndirect = indirect != nullptr && indirect->args != nullptr && indirect->path == IndirectDrawPath::Gpu;
+    if (inputs.inPlace.empty() && !gpuIndirect) return;
+    std::vector<ImportBinding> bindings;
+    bindings.reserve(inputs.inPlace.size() + 2);
+    for (const auto& binding : inputs.inPlace) bindings.push_back({binding.address, binding.bytes, binding.alignment});
+    if (gpuIndirect) {
+        bindings.push_back({indirect->args->arguments, static_cast<std::size_t>(indirect->args->RangeBytes()), 4});
+        if (indirect->args->countIndirect) bindings.push_back({indirect->args->countAddress, 4, 4});
+    }
+    if (!RetakeImportBindings(context, inputs.importEpoch, bindings)) return;
+    const auto inPlaceCount = inputs.inPlace.size();
+    std::size_t copied = 0;
+    for (std::size_t index = 0; index < inPlaceCount; ++index) {
+        auto& binding = inputs.inPlace[index];
+        auto handle = bindings[index].buffer;
+        const auto offset = bindings[index].offset;
+        if (handle == VK_NULL_HANDLE) {
+            auto copy = CopyDrawInput(context, context.recorder, binding.address, binding.bytes, binding.alignment, binding.use);
+            handle = copy.buffer->Handle();
+            if (binding.index) inputs.indices = std::move(copy.buffer);
+            else inputs.vertexBuffers.push_back(std::move(copy.buffer));
+            ++copied;
+            binding.bytes = 0;
+        }
+        if (binding.index) {
+            inputs.indexHandle = handle;
+            inputs.indexOffset = offset;
+        }
+        for (const auto& [slot, within] : binding.vertexSlots) {
+            inputs.vertexHandles[slot] = handle;
+            inputs.vertexOffsets[slot] = offset + within;
+        }
+    }
+    std::erase_if(inputs.inPlace, [](const DrawInputs::InPlaceBinding& binding) { return binding.bytes == 0; });
+    NoteImportRetake("draw", bindings.size(), copied);
+    if (!gpuIndirect) return;
+    const auto* arguments = HostImportFor(context, indirect->args->arguments, static_cast<std::size_t>(indirect->args->RangeBytes()));
+    Require(arguments != nullptr && arguments->buffer == bindings[inPlaceCount].buffer, "the host import of an indirect draw's arguments was retired before the draw was recorded and the range has no import now");
+    indirect->argumentImport = arguments;
+    if (indirect->args->countIndirect) {
+        indirect->countImport = HostImportFor(context, indirect->args->countAddress, 4);
+        Require(indirect->countImport != nullptr && indirect->countImport->buffer == bindings[inPlaceCount + 1].buffer, "the host import of an indirect draw's count was retired before the draw was recorded and the range has no import now");
+    }
+}
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
@@ -1746,7 +1808,7 @@ struct RecordedDraw {
     std::span<const VkImageView> targetViews;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
-    const IndirectRecord* indirect = nullptr;
+    IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
     bool listed = false;
     bool completion = false;
@@ -1883,6 +1945,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    retakeDrawInputs(context, inputs, record.indirect);
+    Require(resources.DirectImportsCurrent(), "a host import the draw's descriptor set reads in place was retired after the set was proved");
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -2157,13 +2221,14 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice));
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice, color.arraySliceCount));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
         Require(!color.mipTail, "rendering into a packed mip tail needs the resident image of its surface");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
         Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
+        Require(color.arraySliceCount == 1, "rendering into several slices of a 2D array color target needs the resident image of its array");
         if (binding.gpuTiling) {
             binding.mip = ColorTargetMip(color, colorLayout);
             binding.tiled = std::make_unique<Buffer>(context, colorLayout.Bytes(), copies);
@@ -2340,7 +2405,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
         owners.push_back(binding.resident);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent);
+    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent, RenderLayers(state));
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2411,6 +2476,8 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    retakeDrawInputs(context, inputs, args != nullptr ? &indirect : nullptr);
+    Require(resources->DirectImportsCurrent(), "a host import the draw's descriptor set reads in place was retired after the set was proved");
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
@@ -2719,7 +2786,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     auto framebuffer = recipe.framebuffer.lock();
-    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent);
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, {}, RenderLayers(state));
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;

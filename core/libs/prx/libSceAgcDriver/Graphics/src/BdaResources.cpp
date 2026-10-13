@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
@@ -128,12 +130,28 @@ BdaResources::BdaResources(const Context& context) {
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
+namespace {
+
+void checkTableAddresses(const char* path, std::uint64_t serial, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+    if (!StaleHandlesTraced()) return;
+    static std::atomic<int> reports{0};
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto& range = ranges[index];
+        const auto freedMs = StaleAddressFreedMs(range.deviceAddress);
+        if (freedMs < 0.0 || reports.fetch_add(1, std::memory_order_relaxed) >= 32) continue;
+        std::fprintf(stderr, "[stale] BDA table (%s, space serial %llu, %zu ranges) entry %zu maps guest [0x%llx, 0x%llx) to device address 0x%llx, whose memory was freed %.1f ms earlier; %s\n", path, static_cast<unsigned long long>(serial), ranges.size(), index, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.deviceAddress), freedMs, DescribeLiveImport(range.begin).c_str());
+    }
+}
+
+}
+
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    checkTableAddresses(cached.has_value() ? "the cached address space's ranges" : "this build's ranges", serial, ranges);
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
@@ -151,6 +169,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
                 if (it->spaceSerial != serial) continue;
                 if (auto shared = it->buffer.lock(); shared != nullptr) {
+                    checkTableAddresses("a table cache hit by space serial", serial, it->ranges);
                     ++cache.hits;
                     ++cache.classes.spaceTables;
                     table = std::move(shared);
