@@ -1218,21 +1218,6 @@ std::uint64_t WalkedBytes() {
     return walkedBytes.load(std::memory_order_relaxed);
 }
 
-namespace {
-
-std::atomic<std::uint64_t> nextOrderEpoch{0};
-thread_local std::uint64_t threadOrderEpoch = 0;
-
-}
-
-void BumpOrderEpoch() {
-    threadOrderEpoch = nextOrderEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
-}
-
-std::uint64_t OrderEpoch() {
-    return threadOrderEpoch;
-}
-
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }

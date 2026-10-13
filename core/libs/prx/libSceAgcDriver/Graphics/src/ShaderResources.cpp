@@ -108,9 +108,11 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
-    std::uint64_t provenEpoch = 0;
+    std::uint64_t provenPresent = 0;
+    std::chrono::steady_clock::time_point provenAt{};
     std::uint64_t provenForget = 0;
     std::uint64_t provenWrites = 0;
+    bool proven = false;
 };
 
 struct SnapshotProofCounts {
@@ -135,18 +137,27 @@ void reportSnapshotProofs() {
     auto last = counts.lastReport.load(std::memory_order_relaxed);
     if (nowMs - last < 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new epoch, %llu forget, %llu driver write over the surface)\n", count(counts.hits), count(counts.compares), static_cast<double>(counts.comparedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written));
+    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface)\n", count(counts.hits), count(counts.compares), static_cast<double>(counts.comparedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written));
+}
+
+std::chrono::milliseconds snapshotProofLifetime() {
+    static const auto lifetime = [] {
+        const char* text = std::getenv("APS5_SNAPSHOT_PROOF_MS");
+        return std::chrono::milliseconds(text != nullptr ? std::strtoull(text, nullptr, 10) : 500ull);
+    }();
+    return lifetime;
 }
 
 bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t bytes) {
     static const bool disabled = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
     auto& counts = snapshotProofCounts();
-    const auto epoch = GuestMemory::OrderEpoch();
+    const auto present = Recorder::Presents();
+    const auto now = std::chrono::steady_clock::now();
     const auto forget = GuestMemory::ForgetSerial();
     const auto writes = GuestMemory::DriverWriteSerial();
-    const bool usable = !disabled && epoch != 0 && (forget & 1u) == 0;
-    if (usable && entry.provenEpoch != 0) {
-        if (entry.provenEpoch != epoch) {
+    const bool usable = !disabled && (forget & 1u) == 0;
+    if (usable && entry.proven) {
+        if (entry.provenPresent != present || now - entry.provenAt >= snapshotProofLifetime()) {
             counts.newEpoch.fetch_add(1, std::memory_order_relaxed);
         } else if (entry.provenForget != forget) {
             counts.forgotten.fetch_add(1, std::memory_order_relaxed);
@@ -164,11 +175,11 @@ bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t byt
     counts.compares.fetch_add(1, std::memory_order_relaxed);
     counts.comparedBytes.fetch_add(entry.bytes.size(), std::memory_order_relaxed);
     reportSnapshotProofs();
-    if (!GuestMemory::EqualsCommittedUnsynced(address, entry.bytes)) {
-        entry.provenEpoch = 0;
-        return false;
-    }
-    entry.provenEpoch = usable ? epoch : 0;
+    entry.proven = false;
+    if (!GuestMemory::EqualsCommittedUnsynced(address, entry.bytes)) return false;
+    entry.proven = usable;
+    entry.provenPresent = present;
+    entry.provenAt = now;
     entry.provenForget = forget;
     entry.provenWrites = writes;
     return true;

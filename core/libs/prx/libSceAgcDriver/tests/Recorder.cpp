@@ -4502,7 +4502,7 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     };
     const auto order = [] {
         AgcDriver::GuestMemory::BumpCollectEpoch();
-        AgcDriver::GuestMemory::BumpOrderEpoch();
+        Recorder::CountPresent();
     };
     order();
     const auto made = draw();
@@ -4513,6 +4513,7 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     for (int epoch = 0; epoch < epochs; ++epoch) {
         order();
         for (int i = 0; i < drawsPerEpoch; ++i) {
+            recorder.Sync();
             AgcDriver::GuestMemory::BumpCollectEpoch();
             Require(draw() == made, "an unchanged imported snapshot was made again");
         }
