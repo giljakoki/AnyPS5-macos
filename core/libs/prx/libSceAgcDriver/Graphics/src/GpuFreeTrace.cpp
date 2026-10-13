@@ -1,5 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecorderProgress.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include <array>
 #include <atomic>
@@ -109,10 +109,15 @@ bool Deferring() {
     return DeferBy().count() != 0 || DeferBatches() >= 0;
 }
 
+std::atomic<void (*)(const char*)>& RetirementReport() {
+    static std::atomic<void (*)(const char*)>& report = *new std::atomic<void (*)(const char*)>(nullptr);
+    return report;
+}
+
 bool Due(const Deferred& entry, std::chrono::steady_clock::time_point now) {
     if (DeferBatches() < 0) return entry.due <= now;
-    const auto* recorder = Recorder::Active();
-    return entry.recorder == nullptr || recorder != entry.recorder || recorder->BatchFinished(entry.serial);
+    const auto* recorder = ActiveRecorderProgress();
+    return entry.recorder == nullptr || recorder != entry.recorder || BatchFinished(*recorder, entry.serial);
 }
 
 // The free gate. MoltenVK makes EVERY live GPU-addressable buffer (memory allocated with
@@ -400,9 +405,9 @@ void handle(FreeKind kind, VkDevice device, std::uint64_t object) {
     }
     Deferred entry{kind, device, object, now + DeferBy()};
     if (DeferBatches() >= 0) {
-        if (const auto* recorder = Recorder::Active(); recorder != nullptr) {
+        if (const auto* recorder = ActiveRecorderProgress(); recorder != nullptr) {
             entry.recorder = recorder;
-            entry.serial = recorder->NewestSubmitted() + 1u + static_cast<std::uint64_t>(DeferBatches());
+            entry.serial = NewestSubmittedBatch(*recorder) + 1u + static_cast<std::uint64_t>(DeferBatches());
         }
     }
     state.deferred.push_back(entry);
@@ -527,6 +532,14 @@ PFN_vkGetDeviceProcAddr GuardDeviceProc(PFN_vkGetDeviceProcAddr real) {
     if (DeferBatches() >= 0) std::fprintf(stderr, "[gpu-free] APS5_DEFER_GPU_FREES: Vulkan memory, buffers, images and views are freed once the batch open when the driver releases them, and %d more, completed\n", DeferBatches());
     if (DeferBy().count() != 0) std::fprintf(stderr, "[gpu-free] APS5_DEFER_GPU_FREES: Vulkan memory, buffers, images and views are freed %lld ms after the driver releases them\n", static_cast<long long>(DeferBy().count()));
     return &guardedDeviceProc;
+}
+
+void InstallImportRetirementReport(void (*report)(const char* why)) {
+    RetirementReport().store(report, std::memory_order_release);
+}
+
+void ReportImportRetirementsIfLinked(const char* why) {
+    if (const auto report = RetirementReport().load(std::memory_order_acquire); report != nullptr) report(why);
 }
 
 bool FreeGateEnabled() {

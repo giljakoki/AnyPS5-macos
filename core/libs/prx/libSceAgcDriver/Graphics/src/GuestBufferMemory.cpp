@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -1889,6 +1890,14 @@ void ReportImportRetirements(const char* why) {
     const auto shown = std::min<std::uint64_t>(log.count, log.ring.size());
     std::fprintf(stderr, "[import-retire] %s: %llu host imports retired (%llu outside the device lock), the last %llu oldest first\n", why, static_cast<unsigned long long>(log.count), static_cast<unsigned long long>(log.unlocked), static_cast<unsigned long long>(shown));
     for (std::uint64_t n = log.count - shown; n < log.count; ++n) printRetirement("  ", log.ring[n % log.ring.size()], now);
+}
+
+namespace {
+// A failed submit on the submit thread prints the retirement record through this (GpuFreeTrace.hpp).
+[[maybe_unused]] const bool importRetirementReportInstalled = [] {
+    InstallImportRetirementReport(&ReportImportRetirements);
+    return true;
+}();
 }
 
 void ClearHostImports(VkDevice device) {

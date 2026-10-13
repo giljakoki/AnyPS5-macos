@@ -153,7 +153,7 @@ void QueueSubmitter::run() {
         if (result != VK_SUCCESS && error == VK_SUCCESS) {
             error = result;
             std::fprintf(stderr, "[gpu] vkQueueSubmit on the submit thread failed (%d)\n", static_cast<int>(result));
-            ReportImportRetirements("vkQueueSubmit failed on the submit thread");
+            ReportImportRetirementsIfLinked("vkQueueSubmit failed on the submit thread");
             ReportGpuFrees("vkQueueSubmit failed on the submit thread");
             StaleHandleDump("vkQueueSubmit failed on the submit thread");
         }

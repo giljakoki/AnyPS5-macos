@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecorderProgress.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -1221,6 +1222,19 @@ void Recorder::CountRecordedWork(bool draw) {
 
 Recorder* Recorder::Active() {
     return activeRecorder;
+}
+
+namespace {
+// The buffer pool and the free tracer read batch progress through these (RecorderProgress.hpp).
+const RecorderProgressHooks progressHooks{
+    [] { return static_cast<const Recorder*>(Recorder::Active()); },
+    [](const Recorder& recorder) { return recorder.NewestSubmitted(); },
+    [](const Recorder& recorder, std::uint64_t serial) { return recorder.BatchFinished(serial); },
+};
+[[maybe_unused]] const bool progressHooksInstalled = [] {
+    InstallRecorderProgress(progressHooks);
+    return true;
+}();
 }
 
 void Recorder::Activate() {

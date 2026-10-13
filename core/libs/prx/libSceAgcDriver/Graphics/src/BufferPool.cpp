@@ -1,6 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecorderProgress.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -294,8 +294,8 @@ void BufferPool::takeDoomed(std::vector<BufferAllocation>& gone) {
 
 bool BufferPool::Reusable(const Slot& slot) {
     if (slot.recorder == nullptr) return true;
-    const auto* recorder = Recorder::Active();
-    return recorder != slot.recorder || recorder->BatchFinished(slot.releasedBefore);
+    const auto* recorder = ActiveRecorderProgress();
+    return recorder != slot.recorder || BatchFinished(*recorder, slot.releasedBefore);
 }
 
 bool BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted) {
@@ -381,8 +381,8 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
         takeDoomed(evicted);
-        const auto* recorder = Recorder::Active();
-        const auto releasedBefore = recorder != nullptr ? recorder->NewestSubmitted() + 1u : 0u;
+        const auto* recorder = ActiveRecorderProgress();
+        const auto releasedBefore = recorder != nullptr ? NewestSubmittedBatch(*recorder) + 1u : 0u;
         if (allocation.allocationBytes > tier.budget) {
             doomed.push_back({allocation, ++clock, recorder, releasedBefore});
         } else {
