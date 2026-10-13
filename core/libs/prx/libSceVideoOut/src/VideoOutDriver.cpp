@@ -18,6 +18,7 @@
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceVideoOut/include/KeyboardInput.hpp"
 #include "prx/libScePad/include/PadState.hpp"
+#include "prx/libkernel/Aio/include/ReadThrottle.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
@@ -276,6 +277,7 @@ void VideoOutDriver::SignalFlipLocked(FlipRequest& req) {
     if (req.eventSent) return;
     if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d completed (flip event%s)", static_cast<long long>(req.flipArg), req.index, presentedOnce.load(std::memory_order_acquire) ? "" : ", before the first present");
     triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
+    LoaderFlipCompleted_nid_no_patch();
     ++req.cfg->flipStatus.count;
     req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
     req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
