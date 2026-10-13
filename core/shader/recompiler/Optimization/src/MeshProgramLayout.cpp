@@ -2,6 +2,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include <bit>
+#include <limits>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -65,14 +66,15 @@ MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request) {
             throw std::runtime_error("mesh program layout: the program exports to a pixel target");
         }
     }
-    for (const auto& output : program.Info().outputs) {
-        switch (output.kind) {
-        case StageOutputKind::Layer: layout.layer = true; break;
-        case StageOutputKind::ViewportIndex: layout.viewportIndex = true; break;
-        case StageOutputKind::PointSize: layout.pointSize = true; break;
-        case StageOutputKind::ClipDistance:
-        case StageOutputKind::CullDistance: layout.clipCullDistances++; break;
-        default: break;
+    const auto control = PositionExportControl(request);
+    for (std::uint32_t index = 1; index < layout.positionComponents.size(); index++) {
+        for (std::uint32_t component = 0; component < 4u; component++) {
+            if ((layout.positionComponents[index] & (1u << component)) == 0u) continue;
+            const auto output = DecodePositionExportComponent(control, index, component);
+            layout.layer |= output.layer;
+            layout.viewportIndex |= output.viewport;
+            layout.pointSize |= output.pointSize;
+            if (output.clipDistance != std::numeric_limits<std::uint32_t>::max() || output.cullDistance != std::numeric_limits<std::uint32_t>::max()) layout.clipCullDistances++;
         }
     }
     for (const auto& block : program.Blocks()) {
@@ -87,8 +89,7 @@ MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request) {
 
     const auto scalars = (layout.layer ? 1u : 0u) + (layout.viewportIndex ? 1u : 0u) + (layout.pointSize ? 1u : 0u) + layout.clipCullDistances;
     layout.recordDwords = (4u + 4u * layout.ParameterCount() + scalars + 3u) & ~3u;
-    layout.perCornerRecords = layout.layer || layout.viewportIndex;
-    layout.recordsPerGroup = layout.perCornerRecords ? layout.configuration.maxPrimitives * 3u : layout.configuration.maxVertices;
+    layout.recordsPerGroup = layout.configuration.maxVertices;
     layout.vertexBytesPerGroup = static_cast<std::uint64_t>(layout.recordsPerGroup) * layout.recordDwords * 4u;
     layout.indexBytesPerGroup = static_cast<std::uint64_t>(layout.configuration.maxPrimitives) * 3u * 4u;
     return layout;

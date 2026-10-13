@@ -62,8 +62,10 @@ void DefineModule(SpirvEmitterState& state) {
     }
     state.mainFunc = state.module.AllocateId();
     if (StageOf(state) == IrShaderStage::Mesh) {
-        const auto& mesh = VertexInfo(state).mesh;
         state.meshGuestFunc = state.module.AllocateId();
+    }
+    if (StageOf(state) == IrShaderStage::Mesh && !MeshCompute(state)) {
+        const auto& mesh = VertexInfo(state).mesh;
         state.module.EmitCapability(spv::CapabilityMeshShadingEXT);
         state.module.EmitExtension("SPV_EXT_mesh_shader");
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputTrianglesEXT);

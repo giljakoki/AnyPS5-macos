@@ -238,6 +238,11 @@ public:
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.
     void Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr);
+    struct MeshPrepassOutput {
+        std::vector<std::uint32_t> records;
+        std::vector<std::uint32_t> indices;
+    };
+    MeshPrepassOutput DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     struct IndirectOutcome {
         int cpuReason;
         double argumentReadMs;

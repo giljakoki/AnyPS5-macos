@@ -80,6 +80,17 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
 
 }
 
+ShaderStage HostStage(const RecompileRequest& request) {
+    const bool meshCompute = request.shader.stage == ShaderStage::Mesh && request.graphics.has_value() && request.graphics->mesh.has_value() && request.graphics->mesh->compute;
+    return meshCompute ? ShaderStage::Compute : request.shader.stage;
+}
+
+std::uint32_t PositionExportControl(const RecompileRequest& request) {
+    if (!request.graphics.has_value() || request.shader.stage == ShaderStage::Fragment || request.shader.stage == ShaderStage::Compute) return 0u;
+    const bool meshCompute = request.graphics->mesh.has_value() && request.graphics->mesh->compute;
+    return meshCompute ? request.graphics->positionExportControl : request.graphics->positionExportControl & ~PositionExportLayerViewportBits;
+}
+
 namespace {
 
 // The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
@@ -106,7 +117,7 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
     const auto* tessellation = request.graphics && request.graphics->tessellation ? &*request.graphics->tessellation : nullptr;
-    return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh, tessellation);
+    return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh, tessellation, PositionExportControl(request));
 }
 
 std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
@@ -480,7 +491,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
-    targetOptions.stageSubgroups = StageHasSubgroups(request.target, request.shader.stage);
+    targetOptions.stageSubgroups = StageHasSubgroups(request.target, HostStage(request));
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
