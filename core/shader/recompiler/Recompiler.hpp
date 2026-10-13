@@ -553,6 +553,34 @@ struct GeometryStageLimits {
     std::uint32_t maxFragmentInputComponents;
 };
 
+struct MeshProgramLayout {
+    MeshConfiguration configuration;
+    std::uint32_t waveSize = 0;
+    std::uint32_t wavesPerGroup = 0;
+    std::array<std::uint32_t, 4> positionComponents{};
+    std::uint32_t parameterMask = 0;
+    bool primitiveExport = false;
+    bool layer = false;
+    bool viewportIndex = false;
+    bool pointSize = false;
+    std::uint32_t clipCullDistances = 0;
+    std::uint32_t allocations = 0;
+    std::uint32_t barriers = 0;
+    bool sharedMemory = false;
+    bool subgroupOperations = false;
+    bool perCornerRecords = false;
+    std::uint32_t recordDwords = 0;
+    std::uint32_t recordsPerGroup = 0;
+    std::uint64_t vertexBytesPerGroup = 0;
+    std::uint64_t indexBytesPerGroup = 0;
+
+    [[nodiscard]] std::uint32_t ParameterCount() const;
+    [[nodiscard]] bool VertexStageCandidate() const;
+    [[nodiscard]] std::uint32_t GroupsFor(std::uint32_t indexCount) const;
+};
+
+[[nodiscard]] MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request);
+
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
 }
