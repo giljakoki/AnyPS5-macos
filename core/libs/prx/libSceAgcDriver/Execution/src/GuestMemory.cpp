@@ -527,7 +527,7 @@ const CachedRegion* cachedRegion(std::uintptr_t address, std::uint64_t generatio
 }
 
 void cacheRegion(std::uintptr_t begin, std::uintptr_t end, bool writable, std::uint64_t generation) {
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(begin, 1);
     const auto found = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uintptr_t value, const auto& range) { return value < range->address; });
     if (found == lease.begin()) return;
     const auto& range = **std::prev(found);

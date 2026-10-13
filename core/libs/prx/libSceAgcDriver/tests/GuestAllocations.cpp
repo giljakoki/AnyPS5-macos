@@ -37,6 +37,15 @@ void RunGuestLeaseWaitTests() {
         mutation.Add(memory.data(), 64, true, true, true);
         mutation.Add(memory.data() + 64, 64, true, true, true);
     }
+    {
+        const auto first = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address + 8, 8);
+        Require(first.size() == 1 && first.front()->address == address, "a range lease must hold exactly the allocation containing its bytes");
+        const auto both = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address + 60, 8);
+        Require(both.size() == 2 && both[0]->address == address && both[1]->address == address + 64, "a range lease across two allocations must hold both in address order");
+        const auto point = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address + 64, 0);
+        Require(point.size() == 1 && point.front()->address == address + 64, "an empty range lease must hold the allocation at its address");
+        Require(GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address + 128, 16).empty() || GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address + 128, 16).front()->address >= address + 128, "a range lease past the allocations must not hold them");
+    }
     auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     std::erase_if(lease, [&](const auto& range) { return range->address != address; });
     std::atomic<bool> mutationEntered = false;

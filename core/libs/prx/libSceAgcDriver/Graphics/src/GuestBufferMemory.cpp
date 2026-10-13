@@ -2157,8 +2157,22 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     } else if (state.refreshedGeneration > generation) {
         return true;
     }
-    if (!adopting) current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (!adopting && !locked && window != 0) {
+        for (const auto& mapped : ranges) {
+            const auto range = mapped.lock();
+            if (range == nullptr) continue;
+            const auto low = std::min<std::uint64_t>(range->address, range->address / window * window);
+            const auto high = std::max<std::uint64_t>(range->address + range->bytes, (range->address + range->bytes + window - 1) / window * window);
+            auto around = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(static_cast<std::uintptr_t>(low), static_cast<std::size_t>(high - low));
+            current.insert(current.end(), std::make_move_iterator(around.begin()), std::make_move_iterator(around.end()));
+        }
+        std::sort(current.begin(), current.end(), [](const auto& left, const auto& right) { return left->address < right->address; });
+        current.erase(std::unique(current.begin(), current.end()), current.end());
+    } else if (!adopting) {
+        current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    }
     bool declined = false;
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
