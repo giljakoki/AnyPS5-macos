@@ -517,6 +517,12 @@ void verifyOutOfRangeConstantReads() {
     require(plan->info.images.size() == 2u && plan->info.samplers.size() == 1u, "out-of-range s_buffer_load: the two T#s were not planned as one image each");
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
+    AgcDriver::ShaderMemory direct({}, [](std::uint64_t, std::size_t, std::span<std::byte>) { return AgcDriver::ShaderMemory::PendingWrite::None; });
+    const auto directCapture = direct.Capture(request);
+    require(directCapture->snapshot.images.size() == capture->snapshot.images.size() && std::ranges::equal(directCapture->snapshot.images, capture->snapshot.images, [](const auto& left, const auto& right) { return left.dwords == right.dwords; }), "word-by-word capture reads: the T#s differ from a capture that copies whole pages");
+    const auto pageRegions = memory.Regions();
+    const auto wordRegions = direct.Regions();
+    require(pageRegions.size() == wordRegions.size() && std::ranges::equal(pageRegions, wordRegions, [](const auto& left, const auto& right) { return left.guestAddress == right.guestAddress && std::ranges::equal(left.bytes, right.bytes); }), "word-by-word capture reads: the read regions differ from a capture that copies whole pages");
     request.context.memory = memory.Regions();
     static_cast<void>(Recompile(request, *capture));
     const auto holds = [&](const std::array<std::uint32_t, 8>& words) {

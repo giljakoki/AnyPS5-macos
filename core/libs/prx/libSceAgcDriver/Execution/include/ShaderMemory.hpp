@@ -82,6 +82,7 @@ private:
         std::bitset<PageWords> read;
         std::bitset<PageWords> recent;
         bool wordwise = false;
+        bool direct = false;
     };
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
