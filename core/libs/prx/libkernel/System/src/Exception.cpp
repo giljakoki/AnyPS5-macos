@@ -530,6 +530,7 @@ Raised RaiseOnLocked(Pthread thread) {
 
 bool RaiseOn(Pthread thread) {
     InstallDelivery();
+    RaiseTrace::Raising(thread);
     const Raised raised = RaiseOnLocked(thread);
     if (traceRaise.load(std::memory_order_relaxed)) {
         std::string name;

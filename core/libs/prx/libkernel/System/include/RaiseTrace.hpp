@@ -7,6 +7,7 @@ namespace RaiseTrace {
 
 bool Enabled();
 void Start();
+void Raising(Pthread thread);
 void Sent(Pthread thread, const char* name, const char* how);
 void Entered(Pthread self);
 void Returned(Pthread self);

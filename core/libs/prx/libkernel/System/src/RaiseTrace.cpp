@@ -256,6 +256,14 @@ void Start() {
 #endif
 }
 
+void Raising(Pthread thread) {
+    if (!Enabled()) return;
+    if (Slot* slot = Claim(thread)) {
+        slot->sentNanos.store(Now());
+        slot->sent.fetch_add(1);
+    }
+}
+
 void Sent(Pthread thread, const char* name, const char* how) {
     const bool sent = how != nullptr;
     if (!Enabled()) return;
@@ -267,10 +275,7 @@ void Sent(Pthread thread, const char* name, const char* how) {
         state = Describe(slot->port);
 #endif
         std::snprintf(slot->name, sizeof(slot->name), "%s", name);
-        if (sent) {
-            slot->sentNanos.store(Now());
-            slot->sent.fetch_add(1);
-        }
+        if (!sent) slot->sent.fetch_sub(1);
     }
     std::fprintf(stderr, "[raise] %.3f s exception for guest thread %p '%s' %s; %s\n", Seconds(Now()), static_cast<void*>(thread), name, sent ? how : "not raised, the thread has finished", state.c_str());
 }
