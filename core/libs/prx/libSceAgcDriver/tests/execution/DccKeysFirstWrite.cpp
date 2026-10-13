@@ -428,6 +428,48 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 // An import window stamps the pages whose write protection it saw resolved as a possible CPU
 // store. A driver that pins imported pages for writing (NVIDIA on Linux) resolves it without
 // storing anything, which a store of the byte already there reproduces on any device.
+void RunUntrackedRefreshWithoutWait(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, userData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr, "the untracked image has no pending results");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(image->Refresh(), "an unchanged untracked image was uploaded again");
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    if (recorder == nullptr) {
+        std::cout << "no active recorder: untracked refresh without a wait not tested\n";
+        device.WaitIdle();
+        return;
+    }
+    image->WriteBack();
+    std::memset(block + SurfaceBytes, 0x33, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto submissions = recorder->Submissions();
+    Require(!image->Refresh(), "an untracked image was not uploaded after its write-back and a CPU edit");
+    Require(recorder->Submissions() == submissions, "a storage refresh behind its own write-back waited for the GPU");
+    const auto version = image->Version();
+    Require(image->Refresh() && image->Version() == version && recorder->Submissions() == submissions, "a refresh with the upload's baseline in flight uploaded or waited");
+    device.WaitIdle();
+    recorder->Sync();
+    Require(image->Refresh() && image->Version() == version, "the landed baseline does not match the uploaded image");
+    std::memset(block + SurfaceBytes, 0x44, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(!image->Refresh(), "a CPU edit after the baseline landed was missed");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test untracked refresh");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "the written-back GPU results were lost");
+    Require(Count(block + SurfaceBytes, SurfaceBytes, 0x44) == SurfaceBytes, "the CPU-edited block was overwritten");
+    std::cout << "untracked storage refresh without a GPU wait: ok\n";
+}
+
 void RunImportWindow(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     auto* texels = block;
     auto* keys = block + KeysOffset;
@@ -512,6 +554,9 @@ int main() {
         Run(*device, block->Data());
         untracked.emplace(false);
         RunUntrackedReuse(*device, untracked->Data());
+        std::optional<GuestBlock> unwaited;
+        unwaited.emplace(false);
+        RunUntrackedRefreshWithoutWait(*device, unwaited->Data());
         std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());
