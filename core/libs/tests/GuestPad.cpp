@@ -125,6 +125,89 @@ static void CheckReadStateHandle(int handle) {
     Require(scePadReadState(handle, &data) == PAD_OK);
 }
 
+// scePadReadState shows every button change in order, each to the reads of one 10 ms window: a
+// tap released before the next read, a re-tap and a chord released between reads all reach the
+// title; a held or idle pad reads its live state, and scePadRead, which returns every transition,
+// drops what waits.
+static void CheckButtonSteps(int handle) {
+    const auto cross = static_cast<std::uint32_t>(Pad::PadButton::Cross);
+    const auto circle = static_cast<std::uint32_t>(Pad::PadButton::Circle);
+    const auto next = [] { std::this_thread::sleep_for(std::chrono::milliseconds(15)); };
+    const auto read = [handle] {
+        PadData data{};
+        Require(scePadReadState(handle, &data) == PAD_OK);
+        return data;
+    };
+    const auto publish = [](std::uint32_t buttons) {
+        PadInputState input;
+        input.buttons = buttons;
+        PadPublishInput_nid_postfix(input);
+    };
+
+    publish(cross);
+    publish(0);
+    Require((read().buttons & cross) != 0);
+    Require((read().buttons & cross) != 0);
+    next();
+    Require((read().buttons & cross) == 0);
+    next();
+    Require((read().buttons & cross) == 0);
+
+    publish(cross);
+    Require((read().buttons & cross) != 0);
+    next();
+    Require((read().buttons & cross) != 0);
+    next();
+    Require((read().buttons & cross) != 0);
+    publish(0);
+    next();
+    Require((read().buttons & cross) == 0);
+    next();
+    Require((read().buttons & cross) == 0);
+
+    publish(cross);
+    publish(0);
+    publish(cross | circle);
+    publish(0);
+    Require((read().buttons & (cross | circle)) == cross);
+    next();
+    Require((read().buttons & (cross | circle)) == 0);
+    next();
+    const auto chord = read();
+    Require((chord.buttons & (cross | circle)) == (cross | circle) && chord.analog_buttons_l2 == 0);
+    next();
+    Require((read().buttons & (cross | circle)) == 0);
+    next();
+
+    publish(cross);
+    publish(cross | circle);
+    publish(circle);
+    publish(0);
+    Require((read().buttons & (cross | circle)) == (cross | circle));
+    next();
+    Require((read().buttons & (cross | circle)) == 0);
+    next();
+
+    for (int tap = 0; tap < 20; ++tap) {
+        publish(cross);
+        publish(0);
+    }
+    int shown = 0;
+    for (int poll = 0; poll < 6; ++poll) {
+        if ((read().buttons & cross) != 0) ++shown;
+        next();
+    }
+    Require(shown >= 1 && shown <= 3);
+    Require((read().buttons & cross) == 0);
+
+    publish(static_cast<std::uint32_t>(Pad::PadButton::L2));
+    publish(0);
+    PadData drained[64]{};
+    Require(scePadRead_nid_postfix(handle, drained, 64) >= 2);
+    const auto after = read();
+    Require(after.buttons == 0 && after.analog_buttons_l2 == 0);
+}
+
 static void CheckRemoteController(int handle) {
     bool remote = true;
     Require(scePadIsRemoteController(handle + 1, &remote) == PAD_ERROR_INVALID_HANDLE);
@@ -195,6 +278,7 @@ int main() {
     CheckTouchContact();
     CheckReadQueue(handle);
     CheckReadStateHandle(handle);
+    CheckButtonSteps(handle);
     CheckRemoteController(handle);
     CheckInjectedState(path);
     Require(scePadSetVibrationMode(handle, 1) == 0);

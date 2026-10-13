@@ -4,6 +4,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -24,6 +25,27 @@ namespace {
     std::deque<QueuedInput> queue;
     std::exception_ptr failure;
     bool initialized = false;
+
+    // scePadReadState hands the title one snapshot per call, and a title polls it once per frame
+    // (50 ms at 20 fps, far longer in a hitch). A key tapped between two polls, a second tap of
+    // the same key, or a chord whose keys went down and up between polls would be lost or merged,
+    // so every button change that a poll has not shown yet waits in `buttonSteps` and the polls
+    // show the steps in order, each for LatchWindowMicros (every reader of one frame sees the same
+    // step). Consecutive steps that only press, or only release, buttons merge into one, and a
+    // step nobody has to see (the queue is empty) is not queued: a held or idle pad reads its live
+    // state without delay. APS5_PAD_NO_PRESS_LATCH=1 reports the bare snapshot.
+    constexpr std::uint64_t LatchWindowMicros = 10000;
+    constexpr std::size_t MaxButtonSteps = 4;
+    std::deque<std::uint32_t> buttonSteps;
+    std::uint32_t shownButtons = 0;
+    std::uint64_t stepShownAt = 0;
+
+    // APS5_TRACE_PAD=1 logs every published button or left-stick change and the first read that
+    // reports it, with the delay between them and the number of reads in between.
+    std::uint32_t tracedButtons = 0;
+    std::uint64_t tracedChangeAt = 0;
+    std::uint64_t tracedReads = 0;
+    bool tracedPending = false;
 
     struct Quat { float w = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f; };
     Quat orientation;
@@ -172,6 +194,80 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
     return data;
 }
 
+bool LatchEnabled() {
+    static const bool enabled = std::getenv("APS5_PAD_NO_PRESS_LATCH") == nullptr;
+    return enabled;
+}
+
+bool TraceEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACE_PAD") != nullptr;
+    return enabled;
+}
+
+double TraceMillis(std::uint64_t micros) {
+    return static_cast<double>(micros) / 1000.0;
+}
+
+// The buttons the next read reports: the oldest step not yet shown for a full window, or the live
+// state when no step waits.
+std::uint32_t TakeButtonStep(std::uint64_t now) {
+    while (!buttonSteps.empty()) {
+        if (stepShownAt == 0) stepShownAt = now;
+        else if (now - stepShownAt >= LatchWindowMicros) {
+            buttonSteps.pop_front();
+            stepShownAt = 0;
+            continue;
+        }
+        shownButtons = buttonSteps.front();
+        return shownButtons;
+    }
+    shownButtons = state.buttons;
+    return shownButtons;
+}
+
+void QueueButtonStep(std::uint32_t previous, std::uint32_t next, std::uint64_t now) {
+    // A step already shown that only repeats the live state holds nothing back.
+    if (buttonSteps.size() == 1 && stepShownAt != 0 && (now - stepShownAt >= LatchWindowMicros || buttonSteps.front() == previous)) {
+        buttonSteps.pop_front();
+        stepShownAt = 0;
+    }
+    if (buttonSteps.empty()) {
+        // Nothing waits: a read shows `next` directly unless the step it replaces was never shown.
+        if (previous == shownButtons) {
+            buttonSteps.push_back(next);
+            return;
+        }
+        buttonSteps.push_back(previous);
+        buttonSteps.push_back(next);
+        return;
+    }
+    const auto back = buttonSteps.back();
+    const auto before = buttonSteps.size() >= 2 ? buttonSteps[buttonSteps.size() - 2] : shownButtons;
+    const bool backUnshown = buttonSteps.size() >= 2 || stepShownAt == 0;
+    const bool samePresses = (back & ~before) != 0 && (back & before) == before && (next & back) == back;
+    const bool sameReleases = (before & ~back) != 0 && (back & before) == back && (next & back) == next;
+    if (backUnshown && (samePresses || sameReleases)) {
+        buttonSteps.back() = next;
+        return;
+    }
+    if (buttonSteps.size() == MaxButtonSteps) buttonSteps.pop_back();
+    buttonSteps.push_back(next);
+}
+
+void TraceRead(const PadData& data, std::uint64_t now, std::size_t waiting) {
+    if (!TraceEnabled()) return;
+    ++tracedReads;
+    if (!tracedPending && data.buttons == tracedButtons) return;
+    if (tracedPending)
+        std::fprintf(stderr, "[pad] %.1f ms: title read buttons 0x%x left stick %u,%u, %.1f ms after the change was published, read %llu since%s\n", TraceMillis(now), data.buttons,
+                     data.left_stick_x, data.left_stick_y, TraceMillis(now - tracedChangeAt), static_cast<unsigned long long>(tracedReads), waiting != 0 ? " (a queued step)" : "");
+    else
+        std::fprintf(stderr, "[pad] %.1f ms: title read buttons 0x%x, a queued step after %llu reads\n", TraceMillis(now), data.buttons, static_cast<unsigned long long>(tracedReads));
+    tracedButtons = data.buttons;
+    tracedPending = false;
+    tracedReads = 0;
+}
+
 std::uint32_t InjectedButtons(std::uint64_t now) {
     static Pad::InputCommandFile commands(std::getenv("APS5_PAD_INPUT_FILE"));
     static std::uint32_t lastInjected = 0;
@@ -190,7 +286,19 @@ PadData Pad::ReadState() {
     if (!initialized) throw std::runtime_error("Pad: read before initialization");
     const std::uint64_t now = sceKernelGetProcessTime();
     const std::uint32_t injected = InjectedButtons(now);
-    return BuildData(state, timestamp, now, injected);
+    if (!LatchEnabled()) {
+        const auto data = BuildData(state, timestamp, now, injected);
+        TraceRead(data, now, 0);
+        return data;
+    }
+    const auto waiting = buttonSteps.size();
+    PadInputState shown = state;
+    shown.buttons = TakeButtonStep(now);
+    if ((state.buttons & ~shown.buttons & 0x100u) != 0) shown.analogButtonsL2 = 0;
+    if ((state.buttons & ~shown.buttons & 0x200u) != 0) shown.analogButtonsR2 = 0;
+    const auto data = BuildData(shown, timestamp, now, injected);
+    TraceRead(data, now, waiting);
+    return data;
 }
 
 int Pad::Read(PadData* data, int num) {
@@ -200,6 +308,10 @@ int Pad::Read(PadData* data, int num) {
     if (!initialized) throw std::runtime_error("Pad: read before initialization");
     const std::uint64_t now = sceKernelGetProcessTime();
     const std::uint32_t injected = InjectedButtons(now);
+    // The queue carries every transition, so the steps waiting for scePadReadState are done.
+    buttonSteps.clear();
+    stepShownAt = 0;
+    shownButtons = state.buttons;
     if (queue.empty()) {
         data[0] = BuildData(state, timestamp, now, injected);
         return 1;
@@ -327,8 +439,16 @@ extern "C" void PadPublishInput_nid_postfix(const PadInputState& input) {
         state.touchLeft == input.touchLeft && state.touchRight == input.touchRight &&
         state.hasMotion == input.hasMotion && state.accel == input.accel && state.gyro == input.gyro &&
         state.touch == input.touch && state.deviceKind == input.deviceKind) return;
+    const auto now = sceKernelGetProcessTime();
+    if (LatchEnabled() && input.buttons != state.buttons) QueueButtonStep(state.buttons, input.buttons, now);
+    if (TraceEnabled() && (state.buttons != input.buttons || state.sticks[0] != input.sticks[0] || state.sticks[1] != input.sticks[1])) {
+        std::fprintf(stderr, "[pad] %.1f ms: published buttons 0x%x left stick %u,%u\n", TraceMillis(now), input.buttons, input.sticks[0], input.sticks[1]);
+        tracedChangeAt = now;
+        tracedPending = true;
+        tracedReads = 0;
+    }
     state = input;
-    timestamp = sceKernelGetProcessTime();
+    timestamp = now;
     if (queue.size() == kQueueCapacity) queue.pop_front();
     queue.push_back({input, timestamp});
 }
