@@ -171,5 +171,35 @@ int main() {
         return native != plain && native != emulated && emulated != emulatedPlain;
     });
 
+    passed &= Run("the pass-through vertex shader exports the program's parameters and carries the mesh draw words", [] {
+        auto layout = DescribeLayer(LayerExportControl, true);
+        layout.parameterMask = 0x5u;
+        layout.recordDwords = 16u;
+        const auto shader = BuildMeshPassThroughVertexShader(layout, MeshlessTarget(), false);
+        return !shader.spirv.empty() && shader.spirv[0] == 0x07230203u && shader.parameterExports == std::vector<std::uint32_t>{0u, 2u} && shader.pushConstants.size() == MeshDrawPushOffsetBytes + MeshDrawPushBytes && shader.bdaAbiVersion == BdaAbi::Version && shader.bindings.size() == 1u && shader.bindings[0].role == DescriptorRole::FaultBuffer;
+    });
+
+    passed &= Run("the pass-through vertex shader drops the layer unless asked and the device can write it", [] {
+        const auto layout = DescribeLayer(LayerExportControl, true);
+        const auto dropped = BuildMeshPassThroughVertexShader(layout, MeshlessTarget(), false);
+        try {
+            (void)BuildMeshPassThroughVertexShader(layout, MeshlessTarget(), true);
+        } catch (const std::runtime_error&) {
+            return !dropped.spirv.empty();
+        }
+        return false;
+    });
+
+    passed &= Run("the pass-through vertex shader rejects a record smaller than its exports", [] {
+        auto layout = Describe(64u, SmallSubgroup);
+        layout.recordDwords = 4u;
+        try {
+            (void)BuildMeshPassThroughVertexShader(layout, MeshlessTarget(), false);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    });
+
     return passed ? 0 : 1;
 }
