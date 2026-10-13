@@ -43,8 +43,8 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
-    static std::mutex cacheMutex;
-    static std::list<std::shared_ptr<const ShaderSnapshot>> cache;
+    static std::mutex& cacheMutex = *new std::mutex();
+    static std::list<std::shared_ptr<const ShaderSnapshot>>& cache = *new std::list<std::shared_ptr<const ShaderSnapshot>>();
     static std::size_t cacheBytes = 0;
     std::shared_ptr<const ShaderSnapshot> cached;
     {

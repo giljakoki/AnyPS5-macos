@@ -56,7 +56,7 @@ struct TextureProfile {
 };
 
 TextureProfile& Profile() {
-    static TextureProfile profile;
+    static TextureProfile& profile = *new TextureProfile();
     return profile;
 }
 
@@ -100,7 +100,7 @@ struct StorageTraffic {
 };
 
 StorageTraffic& Traffic() {
-    static StorageTraffic traffic;
+    static StorageTraffic& traffic = *new StorageTraffic();
     return traffic;
 }
 
@@ -166,7 +166,7 @@ struct LiveImages {
 };
 
 LiveImages& Live() {
-    static LiveImages live;
+    static LiveImages& live = *new LiveImages();
     return live;
 }
 
@@ -515,8 +515,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             else ++Profile().recordedUploads;
             if (profile) Profile().gpu += timer.lap();
             if (dump) {
-                static std::mutex dumpMutex;
-                static std::map<std::uint64_t, int> dumped;
+                static std::mutex& dumpMutex = *new std::mutex();
+                static std::map<std::uint64_t, int>& dumped = *new std::map<std::uint64_t, int>();
                 std::lock_guard lock(dumpMutex);
                 auto& count = dumped[descriptor.baseAddress];
                 if (count < 8) {
@@ -851,7 +851,7 @@ VkFormat StorageFormatOrUndefined(const Context& context, VkFormat format) {
         std::mutex mutex;
         std::unordered_map<std::uint64_t, VkFormat> formats;
     };
-    static Table table;
+    static Table& table = *new Table();
     // The key names the physical device: the headless and the windowed device share one GPU, but a
     // second GPU would answer differently.
     const auto key = (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(context.physical)) << 20u) ^ static_cast<std::uint64_t>(format);
@@ -957,7 +957,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
         std::mutex mutex;
         std::unordered_map<VkPhysicalDevice, VkFormat> formats;
     };
-    static Table table;
+    static Table& table = *new Table();
     {
         std::lock_guard lock(table.mutex);
         if (const auto found = table.formats.find(context.physical); found != table.formats.end()) return found->second;
@@ -1110,7 +1110,7 @@ struct PendingWrites {
 };
 
 PendingWrites& Pending() {
-    static PendingWrites pending;
+    static PendingWrites& pending = *new PendingWrites();
     return pending;
 }
 
@@ -1291,8 +1291,8 @@ bool AdjacentGenerationEnabled() {
 }
 
 bool ClearKeepsDenormals(const Context& context, VkFormat format) {
-    static std::mutex mutex;
-    static std::map<std::pair<VkDevice, VkFormat>, bool> known;
+    static std::mutex& mutex = *new std::mutex();
+    static std::map<std::pair<VkDevice, VkFormat>, bool>& known = *new std::map<std::pair<VkDevice, VkFormat>, bool>();
     std::lock_guard lock(mutex);
     if (const auto found = known.find({context.device, format}); found != known.end()) return found->second;
     ClearLayout layout{};

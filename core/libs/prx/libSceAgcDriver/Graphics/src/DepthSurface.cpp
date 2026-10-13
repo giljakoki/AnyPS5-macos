@@ -174,7 +174,7 @@ bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
 }
 
 std::mutex& surfacesMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 

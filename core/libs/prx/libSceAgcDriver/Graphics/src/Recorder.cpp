@@ -62,7 +62,7 @@ struct SyncSiteWaits {
     std::uint64_t batches;
     double waitedMs;
 };
-std::vector<SyncSiteWaits> syncSites;
+std::vector<SyncSiteWaits>& syncSites = *new std::vector<SyncSiteWaits>();
 constexpr std::size_t NoSyncSite = static_cast<std::size_t>(-1);
 constexpr std::size_t SyncSiteLimit = 48;
 thread_local std::size_t activeSyncSite = NoSyncSite;
@@ -123,8 +123,8 @@ struct ThreadSyncs {
     std::array<std::uint64_t, 5> counts;
     std::array<double, 5> waitedMs;
 };
-std::vector<ThreadSyncs> threadSyncs;
-std::mutex threadSyncsMutex;
+std::vector<ThreadSyncs>& threadSyncs = *new std::vector<ThreadSyncs>();
+std::mutex& threadSyncsMutex = *new std::mutex();
 
 // This thread's fence and timeline waits in total (Recorder::ThreadWaitedMs): a caller times a span
 // of its own work and reads the difference to learn how much of it was waiting for the GPU.
@@ -172,8 +172,8 @@ std::atomic<int> unlockedWaiters[WaiterSlots]{};
 std::atomic<int>& WaitersOf(std::uint64_t id) { return unlockedWaiters[id % WaiterSlots]; }
 // Recorders alive, by id (own mutex, taken under the GpuMutex or with nothing held): a thread that
 // released the GpuMutex around a wait learns whether its recorder still exists before touching it.
-std::mutex liveRecordersMutex;
-std::vector<std::uint64_t> liveRecorders;
+std::mutex& liveRecordersMutex = *new std::mutex();
+std::vector<std::uint64_t>& liveRecorders = *new std::vector<std::uint64_t>();
 std::atomic<std::uint64_t> nextRecorderId{1};
 std::atomic<std::uint64_t> samplesPassed{0};
 constexpr std::uint32_t SampleFoldCapacity = 64;
@@ -312,7 +312,7 @@ struct HoldCounters {
     // Genuine nested hooks (depth >= 2 outside a completion action) that had to wait locked.
     std::uint64_t hookLockedWaits = 0;
 };
-HoldCounters holdCounters;
+HoldCounters& holdCounters = *new HoldCounters();
 
 // Deferred release of a finished batch's kept objects (and its completion actions, whose captures
 // hold some of the same objects): finish() moves them to this list of the finishing thread instead
@@ -535,7 +535,7 @@ bool ProcTable() {
 // instead of queueing behind a dispatch. `labelTableOwner` is the active recorder while it lives,
 // set and cleared under this mutex, so a lookup never touches a table being destroyed. Nothing
 // under this mutex takes the GPU mutex (no lock-order cycle).
-std::mutex labelTableMutex;
+std::mutex& labelTableMutex = *new std::mutex();
 Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
@@ -635,7 +635,7 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-AtomicSharedPtr<const WriteRanges> pendingWrites;
+AtomicSharedPtr<const WriteRanges>& pendingWrites = *new AtomicSharedPtr<const WriteRanges>();
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -741,7 +741,7 @@ struct HookSyncStats {
 };
 
 HookSyncStats& HookSyncs() {
-    static HookSyncStats stats;
+    static HookSyncStats& stats = *new HookSyncStats();
     return stats;
 }
 
@@ -895,7 +895,7 @@ struct RecordedStoreStats {
 };
 
 RecordedStoreStats& RecordedStoreSyncs() {
-    static RecordedStoreStats stats;
+    static RecordedStoreStats& stats = *new RecordedStoreStats();
     return stats;
 }
 
@@ -1747,8 +1747,8 @@ std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
-std::mutex timingMutex;
-std::map<std::uint64_t, TimingTotals> timingByKey;
+std::mutex& timingMutex = *new std::mutex();
+std::map<std::uint64_t, TimingTotals>& timingByKey = *new std::map<std::uint64_t, TimingTotals>();
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -3338,7 +3338,7 @@ struct SyncWaitStats {
 };
 
 SyncWaitStats& SyncWaits() {
-    static SyncWaitStats stats;
+    static SyncWaitStats& stats = *new SyncWaitStats();
     return stats;
 }
 

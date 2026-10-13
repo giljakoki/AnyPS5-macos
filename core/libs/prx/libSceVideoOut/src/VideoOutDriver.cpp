@@ -295,7 +295,7 @@ void VideoOutDriver::SignalFlipLocked(FlipRequest& req) {
 }
 
 VideoOutDriver& VideoOutDriver::Get() {
-    static VideoOutDriver instance;
+    static VideoOutDriver& instance = *new VideoOutDriver();
     return instance;
 }
 

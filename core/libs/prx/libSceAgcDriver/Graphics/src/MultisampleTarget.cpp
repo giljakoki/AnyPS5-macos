@@ -174,12 +174,12 @@ struct GuardedRange {
 };
 
 std::shared_mutex& guardedMutex() {
-    static std::shared_mutex mutex;
+    static std::shared_mutex& mutex = *new std::shared_mutex();
     return mutex;
 }
 
 std::vector<GuardedRange>& guarded() {
-    static std::vector<GuardedRange> ranges;
+    static std::vector<GuardedRange>& ranges = *new std::vector<GuardedRange>();
     return ranges;
 }
 
@@ -202,12 +202,12 @@ void guard(const Context& context, const ColorTarget& target) {
 }
 
 std::mutex& targetsMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 
 std::vector<std::unique_ptr<MultisampleTarget>>& targets() {
-    static std::vector<std::unique_ptr<MultisampleTarget>> list;
+    static std::vector<std::unique_ptr<MultisampleTarget>>& list = *new std::vector<std::unique_ptr<MultisampleTarget>>();
     return list;
 }
 

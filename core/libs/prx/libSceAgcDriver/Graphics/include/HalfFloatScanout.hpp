@@ -39,7 +39,7 @@ inline const std::array<std::uint32_t, 2 * HalfFloatScanoutCodes>& HalfFloatScan
 }
 
 inline std::uint8_t HalfFloatScanoutCode(std::uint16_t bits, bool alpha) {
-    static std::array<std::array<std::uint8_t, 65536>, 2> codes{};
+    static std::array<std::array<std::uint8_t, 65536>, 2>& codes = *new std::array<std::array<std::uint8_t, 65536>, 2>();
     static const bool filled = [] {
         const auto& thresholds = HalfFloatScanoutThresholds();
         for (std::uint32_t kind = 0; kind < 2u; ++kind) {

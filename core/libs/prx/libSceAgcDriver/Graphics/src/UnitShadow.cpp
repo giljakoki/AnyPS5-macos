@@ -60,7 +60,7 @@ struct Statistics {
 };
 
 Statistics& Stats() {
-    static Statistics statistics;
+    static Statistics& statistics = *new Statistics();
     return statistics;
 }
 
@@ -107,7 +107,7 @@ struct Shadows {
 };
 
 Shadows& Registry() {
-    static Shadows shadows;
+    static Shadows& shadows = *new Shadows();
     return shadows;
 }
 
