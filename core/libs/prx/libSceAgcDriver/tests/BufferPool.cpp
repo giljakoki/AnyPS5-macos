@@ -505,10 +505,68 @@ void PartialSlabDoesNotRetry() {
 
 }
 
+void AlternateSizes() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    const auto addressOf = [](VkBuffer buffer) { return 0x100000000000ULL + reinterpret_cast<std::uintptr_t>(buffer) * 0x10000; };
+    VkBuffer first = VK_NULL_HANDLE;
+    std::pair<VkDeviceMemory, VkDeviceSize> memory{};
+    {
+        Buffer buffer(context, 1100, usage);
+        first = buffer.Handle();
+        memory = mock.bound.at(first);
+    }
+    VkBuffer second = VK_NULL_HANDLE;
+    {
+        Buffer buffer(context, 1200, usage);
+        second = buffer.Handle();
+        Expect(mock.bound.at(second) == memory && mock.sizes.at(second) == 1200, "a 1200-byte request did not get an exact buffer on the retained allocation");
+        Expect(mock.destroyedBuffers == 0 && mock.liveBuffers.contains(first), "the retained buffer of another size was destroyed to make the exact one");
+        Expect(buffer.DeviceAddress() == addressOf(second), "an exact buffer made on a retained allocation has another buffer's address");
+    }
+    const auto created = mock.next;
+    {
+        Buffer buffer(context, 1100, usage);
+        Expect(buffer.Handle() == first && mock.next == created && mock.destroyedBuffers == 0, "the kept 1100-byte buffer was not taken back without creating or destroying one");
+        Expect(buffer.DeviceAddress() == addressOf(first), "a kept buffer taken back reports another buffer's address");
+    }
+    {
+        Buffer buffer(context, 1200, usage);
+        Expect(buffer.Handle() == second && mock.next == created, "the kept 1200-byte buffer was not taken back");
+    }
+    for (const std::size_t bytes : {1300, 1400, 1500}) {
+        Buffer buffer(context, bytes, usage);
+        Expect(mock.bound.at(buffer.Handle()) == memory && mock.sizes.at(buffer.Handle()) == bytes, "a request of another size in the class did not get an exact buffer on the retained allocation");
+    }
+    Expect(mock.destroyedBuffers == 1 && mock.liveBuffers.size() == BufferAlternateCount + 1, "a full set of kept buffers did not drop exactly its oldest one");
+    {
+        Buffer buffer(context, 1100, usage);
+        Expect(buffer.Handle() != first && mock.sizes.at(buffer.Handle()) == 1100, "a dropped buffer was handed out again");
+    }
+    VkBuffer deviceFirst = VK_NULL_HANDLE;
+    {
+        DeviceBuffer device(context, 3000, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        deviceFirst = device.Handle();
+    }
+    const auto destroyed = mock.destroyedBuffers;
+    {
+        DeviceBuffer device(context, 3500, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Expect(mock.sizes.at(device.Handle()) == 3500 && mock.destroyedBuffers == destroyed, "a device buffer of another size destroyed the retained one");
+    }
+    {
+        DeviceBuffer device(context, 3000, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Expect(device.Handle() == deviceFirst && mock.destroyedBuffers == destroyed, "the kept device buffer was not taken back");
+    }
+    context.bufferPool.reset();
+    Expect(mock.liveBuffers.empty(), "the pool left kept buffers alive when it was destroyed");
+}
+
 int main() {
     try {
         SizeClassesAndDirections();
         ExactSizeReuse();
+        AlternateSizes();
         LargerClass();
         KeptUntilFence();
         Budget();

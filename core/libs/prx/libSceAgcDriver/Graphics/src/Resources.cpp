@@ -51,8 +51,10 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         capacity = allocation->bytes;
         offset = allocation->offset;
         slab = allocation->slab;
+        alternates = allocation->alternates;
         if (allocation->bufferBytes != size) {
-            context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+            const auto dropped = KeepAlternate(alternates, {buffer, deviceAddress, allocation->bufferBytes});
+            if (dropped.buffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, dropped.buffer, nullptr);
             buffer = VK_NULL_HANDLE;
             deviceAddress = 0;
             try {
@@ -120,8 +122,11 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, alternates});
         return;
+    }
+    for (const auto& alternate : alternates) {
+        if (alternate.buffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, alternate.buffer, nullptr);
     }
     if (slab) {
         if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
@@ -159,8 +164,10 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
         capacity = allocation->bytes;
+        alternates = allocation->alternates;
         if (allocation->bufferBytes == size) return;
-        context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+        const auto dropped = KeepAlternate(alternates, {buffer, 0, allocation->bufferBytes});
+        if (dropped.buffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, dropped.buffer, nullptr);
         buffer = VK_NULL_HANDLE;
         try {
             buffer = BindExactBuffer(context, size, this->usage, memory, 0, allocationBytes);
@@ -196,8 +203,11 @@ DeviceBuffer::~DeviceBuffer() {
 
 void DeviceBuffer::release() noexcept {
     if (buffer && memory && cache) {
-        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
+        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size, alternates});
         return;
+    }
+    for (const auto& alternate : alternates) {
+        if (alternate.buffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, alternate.buffer, nullptr);
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
