@@ -204,6 +204,7 @@ int UmtxNwakePrivate(void* object, std::uint64_t value) {
 extern "C" {
 
 int APS5_VABI sceKernelSyncOnAddressWait(std::uint32_t* address, std::uint32_t expected, const KernelUseconds* timeout, const char* name) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     (void)name;
     if (!IsAlignedAddress<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address))) {
         APS5_INVALID_ARG_EX;
@@ -212,6 +213,7 @@ int APS5_VABI sceKernelSyncOnAddressWait(std::uint32_t* address, std::uint32_t e
 }
 
 int APS5_VABI sceKernelSyncOnAddressWait8(std::uint8_t* address, std::uint8_t expected, const KernelUseconds* timeout, const char* name) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     (void)name;
     if (!IsAlignedAddress<std::uint8_t>(reinterpret_cast<std::uintptr_t>(address))) {
         APS5_INVALID_ARG_EX;
@@ -220,6 +222,7 @@ int APS5_VABI sceKernelSyncOnAddressWait8(std::uint8_t* address, std::uint8_t ex
 }
 
 int APS5_VABI sceKernelSyncOnAddressWait16(std::uint16_t* address, std::uint16_t expected, const KernelUseconds* timeout, const char* name) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     (void)name;
     if (!IsAlignedAddress<std::uint16_t>(reinterpret_cast<std::uintptr_t>(address))) {
         APS5_INVALID_ARG_EX;
@@ -228,6 +231,7 @@ int APS5_VABI sceKernelSyncOnAddressWait16(std::uint16_t* address, std::uint16_t
 }
 
 int APS5_VABI sceKernelSyncOnAddressWait32(std::uint32_t* address, std::uint32_t expected, const KernelUseconds* timeout, const char* name) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     (void)name;
     if (!IsAlignedAddress<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address))) {
         APS5_INVALID_ARG_EX;
@@ -236,6 +240,7 @@ int APS5_VABI sceKernelSyncOnAddressWait32(std::uint32_t* address, std::uint32_t
 }
 
 int APS5_VABI sceKernelSyncOnAddressWait64(std::uint64_t* address, std::uint64_t expected, const KernelUseconds* timeout, const char* name) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     (void)name;
     if (!IsAlignedAddress<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address))) {
         APS5_INVALID_ARG_EX;
@@ -244,6 +249,7 @@ int APS5_VABI sceKernelSyncOnAddressWait64(std::uint64_t* address, std::uint64_t
 }
 
 int APS5_VABI sceKernelSyncOnAddressWake(void* address, std::int32_t count) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     const auto key = reinterpret_cast<std::uintptr_t>(address);
     if (!IsAlignedAddress<std::uint8_t>(key) || count < 0) {
         APS5_INVALID_ARG_EX;
@@ -254,6 +260,7 @@ int APS5_VABI sceKernelSyncOnAddressWake(void* address, std::int32_t count) {
 }
 
 int APS5_VABI _umtx_op_nid_postfix(void* object, int operation, std::uint64_t value, void* sizeArgument, void* timeArgument) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
     const void* caller = __builtin_return_address(0);
     int error = 0;
     switch (operation) {

@@ -41,6 +41,7 @@ constexpr std::uint32_t MultipleWaiters = 0x20;
 constexpr std::size_t ContextRsp = 0xf8;
 
 KernelSema suspended = nullptr;
+KernelSema shared = nullptr;
 KernelSema resumed = nullptr;
 KernelEventFlag resume = nullptr;
 std::atomic<bool> stopping{false};
@@ -124,6 +125,20 @@ void* APS5_VABI ShortWaiter(void*) {
     return nullptr;
 }
 
+void* APS5_VABI SharedWaiter(void*) {
+    started.fetch_add(1);
+    while (!stopping.load()) {
+        KernelUseconds timeout = 100;
+        sceKernelWaitSema(shared, 1, &timeout);
+    }
+    return nullptr;
+}
+
+void* APS5_VABI SharedBlockedWaiter(void*) {
+    BlockHostSignals();
+    return SharedWaiter(nullptr);
+}
+
 void* APS5_VABI Runner(void*) {
     started.fetch_add(1);
     volatile std::uint64_t work = 0;
@@ -137,9 +152,10 @@ int main() {
     Require(sceKernelCreateSema(&suspended, "SuspendSemaphore", 0, 0, 256, nullptr) == 0, "creating the suspend semaphore failed");
     Require(sceKernelCreateSema(&resumed, "ResumeSemaphore", 0, 0, 256, nullptr) == 0, "creating the resume semaphore failed");
     Require(sceKernelCreateEventFlag(&resume, "resumeEvent", MultipleWaiters | 0x01, 0, nullptr) == 0, "creating the resume event failed");
+    Require(sceKernelCreateSema(&shared, "shared", 0, 0, 1, nullptr) == 0, "creating the shared semaphore failed");
     Require(sceKernelInstallExceptionHandler(RaisedSignal, reinterpret_cast<void*>(&StopWorldHandler)) == 0, "installing the handler failed");
 
-    PthreadEntry entries[] = {EventFlagWaiter, SemaphoreWaiter, ConditionWaiter, EventFlagWaiter, SemaphoreWaiter, ConditionWaiter, ShortWaiter, ShortWaiter, Runner};
+    PthreadEntry entries[] = {EventFlagWaiter, SemaphoreWaiter, ConditionWaiter, EventFlagWaiter, SemaphoreWaiter, ConditionWaiter, ShortWaiter, ShortWaiter, SharedWaiter, SharedWaiter, SharedWaiter, SharedBlockedWaiter, SharedBlockedWaiter, Runner};
     constexpr int Count = sizeof(entries) / sizeof(entries[0]);
     Pthread threads[Count]{};
     for (int index = 0; index < Count; ++index) Require(scePthreadCreate(&threads[index], nullptr, entries[index], nullptr, "worker") == 0, "creating a worker failed");

@@ -683,6 +683,7 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
         throw std::runtime_error("scePthreadJoin: cannot join current thread");
     ThreadCancel::Check();
     {
+        TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
         std::unique_lock lock(thread->_join_mtx);
         ThreadCancel::WaitUntil(thread->_join_cv, lock, std::nullopt, [&] { return thread->_finished.load(); });
     }

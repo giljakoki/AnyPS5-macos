@@ -1,3 +1,4 @@
+#include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libkernel/Semaphore/include/Semaphore.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <chrono>
@@ -23,6 +24,7 @@ int APS5_VABI sceKernelCreateSema(KernelSema* sem, const char* name, uint32_t at
 }
 
 int APS5_VABI sceKernelPollSema(KernelSema sem, int need) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
  if (sem == nullptr || need <= 0) {
   APS5_INVALID_ARG_EX;
  }
@@ -36,6 +38,7 @@ int APS5_VABI sceKernelPollSema(KernelSema sem, int need) {
 }
 
 int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
  if (sem == nullptr || count < 0) {
   APS5_INVALID_ARG_EX;
  }
@@ -50,6 +53,7 @@ int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
 }
 
 int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
  if (sem == nullptr || need <= 0) {
   APS5_INVALID_ARG_EX;
  }
@@ -104,6 +108,7 @@ int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time) 
 }
 
 int APS5_VABI sceKernelCancelSema(KernelSema sem, int count, int* threads) {
+    TimedWait::RaiseCritical raiseCritical(TimedWait::CurrentRaiseState());
  if (sem == nullptr) {
   APS5_INVALID_ARG_EX;
  }

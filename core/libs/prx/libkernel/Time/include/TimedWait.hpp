@@ -70,6 +70,7 @@ RaiseState* CurrentRaiseState();
 bool EnterWait(RaiseState* state, Condition* condition);
 void LeaveWait(RaiseState* state);
 void DrainRaises(RaiseState* state);
+void DrainRaisesInWait(RaiseState* state);
 
 class RaiseCritical {
 public:
@@ -121,6 +122,7 @@ public:
             if (generation.load(std::memory_order_seq_cst) == observed && (!published || raise->pending.load(std::memory_order_seq_cst) == 0)) signal.wait(inner);
             LeaveWait(raise);
         }
+        DrainRaisesInWait(raise);
         lock.lock();
 #endif
     }
@@ -152,6 +154,7 @@ public:
                 signaled = signal.wait_for(inner, std::chrono::microseconds(RemainingMicros(deadlineNanos))) == std::cv_status::no_timeout;
             LeaveWait(raise);
         }
+        DrainRaisesInWait(raise);
         lock.lock();
         return signaled;
 #endif

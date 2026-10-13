@@ -340,6 +340,13 @@ void DrainRaises(RaiseState* state) {
     }
 }
 
+void DrainRaisesInWait(RaiseState* state) {
+    if (state == nullptr) return;
+    const int outer = state->waitDepth.exchange(0, std::memory_order_seq_cst);
+    DrainRaises(state);
+    state->waitDepth.fetch_add(outer, std::memory_order_seq_cst);
+}
+
 RaiseSignal ClaimRaiseSignal() {
 #ifdef __APPLE__
     RaiseState* state = BoundRaiseState();
