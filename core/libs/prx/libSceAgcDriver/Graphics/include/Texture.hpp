@@ -577,7 +577,7 @@ private:
     std::deque<PendingBaseline> pendingBaselines;
     bool baselineKeepsProof = false;
     void startBaseline(bool keepProof);
-    void dropOriginal();
+    void dropOriginal(const char* reason);
     bool inFlightOverlaps(std::uint64_t begin, std::uint64_t end) const;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
