@@ -15,6 +15,7 @@
 namespace ShaderRecompiler {
 struct SourceHandle;
 class PreparedShaderInvocation;
+struct SrtRuntime;
 }
 
 namespace AgcDriver {
@@ -87,6 +88,9 @@ private:
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
+    static bool recordedRead(void* context, std::uint64_t address, std::uint32_t* value);
+    static bool recordedAccessible(void* context, std::uint64_t address, std::uint64_t bytes);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> memoizedCapture(const ShaderRecompiler::PreparedShaderInvocation& invocation, ShaderRecompiler::SrtRuntime& runtime);
     Page& page(std::uint64_t base);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:

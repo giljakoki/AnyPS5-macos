@@ -4,6 +4,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver {
@@ -80,6 +82,55 @@ CaptureProfile& CaptureTotals() {
 }
 
 std::atomic<ShaderMemory::WaitedMsProvider> waitedMsProvider{nullptr};
+
+bool CaptureMemoEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_CAPTURE_MEMO") != nullptr;
+    return !disabled;
+}
+
+struct MemoStep {
+    std::uint64_t address;
+    std::uint64_t bytes;
+    std::uint32_t value;
+    bool probe;
+    bool result;
+};
+
+struct CaptureMemoEntry {
+    std::weak_ptr<const ShaderRecompiler::SourceHandle> handle;
+    std::uint64_t shaderBase = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<MemoStep> steps;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+};
+
+struct CaptureMemo {
+    std::unordered_map<std::uint64_t, CaptureMemoEntry> entries;
+};
+
+thread_local CaptureMemo* captureMemo = nullptr;
+
+struct CaptureMemoCounts {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> changed{0};
+};
+
+CaptureMemoCounts& MemoCounts() {
+    static CaptureMemoCounts& counts = *new CaptureMemoCounts();
+    return counts;
+}
+
+struct Recording {
+    void* memory;
+    std::vector<MemoStep>* steps;
+};
+
+std::uint64_t memoKey(const void* handle, std::uint64_t shaderBase, std::span<const std::uint32_t> userData) {
+    std::uint64_t hash = reinterpret_cast<std::uintptr_t>(handle) * 0x9e3779b97f4a7c15ull ^ shaderBase;
+    for (const auto word : userData) hash = (hash ^ word) * 0x100000001b3ull;
+    return hash;
+}
 
 double WaitedMs() {
     const auto provider = waitedMsProvider.load(std::memory_order_acquire);
@@ -215,6 +266,64 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     return true;
 }
 
+bool ShaderMemory::recordedRead(void* context, std::uint64_t address, std::uint32_t* value) {
+    auto& recording = *static_cast<Recording*>(context);
+    const bool ok = read(recording.memory, address, value);
+    recording.steps->push_back({address, sizeof(*value), ok ? *value : 0u, false, ok});
+    return ok;
+}
+
+bool ShaderMemory::recordedAccessible(void* context, std::uint64_t address, std::uint64_t bytes) {
+    auto& recording = *static_cast<Recording*>(context);
+    const bool ok = accessible(recording.memory, address, bytes);
+    recording.steps->push_back({address, bytes, 0u, true, ok});
+    return ok;
+}
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::memoizedCapture(const ShaderRecompiler::PreparedShaderInvocation& invocation, ShaderRecompiler::SrtRuntime& runtime) {
+    auto& memo = ShaderRecompiler::ThreadOwned(captureMemo);
+    const auto& handle = invocation.Handle();
+    const auto key = memoKey(handle.get(), runtime.shaderBase, runtime.userData);
+    auto& counts = MemoCounts();
+    if (const auto found = memo.entries.find(key); found != memo.entries.end()) {
+        auto& entry = found->second;
+        if (entry.handle.lock() == handle && entry.shaderBase == runtime.shaderBase && std::equal(entry.userData.begin(), entry.userData.end(), runtime.userData.begin(), runtime.userData.end())) {
+            bool same = true;
+            for (const auto& step : entry.steps) {
+                if (step.probe) {
+                    if (accessible(this, step.address, step.bytes) != step.result) same = false;
+                } else {
+                    std::uint32_t value = 0;
+                    const bool ok = read(this, step.address, &value);
+                    if (ok != step.result || (ok && value != step.value)) same = false;
+                }
+                if (!same) break;
+            }
+            if (same) {
+                counts.hits.fetch_add(1, std::memory_order_relaxed);
+                return entry.capture;
+            }
+            counts.changed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    counts.misses.fetch_add(1, std::memory_order_relaxed);
+    if (memo.entries.size() >= 8192) memo.entries.clear();
+    auto& entry = memo.entries[key];
+    entry.handle = handle;
+    entry.shaderBase = runtime.shaderBase;
+    entry.userData.assign(runtime.userData.begin(), runtime.userData.end());
+    entry.steps.clear();
+    entry.capture.reset();
+    Recording recording{this, &entry.steps};
+    runtime.userContext = &recording;
+    runtime.readMemory = &recordedRead;
+    runtime.readSpecializationMemory = &recordedRead;
+    runtime.accessible = &recordedAccessible;
+    auto capture = invocation.Capture(runtime);
+    entry.capture = capture;
+    return capture;
+}
+
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
@@ -270,7 +379,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.readMemory = &read;
     runtime.readSpecializationMemory = &read;
     runtime.accessible = &accessible;
-    auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    auto capture = invocation != nullptr ? (CaptureMemoEnabled() ? memoizedCapture(*invocation, runtime) : invocation->Capture(runtime)) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
@@ -286,7 +395,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
             const auto specializationNs = ShaderRecompiler::ResourceMaterializer::SpecializationNanoseconds();
             const auto hookNs = totals.hookWaitNanoseconds.load();
             const auto walkNs = captureNs > resolveNs + pageNs + wordNs + specializationNs ? captureNs - resolveNs - pageNs - wordNs - specializationNs : 0;
-            AgcDriver::ProfilePrint_nid_no_patch( "[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values, %llu hook reads not observed: no GPU wait), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f; source handle memo %llu hits, %llu resolves\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()));
+            AgcDriver::ProfilePrint_nid_no_patch( "[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values, %llu hook reads not observed: no GPU wait), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f; source handle memo %llu hits, %llu resolves; capture memo %llu hits, %llu walks (%llu after a word changed)\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()), static_cast<unsigned long long>(MemoCounts().hits.load()), static_cast<unsigned long long>(MemoCounts().misses.load()), static_cast<unsigned long long>(MemoCounts().changed.load()));
         }
     }
     return capture;
