@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -16,6 +17,14 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 void ClearDepthSurfaces(VkDevice device);
 bool DepthSurfaceAt(std::uint64_t address);
+struct DepthStoreClear {
+    std::uint64_t image = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint64_t value = 0;
+};
+std::optional<DepthStoreClear> MatchDepthStoreClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
+bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth);
 void RetireDepthSurfacesAt(const Context& context, std::uint64_t address);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 void NoteHtileDepthClear(std::uint64_t htileAddress);

@@ -295,6 +295,36 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
     }
 }
 
+std::optional<DepthStoreClear> MatchDepthStoreClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static constexpr std::array<std::uint32_t, 12> storeKernel{0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u, 0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du, 0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u};
+    static constexpr std::array<std::uint32_t, 15> storeVectorKernel{0xd7460004u, 0x0401060cu, 0xf4280404u, 0xfa000000u, 0xd7460005u, 0x0405060du, 0x7e0c020eu, 0xbf8cc07fu, 0x7e000210u, 0x7e020211u, 0x7e040212u, 0x7e060213u, 0xf0200f28u, 0x00000004u, 0xbf810000u};
+    const auto starts = [&](const auto& kernel) { return code.size() >= kernel.size() && std::equal(kernel.begin(), kernel.end(), code.begin()); };
+    if (!starts(storeKernel) && !starts(storeVectorKernel)) return std::nullopt;
+    if (userData.size() < 12 || numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return std::nullopt;
+    const auto image = DecodeTextureResource(userData.first(8));
+    if (image.dimension != TextureDimension::k2DArray && image.dimension != TextureDimension::k2D) return std::nullopt;
+    if (image.baseArray != 0 || image.depthOrLastArray != 0 || groups[2] < 1u) return std::nullopt;
+    const auto width = static_cast<std::uint64_t>(groups[0]) * 8u;
+    const auto height = static_cast<std::uint64_t>(groups[1]) * 8u;
+    if (width < image.width || height < image.height) return std::nullopt;
+    const auto value = userData[8] | (static_cast<std::uint64_t>(userData[9] & 0xffffu) << 32u);
+    if (value == 0 || (value & 3u) != 0 || userData[10] == 0) return std::nullopt;
+    return DepthStoreClear{image.baseAddress, image.width, image.height, value};
+}
+
+bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device || surface->target.address != address) continue;
+        if (width < surface->target.extent.width || height < surface->target.extent.height) return false;
+        surface->clearDepth = depth;
+        surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        surface->ApplyFastClear();
+        return true;
+    }
+    return false;
+}
+
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
