@@ -35,6 +35,7 @@ struct Freed {
 
 struct CommandRefs {
     std::unordered_map<std::uint64_t, std::uint64_t> memories;
+    std::unordered_set<std::uint64_t> buffers;
     std::uint64_t fence = 0;
     bool submitted = false;
     std::chrono::steady_clock::time_point begun;
@@ -52,6 +53,8 @@ struct Tracker {
     std::unordered_map<std::uint64_t, std::uint64_t> bufferSize;
     std::unordered_map<std::uint64_t, std::uint64_t> memorySize;
     std::unordered_map<std::uint64_t, std::pair<const std::byte*, std::uint64_t>> memoryMapping;
+    std::unordered_map<std::uint64_t, std::uint64_t> mappingOffset;
+    std::unordered_map<std::uint64_t, std::uint64_t> bufferOffset;
     std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> bufferAddress;
     std::map<std::uint64_t, AddressRange> freedRanges;
     std::array<std::pair<std::uint64_t, AddressRange>, 64> freedRing{};
@@ -159,7 +162,9 @@ void reference(Tracker& tracker, VkCommandBuffer commands, const char* command, 
         printFrames(freed->second.frames, freed->second.depth);
         std::fprintf(stderr, "\n");
     }
-    tracker.commands[key(commands)].memories.emplace(memory, handle);
+    auto& refs = tracker.commands[key(commands)];
+    refs.memories.emplace(memory, handle);
+    if (kind == StaleObject::Buffer) refs.buffers.insert(handle);
 }
 
 void referenceSet(Tracker& tracker, VkCommandBuffer commands, const char* command, VkDescriptorSet set) {
@@ -173,6 +178,7 @@ void completeFence(Tracker& tracker, std::uint64_t fence) {
     for (auto& [commands, refs] : tracker.commands) {
         if (refs.submitted && refs.fence == fence) {
             refs.memories.clear();
+            refs.buffers.clear();
             refs.submitted = false;
         }
     }
@@ -234,6 +240,7 @@ VKAPI_ATTR VkResult VKAPI_CALL staleMapMemory(VkDevice device, VkDeviceMemory me
         const auto total = tracker.memorySize.contains(key(memory)) ? tracker.memorySize[key(memory)] : 0u;
         const auto bytes = size == VK_WHOLE_SIZE ? (total > offset ? total - offset : 0u) : size;
         tracker.memoryMapping[key(memory)] = {static_cast<const std::byte*>(*data), bytes};
+        tracker.mappingOffset[key(memory)] = offset;
     }
     return result;
 }
@@ -316,6 +323,7 @@ VKAPI_ATTR VkResult VKAPI_CALL staleBindBufferMemory(VkDevice device, VkBuffer b
         auto& tracker = Track();
         std::lock_guard lock(tracker.mutex);
         tracker.bufferMemory[key(buffer)] = key(memory);
+        tracker.bufferOffset[key(buffer)] = offset;
     }
     return real_vkBindBufferMemory(device, buffer, memory, offset);
 }
@@ -433,6 +441,7 @@ VKAPI_ATTR VkResult VKAPI_CALL staleBeginCommandBuffer(VkCommandBuffer commands,
         std::lock_guard lock(tracker.mutex);
         auto& refs = tracker.commands[key(commands)];
         refs.memories.clear();
+        refs.buffers.clear();
         refs.submitted = false;
         refs.fence = 0;
         refs.begun = std::chrono::steady_clock::now();
@@ -468,10 +477,17 @@ VKAPI_ATTR VkResult VKAPI_CALL staleQueueSubmit(VkQueue queue, std::uint32_t cou
                 refs.submitted = true;
                 refs.fence = key(fence);
                 if (!tracker.freedRanges.empty()) {
-                    for (const auto& [memory, handle] : refs.memories) {
-                        const auto mapping = tracker.memoryMapping.find(memory);
-                        if (mapping == tracker.memoryMapping.end() || mapping->second.second > (1u << 20u)) continue;
-                        scanAddresses(tracker, submits[s].pCommandBuffers[c], "vkQueueSubmit (mapped memory of a used object)", mapping->second.first, static_cast<std::size_t>(mapping->second.second), 8);
+                    for (const auto buffer : refs.buffers) {
+                        const auto memory = tracker.bufferMemory.find(buffer);
+                        if (memory == tracker.bufferMemory.end()) continue;
+                        const auto mapping = tracker.memoryMapping.find(memory->second);
+                        if (mapping == tracker.memoryMapping.end()) continue;
+                        const auto mapOffset = tracker.mappingOffset[memory->second];
+                        const auto offset = tracker.bufferOffset[buffer];
+                        const auto size = tracker.bufferSize.contains(buffer) ? tracker.bufferSize[buffer] : 0u;
+                        if (offset < mapOffset || offset - mapOffset >= mapping->second.second || size == 0) continue;
+                        const auto bytes = std::min<std::uint64_t>({size, mapping->second.second - (offset - mapOffset), 4u << 20u});
+                        scanAddresses(tracker, submits[s].pCommandBuffers[c], "vkQueueSubmit (mapped contents of a used buffer)", mapping->second.first + (offset - mapOffset), static_cast<std::size_t>(bytes), 8);
                     }
                 }
                 for (const auto& [memory, handle] : refs.memories) {
@@ -522,6 +538,7 @@ void completeAll() {
     for (auto& [commands, refs] : tracker.commands) {
         if (!refs.submitted) continue;
         refs.memories.clear();
+        refs.buffers.clear();
         refs.submitted = false;
     }
 }
