@@ -1524,6 +1524,8 @@ void Recorder::ensureOpen() {
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
+        batch->kept.insert(batch->kept.end(), std::make_move_iterator(carriedToNextBatch.begin()), std::make_move_iterator(carriedToNextBatch.end()));
+        carriedToNextBatch.clear();
         open = std::move(batch);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
@@ -2513,6 +2515,11 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
+}
+
+void Recorder::KeepPastNextBatch(std::shared_ptr<void> object) {
+    carriedToNextBatch.push_back(object);
+    Keep(std::move(object));
 }
 
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {

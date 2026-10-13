@@ -316,7 +316,7 @@ void RetireDepthSurfacesAt(const Context& context, std::uint64_t address) {
     if (retired.empty()) return;
     auto* recorder = RecorderFor(context);
     if (recorder == nullptr) return;
-    for (auto& surface : retired) recorder->Keep(std::shared_ptr<DepthSurface>(std::move(surface)));
+    for (auto& surface : retired) recorder->KeepPastNextBatch(std::shared_ptr<DepthSurface>(std::move(surface)));
 }
 
 }

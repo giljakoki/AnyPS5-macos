@@ -350,6 +350,19 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
 }
 
+void keepPastNextBatchTests(Recorder& recorder) {
+    auto object = std::make_shared<int>(7);
+    const std::weak_ptr<int> watched = object;
+    recorder.KeepPastNextBatch(std::move(object));
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(!watched.expired(), "an object kept past the next batch was released with the batch open when it was kept");
+    recorder.Keep(std::make_shared<int>(0));
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(watched.expired(), "an object kept past the next batch outlived that batch");
+}
+
 void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(recorder.PendingWriteSettled(0x50000, 0x100), "an unwritten range is not settled");
     recorder.NotePendingWrite(0x50000, 0x100);
@@ -5767,6 +5780,7 @@ int main(int argc, char** argv) {
 
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
+        keepPastNextBatchTests(recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         directCompletionLabelTests(recorder);
