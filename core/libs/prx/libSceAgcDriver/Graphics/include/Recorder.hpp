@@ -185,6 +185,7 @@ public:
     void Sync();
     void CountSamples();
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
+    bool RecordSurfaceHash(VkCommandBuffer commands, VkDeviceAddress surface, std::uint32_t blocks, VkDeviceAddress digest);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -218,6 +219,8 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    std::uint64_t OpenSerial() const { return submissions + 1; }
+    bool BatchFinished(std::uint64_t serial) const;
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -675,6 +678,9 @@ private:
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
+    int surfaceHashState = 0;
+    VkPipelineLayout surfaceHashLayout = VK_NULL_HANDLE;
+    VkPipeline surfaceHashPipeline = VK_NULL_HANDLE;
     int sampleCounterState = 0;
     std::unique_ptr<Buffer> sampleCounter;
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;
