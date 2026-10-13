@@ -843,6 +843,8 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    double missMs = 0;
+    double longestMissMs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -875,8 +877,9 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses built in %.1f ms (longest %.1f ms), %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), store.missMs, store.longestMissMs, static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
     store.hits = store.misses = store.uncached = store.evicted = 0;
+    store.missMs = store.longestMissMs = 0;
 }
 
 }
@@ -917,7 +920,21 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
+    const auto buildStart = std::chrono::steady_clock::now();
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto buildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count();
+    store.missMs += buildMs;
+    store.longestMissMs = std::max(store.longestMissMs, buildMs);
+    static const bool traceMisses = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_TRACE_PIPELINE_MISSES") != nullptr;
+    if (traceMisses) {
+        std::string programs;
+        for (const auto& shader : shaders) {
+            char text[40];
+            std::snprintf(text, sizeof(text), " stage %d at 0x%llx", static_cast<int>(shader.stage), static_cast<unsigned long long>(shader.guestAddress));
+            programs += text;
+        }
+        std::fprintf(stderr, "[pipecache] miss built in %.1f ms on the draw thread:%s (%zu cached)\n", buildMs, programs.c_str(), store.entries.size());
+    }
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
     store.index[hash] = std::prev(store.entries.end());
     constexpr std::size_t bound = 1024;
