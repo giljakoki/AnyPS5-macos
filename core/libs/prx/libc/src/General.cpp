@@ -114,7 +114,7 @@ struct WorkingDirectory {
     const std::filesystem::path root = std::filesystem::canonical(std::filesystem::current_path());
     std::filesystem::path current = root;
 };
-WorkingDirectory& Directories() { static WorkingDirectory state; return state; }
+WorkingDirectory& Directories() { static WorkingDirectory& state = *new WorkingDirectory(); return state; }
 std::filesystem::path HostPath(WorkingDirectory& state, const std::filesystem::path& guest) {
     if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
     return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
@@ -190,7 +190,7 @@ struct WrittenPathRegistry {
     std::map<std::filesystem::path, bool> dirty;
     WriteMark mark = Now();
 };
-WrittenPathRegistry& Written() { static WrittenPathRegistry registry; return registry; }
+WrittenPathRegistry& Written() { static WrittenPathRegistry& registry = *new WrittenPathRegistry(); return registry; }
 #ifdef _WIN32
 std::optional<WriteMark> WriteTime(const std::filesystem::path& path) {
     WIN32_FILE_ATTRIBUTE_DATA data;
