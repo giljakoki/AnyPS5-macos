@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -2865,6 +2866,12 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     ensureOpen();
+    ++open->tracedLabels;
+    if (UploadTraceEnabled() && bytes.size() >= 4) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, bytes.data(), 4);
+        open->tracedLabelTimes.emplace_back(address, value, std::chrono::steady_clock::now());
+    }
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
     const bool tabled = bytes.size() <= LabelTableBytes;
@@ -3121,6 +3128,7 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
+    if (UploadTraceEnabled()) UploadTrace("batch %llu submitted with %u labels", static_cast<unsigned long long>(batch->serial), batch->tracedLabels);
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
         ++submitCount;
@@ -3511,6 +3519,11 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    if (UploadTraceEnabled() && batch != nullptr && batch->submitted) UploadTrace("batch %llu retired %.1f ms after its submit (%u labels, %s)", static_cast<unsigned long long>(batch->serial), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch->submittedAt).count(), batch->tracedLabels, wait ? "waited" : "reaped");
+    if (UploadTraceEnabled() && batch != nullptr && batch->submitted) {
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& [address, value, recordedAt] : batch->tracedLabelTimes) UploadTrace("label 0x%llx = 0x%x seen landed %.2f ms after its record (batch %llu submitted %.2f ms after it)", static_cast<unsigned long long>(address), value, std::chrono::duration<double, std::milli>(now - recordedAt).count(), static_cast<unsigned long long>(batch->serial), std::chrono::duration<double, std::milli>(batch->submittedAt - recordedAt).count());
+    }
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {

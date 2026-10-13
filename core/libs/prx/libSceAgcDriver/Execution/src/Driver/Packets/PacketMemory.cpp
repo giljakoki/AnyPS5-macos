@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -47,6 +48,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 }
                 countLabelOutcome(reason);
+                if (Graphics::UploadTraceEnabled()) Graphics::UploadTrace("label 0x%llx = 0x%x queue=0x%x serial=%llu %s", static_cast<unsigned long long>(label->address), bytes.size() >= 4 ? *reinterpret_cast<const std::uint32_t*>(bytes.data()) : 0u, submission.queue, static_cast<unsigned long long>(submission.serial), reason == 0 ? "recorded on the GPU" : reason == 5 ? "recorded behind completions" : reason == 1 ? "stored by the CPU (device idle)" : "drained");
                 ++immediateLabels;
             } else {
                 ++noOpLabels;
@@ -81,6 +83,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 entry.address = label->address;
                 entry.size = bytes.size();
                 std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
+                if (Graphics::UploadTraceEnabled()) entry.queuedAt = std::chrono::steady_clock::now();
                 ++queuedLabels;
                 wroteOnGpu = true;
             } else {
@@ -100,6 +103,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp, submission.queue);
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 countLabelOutcome(reason);
+                if (Graphics::UploadTraceEnabled()) Graphics::UploadTrace("label 0x%llx = 0x%x queue=0x%x serial=%llu %s", static_cast<unsigned long long>(label->address), bytes.size() >= 4 ? *reinterpret_cast<const std::uint32_t*>(bytes.data()) : 0u, submission.queue, static_cast<unsigned long long>(submission.serial), reason == 0 ? "recorded on the GPU" : reason == 5 ? "recorded behind completions" : reason == 1 ? "stored by the CPU (device idle)" : "drained");
                 ++immediateLabels;
             }
         } else if (opcode == 0x49 ? ((packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0) : (packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)) == 0) {

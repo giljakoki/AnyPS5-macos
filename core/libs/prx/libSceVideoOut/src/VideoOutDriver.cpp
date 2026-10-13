@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
@@ -193,9 +195,9 @@ FlipRequest::~FlipRequest() {
 
 void FlipRequest::ReleaseLocked() noexcept {
     if (!reserved || terminal) return;
-    --cfg->flipStatus.flipPendingNum;
+    if (!eventSent) --cfg->flipStatus.flipPendingNum;
     --queue->reservations;
-    if (index >= 0) {
+    if (index >= 0 && !eventSent) {
         --cfg->bufferPending[index];
         cfg->bufferReuse[index].Complete(reuseTicket);
     }
@@ -212,6 +214,7 @@ void FlipRequest::Cancel() noexcept {
 }
 
 void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) {
+    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d reached by the queue worker", static_cast<long long>(flipArg), index);
     require(frameTiming != nullptr, "missing frame timing");
     timing = frameTiming;
     {
@@ -247,12 +250,46 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
     require(gpuComplete, "flip preparation did not complete on GPU");
 }
 
+void FlipRequest::GpuFinished() {
+    std::lock_guard lock(cfg->mutex);
+    if (cfg->Closed() || !ready || terminal || eventSent || !VideoOutDriver::Get().EarlyFlipEvents()) return;
+    VideoOutDriver::Get().SignalFlipLocked(*this);
+}
+
 void FlipRequest::Fail(std::exception_ptr error) noexcept {
     if (!error) std::terminate();
     std::lock_guard lock(cfg->mutex);
     if (!cfg->failure) cfg->failure = error;
     ReleaseLocked();
     queue->changed.NotifyAll();
+}
+
+bool VideoOutDriver::EarlyFlipEvents() const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_EARLY_FIRST_FLIPS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled && !presentedOnce.load(std::memory_order_acquire);
+}
+
+void VideoOutDriver::SignalFlipLocked(FlipRequest& req) {
+    if (req.eventSent) return;
+    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d completed (flip event%s)", static_cast<long long>(req.flipArg), req.index, presentedOnce.load(std::memory_order_acquire) ? "" : ", before the first present");
+    triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
+    ++req.cfg->flipStatus.count;
+    req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
+    req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
+    req.cfg->flipStatus.flipArg = req.flipArg;
+    req.cfg->flipStatus.currentBuffer = req.index;
+    req.cfg->width = req.width;
+    req.cfg->height = req.height;
+    --req.cfg->flipStatus.flipPendingNum;
+    if (req.index >= 0) {
+        --req.cfg->bufferPending[req.index];
+        req.cfg->bufferReuse[req.index].Complete(req.reuseTicket);
+    }
+    req.eventSent = true;
+    req.cfg->vblankCond.notify_all();
 }
 
 VideoOutDriver& VideoOutDriver::Get() {
@@ -428,6 +465,7 @@ int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flip
     // A title that does not pace on flipPendingNum can run ahead of the presenter now that the queue
     // worker no longer waits per flip; a full queue is the documented error, not a failure.
     if (flipQueue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+    if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d submitted", static_cast<long long>(flipArg), index);
     std::array<uint32_t, AgcDriver::FlipPacketWords> words{AgcDriver::FlipPacketHeader, static_cast<uint32_t>(handle), static_cast<uint32_t>(index), static_cast<uint32_t>(flipMode), static_cast<uint32_t>(static_cast<uint64_t>(flipArg)), static_cast<uint32_t>(static_cast<uint64_t>(flipArg) >> 32u)};
     Packet packet{words.data(), static_cast<uint32_t>(words.size()), 0, {}};
     const auto result = sceAgcDriverSubmitDcb(&packet);
@@ -488,8 +526,10 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d dequeued by the presenter, waits for vblank %llu (now %llu, GPU complete %d)", static_cast<long long>(req.flipArg), req.index, static_cast<unsigned long long>(target), static_cast<unsigned long long>(req.cfg->vblankStatus.count), req.gpuComplete ? 1 : 0);
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d vblank reached", static_cast<long long>(req.flipArg), req.index);
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
@@ -510,6 +550,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         const auto extensions = windowExtensions(window.Handle());
         const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
         timing.Mark("window_prepare");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d window ready, presenting", static_cast<long long>(req.flipArg), req.index);
         const auto gpuReady = [](void* context) {
             auto& request = *static_cast<FlipRequest*>(context);
             std::lock_guard lock(request.cfg->mutex);
@@ -526,6 +567,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
         }
         timing.Mark("present");
+        if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d presented", static_cast<long long>(req.flipArg), req.index);
         OnMainThread([&] { window.UpdateTitle(); });
         timing.Mark("window_title");
     }
@@ -539,20 +581,9 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
     require(req.cfg->flipStatus.count != std::numeric_limits<uint64_t>::max(), "flip counter overflow");
-    triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
-    ++req.cfg->flipStatus.count;
-    req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
-    req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
-    req.cfg->flipStatus.flipArg = req.flipArg;
-    req.cfg->flipStatus.currentBuffer = req.index;
-    req.cfg->width = req.width;
-    req.cfg->height = req.height;
-    --req.cfg->flipStatus.flipPendingNum;
+    if (!req.eventSent) SignalFlipLocked(req);
+    presentedOnce.store(true, std::memory_order_release);
     --req.queue->reservations;
-    if (req.index >= 0) {
-        --req.cfg->bufferPending[req.index];
-        req.cfg->bufferReuse[req.index].Complete(req.reuseTicket);
-    }
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");

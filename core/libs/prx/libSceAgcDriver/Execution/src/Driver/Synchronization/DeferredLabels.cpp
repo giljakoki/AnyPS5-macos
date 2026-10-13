@@ -1,9 +1,12 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ThreadOwned.hpp"
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -138,6 +141,12 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         if (reason != 0 && reason != 5) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(label.address, bytes, 4);
+        }
+        if (Graphics::UploadTraceEnabled()) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), 4));
+            const double queuedMs = label.queuedAt == std::chrono::steady_clock::time_point{} ? -1.0 : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - label.queuedAt).count();
+            Graphics::UploadTrace("deferred label 0x%llx = 0x%x queue=0x%x recorded %.2f ms after its packet: %s", static_cast<unsigned long long>(label.address), value, queue, queuedMs, reason == 0 ? "GPU store in the open batch" : reason == 5 ? "GPU store behind completions" : reason == 1 ? "CPU store (device idle), landed now" : "CPU store after a drain, landed now");
         }
         noteLabelStore(label.address, bytes, stamp, queue);
     }

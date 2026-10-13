@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
@@ -273,7 +274,10 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     const auto roomStart = hitches != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     waitForFlipRoom(submission);
     const auto holdStart = hitches != nullptr ? std::chrono::steady_clock::now() : roomStart;
+    const bool traceUploads = Graphics::UploadTraceEnabled();
+    const auto traceHoldStart = traceUploads ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     holdFlipBehindWorker(submission);
+    const double traceHoldMs = traceUploads ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceHoldStart).count() : 0.0;
     if (hitches != nullptr) {
         const auto held = std::chrono::steady_clock::now();
         hitch.flipRoomMs = std::chrono::duration<double, std::milli>(holdStart - roomStart).count();
@@ -307,6 +311,22 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
             flipsAhead.fetch_add(1, std::memory_order_acq_rel);
         }
         flipSubmission = submission.holdsFlip;
+        if (traceUploads) {
+            std::array<std::uint32_t, 6> counts{};
+            for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
+                const auto header = submission.commands[cursor];
+                if (header == FlipPacketHeader) { ++counts[5]; continue; }
+                switch ((header >> 8u) & 0xffu) {
+                    case 0x15: case 0x16: ++counts[0]; break;
+                    case 0x40: case 0x50: ++counts[1]; break;
+                    case 0x27: case 0x2d: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x35: ++counts[2]; break;
+                    case 0x49: case 0x37: ++counts[3]; break;
+                    case 0x3c: case 0x93: ++counts[4]; break;
+                    default: break;
+                }
+            }
+            Graphics::UploadTrace("submit serial=%llu queue=0x%x dwords=%zu dispatches=%u copies=%u draws=%u labels=%u waits=%u flips=%u flip-hold=%.1f ms", static_cast<unsigned long long>(submission.serial), queue, submission.commands.size(), counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], traceHoldMs);
+        }
         enqueue(std::move(submission));
         ++accepted;
     }

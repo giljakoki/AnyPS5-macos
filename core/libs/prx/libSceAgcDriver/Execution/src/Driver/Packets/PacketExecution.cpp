@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -82,6 +83,7 @@ void Driver::execute(const Submission& submission) {
     auto& queue = *state;
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
+    if (Graphics::UploadTraceEnabled()) Graphics::UploadTrace("execute serial=%llu queue=0x%x", static_cast<unsigned long long>(submission.serial), submission.queue);
 
     static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
     if (static_cast<long>(submission.queue) == dumpQueue) {
@@ -260,6 +262,20 @@ void Driver::execute(const Submission& submission) {
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
+            static const bool earlyFlips = [] {
+                const char* value = std::getenv("APS5_EARLY_FIRST_FLIPS");
+                return value != nullptr && std::string_view(value) == "1";
+            }();
+            if (earlyFlips) {
+                auto request = submission.flips.at(cursor);
+                bool queued = false;
+                {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (const auto localDevice = device.Load()) queued = localDevice->AfterRecordedWork([request] { request->GpuFinished(); }, false);
+                }
+                if (!queued) request->GpuFinished();
+            }
         } else if (opcode == 0x15 || opcode == 0x16) {
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
@@ -267,8 +283,13 @@ void Driver::execute(const Submission& submission) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
+            const auto traceDispatchStart = std::chrono::steady_clock::now();
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
             else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            if (Graphics::UploadTraceEnabled()) {
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceDispatchStart).count();
+                if (ms >= 1.0) Graphics::UploadTrace("dispatch at DWORD %zu of serial=%llu took %.1f ms on the worker", cursor, static_cast<unsigned long long>(submission.serial), ms);
+            }
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {
@@ -302,7 +323,12 @@ void Driver::execute(const Submission& submission) {
 
                 try {
                     std::string rejected;
+                    const auto traceDrawStart = std::chrono::steady_clock::now();
                     const auto verdict = draw(queue, packet, submission, rejected);
+                    if (Graphics::UploadTraceEnabled()) {
+                        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceDrawStart).count();
+                        if (ms >= 1.0) Graphics::UploadTrace("draw at DWORD %zu of serial=%llu took %.1f ms on the worker", cursor, static_cast<unsigned long long>(submission.serial), ms);
+                    }
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {

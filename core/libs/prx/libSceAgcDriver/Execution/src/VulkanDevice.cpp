@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -106,7 +107,9 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    const auto createStart = std::chrono::steady_clock::now();
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    if (Graphics::UploadTraceEnabled()) Graphics::UploadTrace("compute pipeline created in %.1f ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count());
 }
 
 bool CaptureComputePipeline(std::size_t words) {

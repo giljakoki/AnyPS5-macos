@@ -33,6 +33,7 @@ class IFlipRequest {
 public:
     virtual ~IFlipRequest() = default;
     virtual void GpuReady(const std::shared_ptr<FrameTiming>& timing) = 0;
+    virtual void GpuFinished() {}
     virtual void Fail(std::exception_ptr error) noexcept = 0;
 };
 

@@ -16,6 +16,7 @@ struct DeferredLabel {
     std::uint64_t address;
     std::size_t size;
     std::array<std::byte, Capacity> bytes;
+    std::chrono::steady_clock::time_point queuedAt{};
 };
 
 struct DeferredLabels {
