@@ -275,6 +275,8 @@ void Texture::recordImportDetile(VkCommandBuffer commands, TextureDetiler& detil
     Require(descriptor.baseAddress >= import.base && guestBytes <= import.bytes && descriptor.baseAddress - import.base <= import.bytes - guestBytes, "host import does not cover the texture");
     PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
     auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto* timed = Recorder::Active();
+    const auto timing = timed != nullptr ? timed->BeginGpuTiming(Recorder::CommandClass::SnapshotRefresh) : Recorder::NoTiming;
     if (auto* recorder = Recorder::Active()) {
         recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
@@ -325,6 +327,7 @@ void Texture::recordImportDetile(VkCommandBuffer commands, TextureDetiler& detil
     toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toShaderRead.newLayout = layout;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+    if (timed != nullptr) timed->EndGpuTiming(timing, guestBytes);
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, const HostImport* import) : context(context) {

@@ -1730,7 +1730,7 @@ namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "surface-hash", "snapshot-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -2342,6 +2342,7 @@ bool Recorder::RecordSurfaceHash(VkCommandBuffer commands, VkDeviceAddress surfa
         }
     }
     if (surfaceHashState < 0 || blocks == 0) return false;
+    const auto timing = BeginGpuTiming(CommandClass::SurfaceHash);
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, surfaceHashPipeline);
     struct {
@@ -2354,7 +2355,8 @@ bool Recorder::RecordSurfaceHash(VkCommandBuffer commands, VkDeviceAddress surfa
     const auto groups = std::min<std::uint32_t>((blocks + 255u) / 256u, 1024u);
     function(cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
-    CountBarriers(CommandClass::StorageUpload, 2);
+    EndGpuTiming(timing, static_cast<std::uint64_t>(blocks) * 16u);
+    CountBarriers(CommandClass::SurfaceHash, 2);
     return true;
 }
 
