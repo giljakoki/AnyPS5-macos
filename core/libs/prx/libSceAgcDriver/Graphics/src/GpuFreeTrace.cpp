@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -121,6 +122,7 @@ void release(FreeState& state, const Deferred& entry) {
 
 void handle(FreeKind kind, VkDevice device, std::uint64_t object) {
     if (object == 0) return;
+    StaleHandleRelease(static_cast<StaleObject>(kind), object);
     auto& state = State();
     const auto now = std::chrono::steady_clock::now();
     FreeNote note;
@@ -212,6 +214,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL guardedDeviceProc(VkDevice device, cons
     if (std::strcmp(name, "vkDestroyImageView") == 0) return swap(state.destroyImageView, &guardedDestroyImageView);
     if (std::strcmp(name, "vkDestroyBufferView") == 0) return swap(state.destroyBufferView, &guardedDestroyBufferView);
     if (std::strcmp(name, "vkDestroyDevice") == 0) return swap(state.destroyDevice, &guardedDestroyDevice);
+    if (const auto wrapped = StaleHandleWrapper(name, real)) return wrapped;
     return real;
 }
 
@@ -230,7 +233,8 @@ void printFrame(void* frame) {
 }
 
 PFN_vkGetDeviceProcAddr GuardDeviceProc(PFN_vkGetDeviceProcAddr real) {
-    if (!Traced() && !Deferring()) return real;
+    if (!Traced() && !Deferring() && !StaleHandlesTraced()) return real;
+    if (StaleHandlesTraced()) std::fprintf(stderr, "[stale] APS5_TRACE_STALE_HANDLES: commands recording freed memory or destroyed objects, and memory freed while a command buffer uses it, are reported\n");
     auto& state = State();
     state.real = real;
     if (Traced()) std::fprintf(stderr, "[gpu-free] APS5_TRACE_GPU_FREES: Vulkan frees are recorded and the last 256 printed when the device is lost\n");

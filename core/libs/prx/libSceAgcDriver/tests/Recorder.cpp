@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -5996,6 +5997,77 @@ int gpuFreeBatchDeferTests(Recorder& recorder) {
     return 0;
 }
 
+int staleHandleTests(const Device& device) {
+    if (!StaleHandlesTraced()) {
+        std::cout << "skipped, APS5_TRACE_STALE_HANDLES is not set\n";
+        return 77;
+    }
+    const auto& context = device.GetContext();
+    const auto guarded = GuardDeviceProc(context.deviceProc);
+    const auto resolve = [&](const char* name) { return guarded(context.device, name); };
+    const auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(resolve("vkAllocateMemory"));
+    const auto createBuffer = reinterpret_cast<PFN_vkCreateBuffer>(resolve("vkCreateBuffer"));
+    const auto bind = reinterpret_cast<PFN_vkBindBufferMemory>(resolve("vkBindBufferMemory"));
+    const auto freeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolve("vkFreeMemory"));
+    const auto destroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(resolve("vkDestroyBuffer"));
+    const auto begin = reinterpret_cast<PFN_vkBeginCommandBuffer>(resolve("vkBeginCommandBuffer"));
+    const auto fill = reinterpret_cast<PFN_vkCmdFillBuffer>(resolve("vkCmdFillBuffer"));
+    const auto end = reinterpret_cast<PFN_vkEndCommandBuffer>(resolve("vkEndCommandBuffer"));
+    const auto freeCommands = reinterpret_cast<PFN_vkFreeCommandBuffers>(resolve("vkFreeCommandBuffers"));
+    const auto getRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(resolve("vkGetBufferMemoryRequirements"));
+    const auto makeBuffer = [&](VkDeviceMemory& memory) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = 4096;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        Check(createBuffer(context.device, &info, nullptr, &buffer), "vkCreateBuffer stale test");
+        VkMemoryRequirements requirements{};
+        getRequirements(context.device, buffer, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, 0);
+        Check(allocate(context.device, &allocation, nullptr, &memory), "vkAllocateMemory stale test");
+        Check(bind(context.device, buffer, memory, 0), "vkBindBufferMemory stale test");
+        return buffer;
+    };
+    VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    commandInfo.commandPool = context.pool;
+    commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commandInfo.commandBufferCount = 1;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &commandInfo, &commands), "vkAllocateCommandBuffers stale test");
+    const VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkDeviceMemory used = VK_NULL_HANDLE;
+    const auto usedBuffer = makeBuffer(used);
+    const auto before = StaleHandleReports();
+    Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
+    fill(commands, usedBuffer, 0, 4096, 0);
+    freeMemory(context.device, used, nullptr);
+    Require(StaleHandleReports() == before + 1, "freeing memory a recording command buffer uses was not reported");
+    Check(end(commands), "vkEndCommandBuffer stale test");
+    Check(reinterpret_cast<PFN_vkResetCommandBuffer>(resolve("vkResetCommandBuffer"))(commands, 0), "vkResetCommandBuffer stale test");
+    destroyBuffer(context.device, usedBuffer, nullptr);
+    VkDeviceMemory early = VK_NULL_HANDLE;
+    const auto staleBuffer = makeBuffer(early);
+    freeMemory(context.device, early, nullptr);
+    Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
+    fill(commands, staleBuffer, 0, 4096, 0);
+    Require(StaleHandleReports() == before + 2, "recording a buffer whose memory was freed was not reported");
+    Check(end(commands), "vkEndCommandBuffer stale test");
+    destroyBuffer(context.device, staleBuffer, nullptr);
+    VkDeviceMemory clean = VK_NULL_HANDLE;
+    const auto cleanBuffer = makeBuffer(clean);
+    Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
+    fill(commands, cleanBuffer, 0, 4096, 0);
+    Check(end(commands), "vkEndCommandBuffer stale test");
+    freeCommands(context.device, context.pool, 1, &commands);
+    freeMemory(context.device, clean, nullptr);
+    destroyBuffer(context.device, cleanBuffer, nullptr);
+    Require(StaleHandleReports() == before + 2, "a free after the command buffer was released was reported");
+    std::cout << "Stale handle tracer tests passed\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--gpu-free-defer-only") return gpuFreeDeferTests();
@@ -6008,6 +6080,7 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--stale-handles-only") return staleHandleTests(device);
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-only") {
             pipelineLibraryTests(device);
             return 0;

@@ -199,6 +199,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/QueueSubmitter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GpuFreeTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StaleHandleTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -869,6 +870,8 @@ if(BUILD_TESTING)
     set_tests_properties(agc_gpu_free_defer PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_DEFER_GPU_FREES=50;APS5_TRACE_GPU_FREES=1")
     add_test(NAME agc_gpu_free_batch_defer COMMAND agc_driver_recorder_tests --gpu-free-batch-defer-only)
     set_tests_properties(agc_gpu_free_batch_defer PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_DEFER_GPU_FREES=batches:0")
+    add_test(NAME agc_stale_handles COMMAND agc_driver_recorder_tests --stale-handles-only)
+    set_tests_properties(agc_stale_handles PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_TRACE_STALE_HANDLES=1")
     add_test(NAME agc_import_lifetime COMMAND agc_driver_recorder_tests --import-lifetime-only)
     set_tests_properties(agc_import_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_PIN_WAIT_MS=10000")
     add_test(NAME agc_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
@@ -939,6 +942,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Resources.cpp
         Graphics/src/QueueSubmitter.cpp
         Graphics/src/GpuFreeTrace.cpp
+        Graphics/src/StaleHandleTrace.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/ShaderResources.cpp
         Graphics/src/ShaderAddressResources.cpp
@@ -999,6 +1003,7 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         Graphics/src/Resources.cpp
         Graphics/src/QueueSubmitter.cpp
         Graphics/src/GpuFreeTrace.cpp
+        Graphics/src/StaleHandleTrace.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/BufferAddress.cpp
 )
