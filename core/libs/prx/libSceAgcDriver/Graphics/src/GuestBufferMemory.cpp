@@ -259,6 +259,14 @@ bool TraceImportRetire() {
     return trace;
 }
 
+bool PrintImportRetire() {
+    static const bool print = [] {
+        const char* value = std::getenv("APS5_TRACE_IMPORT_RETIRE");
+        return value != nullptr && std::string_view(value) != "ring";
+    }();
+    return print;
+}
+
 void printRetirement(const char* prefix, const RetirementNote& note, std::chrono::steady_clock::time_point now) {
     const auto age = std::chrono::duration<double, std::milli>(now - note.at).count();
     if (!note.recorder) {
@@ -283,7 +291,7 @@ void noteRetirement(const HostImport& entry, RetireCause cause) {
         note.recorder = true;
         note.work = recorder->Summary();
     }
-    printRetirement("", note, note.at);
+    if (PrintImportRetire()) printRetirement("", note, note.at);
     auto& log = Retirements();
     std::lock_guard lock(log.mutex);
     if (!note.locked) ++log.unlocked;
@@ -1753,7 +1761,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                 drained = true;
             }
             if (recorder != nullptr) recorder->DrainSubmitQueue();
-            if (TraceImportRetire()) std::fprintf(stderr, "[import-retire] pin waiter for 0x%llx+0x%zx: %s, %s, %zu objects still carried\n", static_cast<unsigned long long>(address), bytes, retiredImport ? "retired imports" : "no import overlapped", synced ? "synced" : "nothing to sync", recorder != nullptr ? recorder->CarriedObjects() : std::size_t{0});
+            if (PrintImportRetire()) std::fprintf(stderr, "[import-retire] pin waiter for 0x%llx+0x%zx: %s, %s, %zu objects still carried\n", static_cast<unsigned long long>(address), bytes, retiredImport ? "retired imports" : "no import overlapped", synced ? "synced" : "nothing to sync", recorder != nullptr ? recorder->CarriedObjects() : std::size_t{0});
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
         }
@@ -1862,7 +1870,7 @@ void ClearImageMirrors(VkDevice device) {
 }
 
 void NoteImportRetake(const char* user, std::size_t bindings, std::size_t copied) {
-    if (TraceImportRetire()) std::fprintf(stderr, "[import-retire] a %s's %zu in-place bindings were taken again before it was recorded (%zu copied: their range has no usable import now)\n", user, bindings, copied);
+    if (PrintImportRetire()) std::fprintf(stderr, "[import-retire] a %s's %zu in-place bindings were taken again before it was recorded (%zu copied: their range has no usable import now)\n", user, bindings, copied);
 }
 
 std::size_t RetiredImportsAlive() {
