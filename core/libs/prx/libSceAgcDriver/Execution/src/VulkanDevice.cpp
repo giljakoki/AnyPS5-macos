@@ -1701,6 +1701,7 @@ void VulkanDevice::WaitIdle() {
         state->recorder->Sync();
     }
     Graphics::QueueSubmitter::Drain(state->queue);
+    const auto access = Graphics::QueueSubmitter::Access(state->queue);
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
@@ -2816,7 +2817,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    {
+    static const bool lockedSubmit = std::getenv("APS5_PRESENT_SUBMIT_LOCKED") != nullptr;
+    if (lockedSubmit || !Graphics::QueueSubmitter::SubmitSignaling(state->queue, commands, slot.fence, rendered)) {
         const auto access = Graphics::QueueSubmitter::Access(state->queue);
         check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
     }

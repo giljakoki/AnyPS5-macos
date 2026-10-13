@@ -793,6 +793,61 @@ void HiddenUserWordVertexTablesTests() {
     Require(plain.fetchEmbedded && plain.fetchBufferReg == 4u && plain.resourcesNum == 1 && plain.resources[0].fields[0] == 0x1000u, "a vertex program's tables moved");
 }
 
+void MultiSemanticVertexTablesTests() {
+    constexpr std::size_t userDataOffset = 288;
+    constexpr std::size_t directOffset = 352;
+    constexpr std::size_t semanticOffset = 384;
+    constexpr std::uint32_t count = 3;
+    static std::vector<std::byte> header(semanticOffset + count * sizeof(ShaderSemantic));
+    static std::array<std::uint32_t, 16> bufferTable{};
+    for (std::uint32_t i = 0; i < bufferTable.size(); ++i) bufferTable[i] = 0x100u * (i / 4u) + (i % 4u);
+    static std::array<std::uint32_t, 6> attribTable{3u, 0xdeadu, 1u | (0x10u << 14u), 0xbeefu, 0xcafeu, 3u | (1u << 26u)};
+    std::array<std::uint16_t, ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT> direct{};
+    direct.fill(ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET);
+    direct[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+    direct[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+    std::memcpy(header.data() + directOffset, direct.data(), sizeof(direct));
+    const std::array<std::uint32_t, count> semanticIds{2u, 0u, 5u};
+    for (std::uint32_t i = 0; i < count; ++i) {
+        ShaderSemantic semantic{};
+        semantic.semantic = semanticIds[i];
+        semantic.hardware_mapping = 4u * i;
+        semantic.size_in_elements = 2;
+        std::memcpy(header.data() + semanticOffset + i * sizeof(ShaderSemantic), &semantic, sizeof(semantic));
+    }
+    ShaderUserData userData{};
+    userData.direct_resource_offset = reinterpret_cast<std::uint16_t*>(header.data() + directOffset);
+    userData.direct_resource_count = ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT;
+    std::memcpy(header.data() + userDataOffset, &userData, sizeof(userData));
+    Shader shader{};
+    shader.user_data = reinterpret_cast<ShaderUserData*>(header.data() + userDataOffset);
+    shader.input_semantics = reinterpret_cast<ShaderSemantic*>(header.data() + semanticOffset);
+    shader.num_input_semantics = count;
+    std::memcpy(header.data(), &shader, sizeof(shader));
+    const auto headerAddress = reinterpret_cast<std::uintptr_t>(header.data());
+    const auto buffers = reinterpret_cast<std::uintptr_t>(bufferTable.data());
+    const auto attribs = reinterpret_cast<std::uintptr_t>(attribTable.data());
+    const std::array<std::uint32_t, 4> registers{static_cast<std::uint32_t>(buffers), static_cast<std::uint32_t>(buffers >> 32u), static_cast<std::uint32_t>(attribs), static_cast<std::uint32_t>(attribs >> 32u)};
+    std::vector<AgcDriver::Graphics::DecodeRead> reads;
+    const auto info = AgcDriver::Graphics::DecodeVertexStageInfo(header, headerAddress, registers, &reads, false, 0);
+    Require(info.fetchEmbedded && info.resourcesNum == count, "three vertex semantics did not decode three resources");
+    const std::array<std::uint32_t, count> indices{1u, 3u, 3u};
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& fields = info.resources[i].fields;
+        const auto base = 0x100u * indices[i];
+        const auto expectedLow = i == 0 ? base + 0x10u : base;
+        Require(fields[0] == expectedLow && fields[2] == base + 2u, "vertex semantic " + std::to_string(i) + " read another buffer descriptor than its attribute word names");
+        Require(info.resourcesDst[i].attrId == static_cast<std::int32_t>(semanticIds[i]) && info.resourcesDst[i].fetchIndex == (i == 2 ? 1u : 0u), "vertex semantic " + std::to_string(i) + " lost its attribute fields");
+    }
+    Require(reads.size() == 2u * count, "the decode did not record one attribute word and one descriptor per semantic");
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& word = reads[2u * i];
+        const auto& sharp = reads[2u * i + 1u];
+        Require(word.address == attribs + 4u * semanticIds[i] && word.bytes.size() == 4u && std::memcmp(word.bytes.data(), &attribTable[semanticIds[i]], 4) == 0, "a recorded attribute word read is not the semantic's own word");
+        Require(sharp.address == buffers + 16u * indices[i] && sharp.bytes.size() == 16u && std::memcmp(sharp.bytes.data(), &bufferTable[4u * indices[i]], 16) == 0, "a recorded descriptor read is not the indexed descriptor");
+    }
+}
+
 void HeaderlessVertexStageTests() {
     const std::array<std::uint32_t, 4> userData{1, 2, 3, 4};
     const auto info = AgcDriver::Graphics::DecodeVertexStageInfo({}, 0, userData);
@@ -5274,6 +5329,7 @@ int main(int argc, char** argv) {
         ColorPipeBankXorTests();
         HeaderlessVertexStageTests();
         HiddenUserWordVertexTablesTests();
+        MultiSemanticVertexTablesTests();
         ComputeScratchTests();
         shaderUserDataTailPaddingTests();
         InitialContextTests();

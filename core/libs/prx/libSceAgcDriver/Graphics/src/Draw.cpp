@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -524,6 +525,127 @@ DrawProfile& Profile() {
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
+enum BatchBreak : std::size_t { BreakIneligible, BreakPass, BreakPipeline, BreakDescriptors, BreakCount };
+constexpr std::array<const char*, BreakCount> BatchBreakNames{"indirect, mesh, instanced or split", "render pass", "pipeline", "descriptors"};
+
+struct BatchProbeCounts {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> batchable{0};
+    std::atomic<std::uint64_t> longest{0};
+    std::array<std::atomic<std::uint64_t>, 8> lengths{};
+    std::array<std::atomic<std::uint64_t>, BreakCount> breaks{};
+    std::atomic<std::uint64_t> pushDiffers{0};
+    std::array<std::atomic<std::uint64_t>, 7> descriptorKinds{};
+    std::atomic<std::uint64_t> differingImages{0};
+    std::atomic<std::uint64_t> differingBuffers{0};
+};
+
+enum DescriptorKind : std::size_t { DescriptorsLayout, DescriptorsImages, DescriptorsSamplers, DescriptorsBufferSizes, DescriptorsBufferAddresses, DescriptorsSnapshots, DescriptorsSame, DescriptorKindCount };
+constexpr std::array<const char*, DescriptorKindCount> DescriptorKindNames{"another layout", "other images", "other samplers only", "buffers of other sizes", "buffers at other addresses or with other data only", "per-draw buffer snapshots only", "the same contents"};
+
+BatchProbeCounts& BatchProbe() {
+    static BatchProbeCounts& counts = *new BatchProbeCounts();
+    return counts;
+}
+
+struct BatchRun {
+    const void* pipeline = nullptr;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    const void* resources = nullptr;
+    std::weak_ptr<const ShaderResources> shared;
+    std::size_t snapshots = 0;
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    bool pushKnown = false;
+    std::uint64_t length = 0;
+};
+
+thread_local BatchRun batchRun;
+
+void closeBatchRun() {
+    auto& counts = BatchProbe();
+    const auto length = batchRun.length;
+    if (length >= 2) {
+        counts.runs.fetch_add(1, std::memory_order_relaxed);
+        counts.batchable.fetch_add(length, std::memory_order_relaxed);
+        counts.lengths[std::min<std::size_t>(std::bit_width(length) - 1, counts.lengths.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+        auto longest = counts.longest.load(std::memory_order_relaxed);
+        while (length > longest && !counts.longest.compare_exchange_weak(longest, length, std::memory_order_relaxed)) {}
+    }
+    batchRun.length = 0;
+}
+
+void classifyDescriptors(const std::shared_ptr<const ShaderResources>& resources, std::size_t snapshots) {
+    auto& counts = BatchProbe();
+    const auto previous = batchRun.shared.lock();
+    if (previous == nullptr || resources == nullptr) return;
+    DescriptorKind kind = DescriptorsSame;
+    if (previous != resources) {
+        const auto delta = resources->CompareDescriptors(*previous, snapshots, batchRun.snapshots);
+        counts.differingImages.fetch_add(delta.images, std::memory_order_relaxed);
+        counts.differingBuffers.fetch_add(delta.bufferSizes + delta.bufferAddresses, std::memory_order_relaxed);
+        if (delta.layout) kind = DescriptorsLayout;
+        else if (delta.images != 0) kind = DescriptorsImages;
+        else if (delta.samplers != 0) kind = DescriptorsSamplers;
+        else if (delta.bufferSizes != 0) kind = DescriptorsBufferSizes;
+        else if (delta.bufferAddresses != 0) kind = DescriptorsBufferAddresses;
+        else if (delta.snapshots != 0) kind = DescriptorsSnapshots;
+    } else if (snapshots != 0 || batchRun.snapshots != 0) {
+        kind = DescriptorsSnapshots;
+    }
+    counts.descriptorKinds[kind].fetch_add(1, std::memory_order_relaxed);
+}
+
+void probeBatch(bool eligible, bool continued, const void* pipeline, VkDescriptorSet set, const std::shared_ptr<const ShaderResources>& shared, std::size_t snapshots, const std::array<std::byte, PipelinePushConstantBytes>* push) {
+    const void* resources = shared.get();
+    auto& counts = BatchProbe();
+    counts.draws.fetch_add(1, std::memory_order_relaxed);
+    BatchBreak why = BreakCount;
+    if (!eligible) why = BreakIneligible;
+    else if (batchRun.length == 0 || !continued) why = BreakPass;
+    else if (pipeline != batchRun.pipeline) why = BreakPipeline;
+    else if (set != batchRun.set || (set == VK_NULL_HANDLE && resources != batchRun.resources)) why = BreakDescriptors;
+    if (why == BreakDescriptors) classifyDescriptors(shared, snapshots);
+    if (why == BreakCount) {
+        if (push != nullptr && batchRun.pushKnown && *push != batchRun.push) counts.pushDiffers.fetch_add(1, std::memory_order_relaxed);
+        ++batchRun.length;
+    } else {
+        if (batchRun.length != 0) counts.breaks[why].fetch_add(1, std::memory_order_relaxed);
+        closeBatchRun();
+        if (eligible) batchRun.length = 1;
+    }
+    batchRun.pipeline = pipeline;
+    batchRun.set = set;
+    batchRun.resources = resources;
+    batchRun.shared = shared;
+    batchRun.snapshots = snapshots;
+    batchRun.pushKnown = push != nullptr;
+    if (push != nullptr) batchRun.push = *push;
+}
+
+void reportBatchProbe() {
+    auto& counts = BatchProbe();
+    const auto draws = counts.draws.exchange(0, std::memory_order_relaxed);
+    if (draws == 0) return;
+    const auto runs = counts.runs.exchange(0, std::memory_order_relaxed);
+    const auto batchable = counts.batchable.exchange(0, std::memory_order_relaxed);
+    std::string lengths;
+    for (std::size_t i = 1; i < counts.lengths.size(); ++i) lengths += " " + std::to_string(1u << i) + (i + 1 == counts.lengths.size() ? "+:" : "-" + std::to_string((2u << i) - 1) + ":") + std::to_string(counts.lengths[i].exchange(0, std::memory_order_relaxed));
+    std::string breaks;
+    for (std::size_t i = 0; i < BreakCount; ++i) breaks += std::string(i == 0 ? " " : ", ") + BatchBreakNames[i] + " " + std::to_string(counts.breaks[i].exchange(0, std::memory_order_relaxed));
+    std::string kinds;
+    std::uint64_t classified = 0;
+    for (std::size_t i = 0; i < DescriptorKindCount; ++i) {
+        const auto count = counts.descriptorKinds[i].exchange(0, std::memory_order_relaxed);
+        classified += count;
+        kinds += std::string(i == 0 ? " " : ", ") + DescriptorKindNames[i] + " " + std::to_string(count);
+    }
+    const auto images = counts.differingImages.exchange(0, std::memory_order_relaxed);
+    const auto buffers = counts.differingBuffers.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[draw-batch] descriptor breaks by their costliest difference (same pass and pipeline, %llu):%s; per break %.1f image and %.1f buffer bindings differ\n", static_cast<unsigned long long>(classified), kinds.c_str(), classified != 0 ? static_cast<double>(images) / static_cast<double>(classified) : 0.0, classified != 0 ? static_cast<double>(buffers) / static_cast<double>(classified) : 0.0);
+    std::fprintf(stderr, "[draw-batch] %llu recorded draws (10 s): %llu in %llu runs of 2 or more that one multi-draw could record (%.0f%%, average run %.1f, longest %llu; runs by length%s); %llu of the joined draws changed their push constants; a run ended by:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(batchable), static_cast<unsigned long long>(runs), 100.0 * static_cast<double>(batchable) / static_cast<double>(draws), runs != 0 ? static_cast<double>(batchable) / static_cast<double>(runs) : 0.0, static_cast<unsigned long long>(counts.longest.exchange(0, std::memory_order_relaxed)), lengths.c_str(), static_cast<unsigned long long>(counts.pushDiffers.exchange(0, std::memory_order_relaxed)), breaks.c_str());
+}
+
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
@@ -584,6 +706,12 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhaseReadTarget && room()) {
+            static std::uint64_t reportedRepeats = 0;
+            const auto repeats = ResidentTargetRepeats();
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu draws repeated their resident target without a lookup)", static_cast<unsigned long long>(repeats - reportedRepeats));
+            reportedRepeats = repeats;
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -615,6 +743,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    reportBatchProbe();
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -1225,6 +1354,48 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+struct ResidentRepeat {
+    std::array<std::uint64_t, 15> key{};
+    std::weak_ptr<StorageTexture> image;
+    std::uint64_t epoch = 0;
+    std::uint64_t present = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t writes = 0;
+};
+
+thread_local ResidentRepeat lastResident;
+std::atomic<std::uint64_t> residentRepeats{0};
+
+std::array<std::uint64_t, 15> residentRepeatKey(const ColorTarget& color) {
+    return {color.address, color.bytes, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode), color.elementBytes, color.dccAddress, color.dccAlphaOnMsb ? 1u : 0u, color.cmaskAddress, color.surfaceAddress, (static_cast<std::uint64_t>(color.extent.width) << 32u) | color.extent.height, (static_cast<std::uint64_t>(color.surfaceExtent.width) << 32u) | color.surfaceExtent.height, color.mipCount, color.mip, color.depth, color.depthSlice};
+}
+
+bool residentRepeatEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_RESIDENT_TARGET_REPEAT") != nullptr;
+    return !disabled;
+}
+
+std::shared_ptr<StorageTexture> repeatedResidentTarget(const Context& context, const ColorTarget& color) {
+    if (!residentRepeatEnabled()) return nullptr;
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto forget = GuestMemory::ForgetSerial();
+    auto& last = lastResident;
+    if (epoch == 0 || (forget & 1u) != 0 || last.epoch != epoch || last.present != Recorder::Presents() || last.forget != forget || last.key != residentRepeatKey(color)) return nullptr;
+    auto image = last.image.lock();
+    if (image == nullptr || !StorageImageCached(context, image.get()) || !StorageImageServesKeys(*image, color.dccAddress)) return nullptr;
+    if (GuestMemory::DriverWroteOver(color.address, color.bytes, last.writes, false)) return nullptr;
+    const auto pending = StorageTexture::FindPending(color.address, color.bytes);
+    if (pending != nullptr && pending != image) return nullptr;
+    last.writes = GuestMemory::DriverWriteSerial();
+    residentRepeats.fetch_add(1, std::memory_order_relaxed);
+    return image;
+}
+
+void noteResidentTarget(const ColorTarget& color, const std::shared_ptr<StorageTexture>& image, std::uint64_t writes, std::uint64_t epoch, std::uint64_t present, std::uint64_t forget) {
+    if (!residentRepeatEnabled()) return;
+    lastResident = {residentRepeatKey(color), image, epoch, present, forget, writes};
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
@@ -1791,6 +1962,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    if (timer.profile) probeBatch(!gpuIndirect && !meshIndirect && !state.stages.mesh && draw.instanceCount == 1 && !record.pipeline->SplitsFaces() && !record.pipeline->SplitsSecondChannel(), continued, record.pipeline.get(), drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE, record.resources, drawBindings != nullptr ? drawBindings->snapshots.size() : 0, record.pushBytes);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
@@ -1970,9 +2142,15 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
                     return resident;
                 }
+                if (auto repeated = repeatedResidentTarget(context, color)) return repeated;
+                const auto writes = GuestMemory::DriverWriteSerial();
+                const auto epoch = GuestMemory::CollectEpoch();
+                const auto present = Recorder::Presents();
+                const auto forget = GuestMemory::ForgetSerial();
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+                noteResidentTarget(color, resident, writes, epoch, present, forget);
                 return resident;
             });
         }
@@ -2587,6 +2765,10 @@ void resolveColorTarget(const Context& context, const ColorMetadataPass& pass) {
     if (!to->CopyFrom(*from, refusal, true)) Require(false, what + " as an image copy was refused (" + (refusal != nullptr ? refusal : "unknown") + ")");
 }
 
+}
+
+std::uint64_t ResidentTargetRepeats() {
+    return residentRepeats.load(std::memory_order_relaxed);
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -53,12 +54,14 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool lockedQueue = std::getenv("APS5_PRESENT_SUBMIT_LOCKED") != nullptr || !Graphics::QueueSubmitter::Enabled();
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
         bool submitted = false;
         bool presentable = false;
         bool trailing = false;
+        bool queueUnlocked = false;
         double waitedMs = 0;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
@@ -105,12 +108,19 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 timing.Mark("render_fence_wait");
             }
             if (submitted && (syncFlip || inFlight != 0)) {
-
-                presenting->QueuePresent();
-                timing.Mark("queue_present");
+                if (syncFlip || lockedQueue) {
+                    presenting->QueuePresent();
+                    timing.Mark("queue_present");
+                } else {
+                    queueUnlocked = true;
+                }
                 trailing = !syncFlip;
                 submitted = false;
             }
+        }
+        if (queueUnlocked) {
+            presenting->QueuePresent();
+            timing.Mark("queue_present");
         }
         if (trailing) {
             waitedMs += presenting->FinishPresent();

@@ -85,6 +85,8 @@ struct ProofCounters {
     std::atomic<std::uint64_t> unstable{0};
     std::atomic<std::uint64_t> rangeProved{0};
     std::atomic<std::uint64_t> rangeScanned{0};
+    std::atomic<std::uint64_t> pendingAnswered{0};
+    std::atomic<std::uint64_t> pendingWaited{0};
 };
 
 ProofCounters& Proofs() {
@@ -107,8 +109,8 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
         return;
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
-    const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
+    auto& proofs = Proofs();
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; keys under pending GPU writes: %llu answered from the writes' values, %llu waited for\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(proofs.pendingAnswered.exchange(0)), static_cast<unsigned long long>(proofs.pendingWaited.exchange(0)));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -462,6 +464,45 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     return keys;
 }
 
+std::optional<DccKeys> PendingWrittenKeys(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    static const bool disabled = std::getenv("APS5_NO_PENDING_KEY_VALUES") != nullptr;
+    if (disabled || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    auto writes = recorder.PendingWritesOver(begin, count);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
+    int value = -1;
+    bool mixed = false;
+    const auto see = [&](int key) {
+        if (value < 0) value = key;
+        else if (value != key) mixed = true;
+    };
+    for (const auto& write : writes) {
+        if (unwritten.empty()) break;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool covered = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            covered = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        if (covered && write.value < 0) return std::nullopt;
+        if (covered) see(write.value);
+        unwritten = std::move(rest);
+    }
+    for (const auto& [from, to] : unwritten) {
+        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
+        else mixed = true;
+    }
+    if (mixed) return DccKeys::Mixed;
+    if (value < 0) return std::nullopt;
+    return ByteKeys(static_cast<std::uint8_t>(value));
+}
+
 DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -470,6 +511,12 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoi
                 memoized = true;
                 return *keys;
             }
+            if (const auto keys = PendingWrittenKeys(*recorder, metaAddress, count)) {
+                Proofs().pendingAnswered.fetch_add(1, std::memory_order_relaxed);
+                memoized = true;
+                return *keys;
+            }
+            Proofs().pendingWaited.fetch_add(1, std::memory_order_relaxed);
             static const bool lockedPresentWait = std::getenv("APS5_PRESENT_KEYS_LOCKED") != nullptr;
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count, !lockedPresentWait && GuestMemory::OnPresenterThread());

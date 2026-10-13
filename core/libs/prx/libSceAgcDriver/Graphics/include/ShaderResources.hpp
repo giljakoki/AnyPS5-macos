@@ -148,6 +148,15 @@ public:
         std::vector<std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    struct DescriptorDelta {
+        bool layout = false;
+        std::uint32_t images = 0;
+        std::uint32_t samplers = 0;
+        std::uint32_t bufferAddresses = 0;
+        std::uint32_t bufferSizes = 0;
+        std::uint32_t snapshots = 0;
+    };
+    DescriptorDelta CompareDescriptors(const ShaderResources& previous, std::size_t snapshots, std::size_t previousSnapshots) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
@@ -471,6 +480,14 @@ private:
     bool reusable = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
+    struct UntrackedValidation {
+        std::uint64_t present = 0;
+        std::chrono::steady_clock::time_point at{};
+        std::uint64_t forget = 1;
+        std::uint64_t writes = 0;
+        bool usable = false;
+    };
+    UntrackedValidation untrackedValidation;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,
     // no image other than the object's own sources has results pending over its surfaces and

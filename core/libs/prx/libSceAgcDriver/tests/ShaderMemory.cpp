@@ -471,6 +471,99 @@ void verifySignedSrtComparison() {
     }
 }
 
+void verifyCaptureMemo() {
+    std::vector<std::uint32_t> code{0xf40c0200u, 0xfa000000u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf4000400u, 0xfa000050u, 0xf4080a00u, 0xfa000080u, 0xbf8cc07fu, 0xf42c0814u, 0xfa000000u, 0xbf8cc07fu, 0xbf068010u, 0xbf850008u};
+    for (std::uint32_t dword = 0; dword < 8u; dword++) {
+        code.push_back(0xbe800300u | ((8u + dword) << 16u) | (32u + dword));
+    }
+    code.insert(code.end(), {0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u});
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[2];
+    const auto imageDescriptor = [&](const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    std::array<std::uint32_t, 36> srt{};
+    const auto first = imageDescriptor(textures[0]);
+    const auto second = imageDescriptor(textures[1]);
+    std::copy(first.begin(), first.end(), srt.begin());
+    const std::array<std::uint32_t, 4> outputV{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    std::copy(outputV.begin(), outputV.end(), srt.begin() + 16);
+    srt[20] = 1u;
+    std::copy(second.begin(), second.end(), srt.begin() + 24);
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x23000u, code, 0, {}};
+    request.context.waveSize = 32u;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    if (std::getenv("APS5_NO_CAPTURE_MEMO") != nullptr) return;
+    const auto prepared = PrepareShader(request);
+    require(prepared != nullptr, "capture memo: the shader was not prepared");
+    const auto invocation = PreparedShaderInvocation::TryCreate(request, prepared);
+    require(invocation.has_value(), "capture memo: no prepared invocation");
+    AgcDriver::ShaderMemory firstMemory({});
+    const auto firstCapture = firstMemory.Capture(*invocation);
+    AgcDriver::ShaderMemory secondMemory({});
+    const auto secondCapture = secondMemory.Capture(*invocation);
+    require(secondCapture == firstCapture, "capture memo: an unchanged walk was not reused");
+    const auto firstRegions = firstMemory.Regions();
+    const auto secondRegions = secondMemory.Regions();
+    require(firstRegions.size() == secondRegions.size() && std::ranges::equal(firstRegions, secondRegions, [](const auto& left, const auto& right) { return left.guestAddress == right.guestAddress && std::ranges::equal(left.bytes, right.bytes); }), "capture memo: a reused walk did not record the same read regions");
+    std::copy(second.begin(), second.end(), srt.begin());
+    AgcDriver::ShaderMemory changedMemory({});
+    const auto changedCapture = changedMemory.Capture(*invocation);
+    require(changedCapture != firstCapture, "capture memo: a walk was reused after a word it read changed");
+    const auto holdsSecond = std::ranges::any_of(changedCapture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(second.begin(), second.end(), value.dwords.begin()); });
+    require(holdsSecond, "capture memo: the walk after the change did not read the new T#");
+    std::copy(first.begin(), first.end(), srt.begin());
+    if (std::getenv("APS5_NO_CAPTURE_PAGE_MEMO") == nullptr) {
+        static std::uint64_t state = 1;
+        static int queries = 0;
+        static bool pending = false;
+        AgcDriver::ShaderMemory::SetPageStateProvider([] { return state; });
+        const auto query = [](std::uint64_t, std::size_t, std::span<std::byte>) {
+            ++queries;
+            return pending ? AgcDriver::ShaderMemory::PendingWrite::Sync : AgcDriver::ShaderMemory::PendingWrite::None;
+        };
+        const auto plain = [&] {
+            AgcDriver::ShaderMemory memory({}, query);
+            return memory.Capture(request);
+        };
+        queries = 0;
+        static_cast<void>(plain());
+        require(queries > 0, "page memo: the first capture did not classify its pages");
+        queries = 0;
+        const auto reused = plain();
+        require(queries == 0, "page memo: a page classified under the same memory map and pending writes was classified again");
+        pending = true;
+        ++state;
+        queries = 0;
+        const auto reclassified = plain();
+        require(queries > 0, "page memo: a page was not classified again after the pending writes changed");
+        require(std::ranges::equal(reused->snapshot.images, reclassified->snapshot.images, [](const auto& left, const auto& right) { return left.dwords == right.dwords; }), "page memo: a word-wise capture read other T#s");
+        pending = false;
+        AgcDriver::ShaderMemory::SetPageStateProvider(nullptr);
+    }
+}
+
 void verifyOutOfRangeConstantReads() {
     std::vector<std::uint32_t> code{0xf40c0200u, 0xfa000000u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf4000400u, 0xfa000050u, 0xf4080a00u, 0xfa000080u, 0xbf8cc07fu, 0xf42c0814u, 0xfa000000u, 0xbf8cc07fu, 0xbf068010u, 0xbf850008u};
     for (std::uint32_t dword = 0; dword < 8u; dword++) {
@@ -3238,6 +3331,7 @@ int main(int argc, char** argv) {
         verifyFrontendPair();
         verifySignedSrtComparison();
         verifyOutOfRangeConstantReads();
+        verifyCaptureMemo();
         verifySignedMinimum();
         verifyPureFlatSlots();
         verifyBindlessTable();

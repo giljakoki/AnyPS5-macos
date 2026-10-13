@@ -56,6 +56,7 @@ void Driver::stop() {
 
 Driver::Driver() {
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
+    ShaderMemory::SetPageStateProvider(&Graphics::Recorder::PublishGeneration);
     InstallRecentWorkDump();
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });

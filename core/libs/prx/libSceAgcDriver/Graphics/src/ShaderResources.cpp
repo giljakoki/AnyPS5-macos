@@ -2114,6 +2114,7 @@ struct RevalidateProfile {
     // Epoch gate: registry scans skipped because the pending serial was unchanged, and import
     // serial loops skipped because the table's identity was unchanged.
     std::atomic<std::uint64_t> serialSkips{0};
+    std::atomic<std::uint64_t> untrackedFast{0};
     std::atomic<std::uint64_t> importSkips{0};
     // Elements with DCC keys the fast path accepted through the images' key proofs.
     std::atomic<std::uint64_t> keysProven{0};
@@ -2146,6 +2147,10 @@ struct RevalidateProfile {
 RevalidateProfile& Revalidations() {
     static RevalidateProfile& profile = *new RevalidateProfile();
     return profile;
+}
+
+void countUntrackedFastProof() {
+    if (BuildProfiled()) Revalidations().untrackedFast.fetch_add(1, std::memory_order_relaxed);
 }
 
 void countFastFail(FastFail reason) {
@@ -2228,7 +2233,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu (%llu over untracked memory), full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.untrackedFast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -2255,6 +2260,13 @@ void ShaderResources::captureValidation() {
         if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
     }
     lookupLog().clear();
+    const auto proof = currentSnapshotProof();
+    untrackedValidation = {proof.present, proof.now, proof.forget, proof.writes, proof.usable};
+}
+
+bool untrackedFastRevalidate() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_FAST_REVALIDATE") != nullptr;
+    return !disabled;
 }
 
 // Proves every texture and storage image still current without repeating its lookup: exactly the
@@ -2283,6 +2295,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
+    const auto proof = currentSnapshotProof();
+    const bool untrackedHolds = untrackedFastRevalidate() && proof.usable && untrackedValidation.usable && untrackedValidation.present == proof.present && proof.now - untrackedValidation.at < snapshotProofLifetime() && untrackedValidation.forget == proof.forget;
+    const auto untrackedProven = [&](std::uint64_t address, std::size_t bytes) { return untrackedHolds && !GuestMemory::DriverWroteOver(address, bytes, untrackedValidation.writes); };
+    bool anyUntracked = false;
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
@@ -2315,7 +2331,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) return fail(FastFail::Collect);
+        const bool untracked = surface.collected == 0;
+        if (untracked && !untrackedProven(address, bytes)) return fail(FastFail::Collect);
+        anyUntracked = anyUntracked || untracked;
         const auto* source = surface.source;
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
@@ -2353,9 +2371,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
-            queries.push_back({address, bytes, source->Generation()});
+            if (!untracked) queries.push_back({address, bytes, source->Generation()});
             images.push_back(source);
-        } else {
+        } else if (!untracked) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -2367,7 +2385,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        const bool untracked = GuestMemory::CollectWrites(address, bytes) == 0;
+        if (untracked && !untrackedProven(address, bytes)) return fail(FastFail::Collect);
+        anyUntracked = anyUntracked || untracked;
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -2377,7 +2397,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
-        queries.push_back({address, bytes, image->Generation()});
+        if (!untracked) queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
     if (!pending.empty()) {
@@ -2419,8 +2439,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         auto& surface = validatedTextures[i];
-        if (surface.source == nullptr) surface.generation = surface.collected;
+        if (surface.source == nullptr && surface.collected != 0) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
+    }
+    if (anyUntracked) {
+        untrackedValidation.writes = proof.writes;
+        countUntrackedFastProof();
     }
     return true;
 }
@@ -3851,6 +3875,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
+}
+
+ShaderResources::DescriptorDelta ShaderResources::CompareDescriptors(const ShaderResources& previous, std::size_t snapshots, std::size_t previousSnapshots) const {
+    DescriptorDelta delta;
+    if (_layout != previous._layout || allocations.size() != previous.allocations.size() || descriptorImages.size() != previous.descriptorImages.size()) {
+        delta.layout = true;
+        return delta;
+    }
+    for (std::size_t index = 0; index < descriptorImages.size(); ++index) {
+        if (descriptorImages[index].imageView != previous.descriptorImages[index].imageView || descriptorImages[index].imageLayout != previous.descriptorImages[index].imageLayout) ++delta.images;
+        if (descriptorImages[index].sampler != previous.descriptorImages[index].sampler) ++delta.samplers;
+    }
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mine = allocations[index];
+        const auto& theirs = previous.allocations[index];
+        if (mine.size != theirs.size) ++delta.bufferSizes;
+        else if (mine.address != theirs.address || (!mine.guest && mine.dataWords != theirs.dataWords)) ++delta.bufferAddresses;
+    }
+    delta.snapshots = static_cast<std::uint32_t>(std::max(snapshots, previousSnapshots));
+    return delta;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
