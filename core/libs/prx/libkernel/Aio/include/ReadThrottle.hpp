@@ -26,9 +26,18 @@ inline std::uint64_t DelayMicros(const Settings& settings, std::uint64_t bytes, 
     return whole;
 }
 
+struct PacingTotals {
+    std::uint64_t waiting = 0;
+    std::uint64_t heldReads = 0;
+    std::uint64_t releasedByFlip = 0;
+    std::uint64_t stalls = 0;
+};
+
 Settings Current();
 void After(std::uint64_t bytes);
 std::uint64_t Flips();
+PacingTotals Totals();
+void SetFlipStallMillis(unsigned millis);
 
 }
 
