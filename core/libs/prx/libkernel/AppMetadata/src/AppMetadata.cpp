@@ -19,7 +19,7 @@ char g_title[128] = {};
 char g_titleId[12] = {};
 std::uint64_t g_downloadDataSizeMiB = 0;
 std::int32_t g_userDefinedParams[4] = {};
-std::vector<std::uint8_t> g_iconBytes;
+std::vector<std::uint8_t>& g_iconBytes = *new std::vector<std::uint8_t>();
 
 constexpr const char* AppMetadataParamJsonGuestPath = "/app0/sce_sys/param.json";
 constexpr const char* AppMetadataIconGuestPath = "/app0/sce_sys/icon0.png";

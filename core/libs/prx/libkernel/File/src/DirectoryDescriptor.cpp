@@ -36,8 +36,8 @@ struct DirectoryState {
     bool loaded = false;
 };
 
-std::mutex g_mutex;
-std::map<int, std::shared_ptr<DirectoryState>> g_directories;
+std::mutex& g_mutex = *new std::mutex();
+std::map<int, std::shared_ptr<DirectoryState>>& g_directories = *new std::map<int, std::shared_ptr<DirectoryState>>();
 std::atomic<std::size_t> g_directoryCount{0};
 
 std::shared_ptr<DirectoryState> Find(int fd) {

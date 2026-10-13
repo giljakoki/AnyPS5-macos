@@ -7,12 +7,12 @@ int APS5_VABI sceKernelIsAddressSanitizerEnabled(void) {
 }
 
 MallocReplace* APS5_VABI sceKernelGetSanitizerMallocReplaceExternal(void) {
-    static MallocReplace replacement{};
+    static MallocReplace& replacement = *new MallocReplace();
     return &replacement;
 }
 
 NewReplace* APS5_VABI sceKernelGetSanitizerNewReplaceExternal(void) {
-    static NewReplace replacement{};
+    static NewReplace& replacement = *new NewReplace();
     return &replacement;
 }
 

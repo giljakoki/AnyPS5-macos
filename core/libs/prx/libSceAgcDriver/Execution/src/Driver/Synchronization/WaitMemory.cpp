@@ -361,8 +361,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             warned = true;
             ++outcomes.timedOut;
             {
-                static std::mutex reportedMutex;
-                static std::set<std::uint64_t> reported;
+                static std::mutex& reportedMutex = *new std::mutex();
+                static std::set<std::uint64_t>& reported = *new std::set<std::uint64_t>();
                 static std::uint64_t timeouts = 0;
                 const std::lock_guard lock(reportedMutex);
                 if (++timeouts % 20 == 0) std::fprintf(stderr, "[gpu] %llu GPU waits have timed out\n", static_cast<unsigned long long>(timeouts));

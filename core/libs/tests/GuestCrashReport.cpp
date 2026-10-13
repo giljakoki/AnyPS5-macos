@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <spawn.h>
+#include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -54,6 +55,15 @@ void* APS5_VABI Raise(void*) {
     return nullptr;
 }
 
+void ThrowThrough() noexcept {
+    throw std::runtime_error("crash-test-terminate");
+}
+
+void* APS5_VABI Terminate(void*) {
+    ThrowThrough();
+    return nullptr;
+}
+
 int Child(const char* mode) {
     struct GuestSigaction {
         std::uintptr_t handler;
@@ -61,7 +71,7 @@ int Child(const char* mode) {
         std::uint32_t mask[4];
     } reset{};
     if (std::strcmp(mode, "guest-reset") == 0) Require(sigaction_nid_postfix(11, &reset, nullptr) == 0, "the guest could not reset SIGSEGV");
-    PthreadEntry entry = std::strcmp(mode, "overflow") == 0 ? Overflow : std::strcmp(mode, "raise") == 0 ? Raise : Fault;
+    PthreadEntry entry = std::strcmp(mode, "overflow") == 0 ? Overflow : std::strcmp(mode, "raise") == 0 ? Raise : std::strcmp(mode, "terminate") == 0 ? Terminate : Fault;
     Pthread thread = nullptr;
     Require(scePthreadCreate(&thread, nullptr, entry, nullptr, "crash-test-thread") == 0, "creating the thread failed");
     scePthreadJoin(thread, nullptr);
@@ -83,7 +93,7 @@ std::string SelfPath() {
 #endif
 }
 
-void Expect(const char* mode, const char* const* needles) {
+void Expect(const char* mode, const char* const* needles, int expectedSignal = 0) {
     int pipeEnds[2];
     Require(pipe(pipeEnds) == 0, "pipe failed");
     posix_spawn_file_actions_t actions;
@@ -107,7 +117,8 @@ void Expect(const char* mode, const char* const* needles) {
     int status = 0;
     Require(waitpid(child, &status, 0) == child, "waiting for the child failed");
     const std::string label = std::string(mode) + ": ";
-    Require(WIFSIGNALED(status) && (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS), label + "the child did not die of the fault, output:\n" + output);
+    const bool signaled = WIFSIGNALED(status) && (expectedSignal != 0 ? WTERMSIG(status) == expectedSignal : WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
+    Require(signaled, label + "the child did not die of the expected signal, output:\n" + output);
     for (const char* const* needle = needles; *needle != nullptr; ++needle)
         Require(output.find(*needle) != std::string::npos, label + "the report lacks '" + *needle + "', output:\n" + output);
 }
@@ -123,6 +134,8 @@ int main(int argc, char** argv) {
     Expect("overflow", overflow);
     const char* const raised[] = {"[crash] SIGSEGV (signal 11)", "'crash-test-thread'", "end of report", nullptr};
     Expect("raise", raised);
+    const char* const terminated[] = {"[crash] std::terminate", "'crash-test-thread'", "crash-test-terminate", "[crash] frames:", "TerminateEPv", "end of report", nullptr};
+    Expect("terminate", terminated, SIGABRT);
     std::puts("guest crash report: ok");
     return 0;
 }

@@ -68,7 +68,7 @@ extern "C" void AgcDriverWaitIdle_nid_postfix() try {
 }
 
 static std::mutex& VulkanLoaderMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 

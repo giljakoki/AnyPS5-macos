@@ -232,7 +232,7 @@ std::filesystem::path ComputePipelineCapture::Write(const std::filesystem::path&
     const auto bytes = Encode();
     const auto recordDirectory = directory / ("compute-" + Hash(bytes));
     const auto path = recordDirectory / "capture.aps5cp";
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     std::lock_guard lock(mutex);
     std::filesystem::create_directories(directory);
     RequireCapture(!std::filesystem::is_symlink(std::filesystem::symlink_status(directory)), "capture directory is a symbolic link");

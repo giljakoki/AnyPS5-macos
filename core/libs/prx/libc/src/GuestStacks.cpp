@@ -20,8 +20,8 @@ struct StackBounds {
 
 constexpr std::size_t DeallocationStackOffset = 0x1478;
 
-std::mutex rangesLock;
-std::map<std::uintptr_t, std::uintptr_t> ranges;
+std::mutex& rangesLock = *new std::mutex();
+std::map<std::uintptr_t, std::uintptr_t>& ranges = *new std::map<std::uintptr_t, std::uintptr_t>();
 
 StackBounds CurrentBounds() {
     auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());

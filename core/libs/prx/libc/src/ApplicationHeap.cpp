@@ -25,10 +25,10 @@ using Initialize = int (APS5_VABI *)();
 using Stats = int (APS5_VABI *)(void*);
 using UsableSize = std::size_t (APS5_VABI *)(void*);
 
-std::mutex heapMutex;
+std::mutex& heapMutex = *new std::mutex();
 std::array<void*, 10> heapApi{};
 std::once_flag heapInitialization;
-std::exception_ptr heapFailure;
+std::exception_ptr& heapFailure = *new std::exception_ptr();
 Initialize heapFinalize = nullptr;
 bool heapFinalized = false;
 thread_local bool heapCallbackActive = false;

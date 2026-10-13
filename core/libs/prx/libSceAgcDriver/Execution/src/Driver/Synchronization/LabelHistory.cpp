@@ -60,7 +60,7 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
     }
     if (kind == nullptr) return;
     if (std::string_view(kind) != "WAIT_REG_MEM") {
-        static std::mutex historyMutex;
+        static std::mutex& historyMutex = *new std::mutex();
         std::lock_guard lock(historyMutex);
         auto& entry = writeHistory()[writeCursor()++ % writeHistory().size()];
         entry = {target, length, queue, opcode};
@@ -72,7 +72,7 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
 }
 
 std::array<WriteRecord, 16384>& Driver::writeHistory() {
-    static std::array<WriteRecord, 16384> history{};
+    static std::array<WriteRecord, 16384>& history = *new std::array<WriteRecord, 16384>();
     return history;
 }
 

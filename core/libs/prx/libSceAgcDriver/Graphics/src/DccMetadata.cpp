@@ -74,7 +74,7 @@ struct ScanProfile {
 };
 
 ScanProfile& Scans() {
-    static ScanProfile profile;
+    static ScanProfile& profile = *new ScanProfile();
     return profile;
 }
 
@@ -88,7 +88,7 @@ struct ProofCounters {
 };
 
 ProofCounters& Proofs() {
-    static ProofCounters counters;
+    static ProofCounters& counters = *new ProofCounters();
     return counters;
 }
 
@@ -156,7 +156,7 @@ struct KeyStoreMemo {
 };
 
 KeyStoreMemo& Memo() {
-    static KeyStoreMemo memo;
+    static KeyStoreMemo& memo = *new KeyStoreMemo();
     return memo;
 }
 
@@ -453,8 +453,8 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) {
-        static std::mutex reportedMutex;
-        static std::set<std::pair<std::uint64_t, int>> reported;
+        static std::mutex& reportedMutex = *new std::mutex();
+        static std::set<std::pair<std::uint64_t, int>>& reported = *new std::set<std::pair<std::uint64_t, int>>();
         std::lock_guard lock(reportedMutex);
         if (reported.size() < 32 && reported.insert({resource.baseAddress, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] texture 0x%llx (format %u) has %s DCC keys at 0x%llx; its texels are read as stored\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, DccKeysName(keys), static_cast<unsigned long long>(resource.dccAddress));
         return DccKeys::Uncompressed;

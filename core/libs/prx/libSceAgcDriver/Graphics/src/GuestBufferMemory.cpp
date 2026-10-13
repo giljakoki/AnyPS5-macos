@@ -137,7 +137,7 @@ struct AddressSpaceCache {
 };
 
 AddressSpaceCache& Spaces() {
-    static AddressSpaceCache cache;
+    static AddressSpaceCache& cache = *new AddressSpaceCache();
     return cache;
 }
 
@@ -174,7 +174,7 @@ struct HostImports {
 };
 
 HostImports& Imports() {
-    static HostImports imports;
+    static HostImports& imports = *new HostImports();
     return imports;
 }
 
@@ -335,7 +335,7 @@ struct ImportChunks {
 };
 
 ImportChunks& Chunks() {
-    static ImportChunks chunks;
+    static ImportChunks& chunks = *new ImportChunks();
     return chunks;
 }
 
@@ -885,12 +885,12 @@ struct AddressBuildTotals {
 };
 
 AddressBuildTotals& AddressBuilds() {
-    static AddressBuildTotals totals;
+    static AddressBuildTotals& totals = *new AddressBuildTotals();
     return totals;
 }
 
 ImageMirrors& Mirrors() {
-    static ImageMirrors mirrors;
+    static ImageMirrors& mirrors = *new ImageMirrors();
     return mirrors;
 }
 
@@ -1493,7 +1493,7 @@ struct LeaseState {
 };
 
 LeaseState& Leases() {
-    static LeaseState state;
+    static LeaseState& state = *new LeaseState();
     return state;
 }
 
@@ -1506,7 +1506,7 @@ struct SnapshotStats {
 };
 
 SnapshotStats& Snapshots() {
-    static SnapshotStats stats;
+    static SnapshotStats& stats = *new SnapshotStats();
     return stats;
 }
 
@@ -2628,7 +2628,7 @@ struct CopyStats {
 };
 
 CopyStats& Copies() {
-    static CopyStats stats;
+    static CopyStats& stats = *new CopyStats();
     return stats;
 }
 
@@ -2651,8 +2651,8 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
 void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     static const bool trace = std::getenv("APS5_TRACE_STAGING") != nullptr;
     if (!trace) return;
-    static std::mutex mutex;
-    static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+    static std::mutex& mutex = *new std::mutex();
+    static std::set<std::pair<std::uint64_t, std::uint64_t>>& seen = *new std::set<std::pair<std::uint64_t, std::uint64_t>>();
     std::lock_guard lock(mutex);
     if (!seen.insert({begin, end}).second) return;
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
@@ -3056,9 +3056,9 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     if (profile) {
         // Why the region is copied rather than bound in place, totalled every 1000 uploads (under a
         // mutex: prepare stages of several builds copy at once).
-        static std::mutex reasonsMutex;
+        static std::mutex& reasonsMutex = *new std::mutex();
         static std::uint64_t uploads = 0, noImport = 0, noImportBytes = 0, misaligned = 0, misalignedBytes = 0, snapshotOnly = 0, snapshotBytes = 0;
-        static std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> outside;
+        static std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>& outside = *new std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>();
         bool inImport = false;
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();

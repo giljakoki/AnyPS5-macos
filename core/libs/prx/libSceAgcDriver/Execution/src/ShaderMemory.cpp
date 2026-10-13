@@ -70,7 +70,7 @@ std::uint64_t NanosecondsSince(std::chrono::steady_clock::time_point started) {
 }
 
 CaptureProfile& CaptureTotals() {
-    static CaptureProfile profile;
+    static CaptureProfile& profile = *new CaptureProfile();
     return profile;
 }
 

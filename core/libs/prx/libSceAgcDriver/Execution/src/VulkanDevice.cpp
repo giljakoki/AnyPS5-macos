@@ -2479,8 +2479,8 @@ std::uint64_t SurfaceKeysOfDisplay(const DisplayBuffer& buffer, std::size_t byte
     if (live == nullptr) return 0;
     const auto surfaceDcc = live->Descriptor().dccAddress;
     if (surfaceDcc == 0 || surfaceDcc == buffer.dccAddress) return 0;
-    static std::mutex mutex;
-    static std::set<std::uint64_t> reported;
+    static std::mutex& mutex = *new std::mutex();
+    static std::set<std::uint64_t>& reported = *new std::set<std::uint64_t>();
     const std::lock_guard lock(mutex);
     if (reported.insert(buffer.address).second) std::fprintf(stderr, "[videoout] display buffer 0x%llx registered DCC metadata 0x%llx, its surface keeps keys at 0x%llx: presenting with the surface's keys\n", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(buffer.dccAddress), static_cast<unsigned long long>(surfaceDcc));
     return surfaceDcc;
@@ -3213,7 +3213,7 @@ struct PresyncCounters {
 };
 
 PresyncCounters& Presyncs() {
-    static PresyncCounters counters;
+    static PresyncCounters& counters = *new PresyncCounters();
     return counters;
 }
 
@@ -3265,12 +3265,12 @@ void WatchMemory(std::uint64_t programAddress) {
         return parsed;
     }();
     if (ranges.empty()) return;
-    static std::mutex mutex;
-    static std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>> history;
+    static std::mutex& mutex = *new std::mutex();
+    static std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>>& history = *new std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>>();
     static bool written = false;
     std::lock_guard lock(mutex);
     if (written) return;
-    static std::vector<std::uint64_t> addresses;
+    static std::vector<std::uint64_t>& addresses = *new std::vector<std::uint64_t>();
     if (addresses.empty()) {
         std::vector<std::uint64_t> found;
         for (const auto& range : ranges) {
@@ -3339,7 +3339,7 @@ struct DispatchCounters {
 };
 
 DispatchCounters& Dispatches() {
-    static DispatchCounters counters;
+    static DispatchCounters& counters = *new DispatchCounters();
     return counters;
 }
 
@@ -3370,7 +3370,7 @@ struct RecipeCounters {
 };
 
 RecipeCounters& Recipes() {
-    static RecipeCounters counters;
+    static RecipeCounters& counters = *new RecipeCounters();
     return counters;
 }
 
@@ -4338,7 +4338,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             // APS5_PROFILE_DRAW: the [recorder] line's "address-based" syncs by program, every 10 s,
             // so the programs still waiting here are known (under the GpuMutex, like the rest).
             struct Waits { std::uint64_t count = 0; double ms = 0; };
-            static std::map<std::uint64_t, Waits> byProgram;
+            static std::map<std::uint64_t, Waits>& byProgram = *new std::map<std::uint64_t, Waits>();
             static std::uint64_t syncs = 0;
             static double waitedMs = 0;
             static auto lastReport = std::chrono::steady_clock::now();

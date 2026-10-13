@@ -8,7 +8,7 @@ namespace AgcDriver::DriverDetail {
 void Driver::countIndirect(int path, double readMs) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile || path < 0 || path >= IndirectPaths) return;
-    static std::mutex countsMutex;
+    static std::mutex& countsMutex = *new std::mutex();
     static std::uint64_t counts[IndirectPaths] = {};
     static double readWaitedMs = 0;
     static auto lastReport = std::chrono::steady_clock::now();

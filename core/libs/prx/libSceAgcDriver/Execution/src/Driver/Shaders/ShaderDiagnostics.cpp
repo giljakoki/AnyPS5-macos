@@ -7,9 +7,9 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::reportSkip(const char* kind, const std::string& what) {
-    static std::mutex reportedMutex;
-    static std::set<std::size_t> reported;
-    static std::map<std::string, int> requestDumps;
+    static std::mutex& reportedMutex = *new std::mutex();
+    static std::set<std::size_t>& reported = *new std::set<std::size_t>();
+    static std::map<std::string, int>& requestDumps = *new std::map<std::string, int>();
 
     static const bool traceSkips = std::getenv("APS5_TRACE_SKIPS") != nullptr;
     static const int dumpLimit = [] { const char* text = std::getenv("APS5_SKIP_REQUEST_DUMPS"); return text ? std::atoi(text) : 8; }();
@@ -50,8 +50,8 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
 }
 
 std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request) {
-    static std::mutex dumpMutex;
-    static std::set<std::uint64_t> dumped;
+    static std::mutex& dumpMutex = *new std::mutex();
+    static std::set<std::uint64_t>& dumped = *new std::set<std::uint64_t>();
     char name[64];
     std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
     std::lock_guard lock(dumpMutex);

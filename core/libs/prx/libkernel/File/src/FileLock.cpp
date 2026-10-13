@@ -15,8 +15,8 @@ constexpr int LockExclusive = 2;
 constexpr int LockNonblocking = 4;
 constexpr int LockUnlock = 8;
 
-std::mutex g_mutex;
-std::map<int, int> g_locks;
+std::mutex& g_mutex = *new std::mutex();
+std::map<int, int>& g_locks = *new std::map<int, int>();
 
 int HeldLock(int fd) {
     std::lock_guard lock(g_mutex);

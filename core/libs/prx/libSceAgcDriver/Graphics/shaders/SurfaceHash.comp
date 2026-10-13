@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Blocks { uvec4 blocks[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Digest { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Blocks surface;
+    Digest digest;
+    uint blockCount;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+} parameters;
+
+shared uvec4 partial[256];
+
+void main() {
+    uvec4 sum = uvec4(0u);
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint block = gl_GlobalInvocationID.x; block < parameters.blockCount; block += stride) {
+        const uvec4 value = parameters.surface.blocks[block];
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            const uint index = block * 4u + lane;
+            uint a = (value[lane] ^ (index * 0x9E3779B9u)) * 0x85EBCA6Bu;
+            a ^= a >> 15u;
+            uint b = a * 0xC2B2AE35u;
+            b ^= b >> 16u;
+            sum.x += a;
+            sum.y += b;
+            sum.z ^= a;
+            sum.w ^= b + index;
+        }
+    }
+    const uint local = gl_LocalInvocationIndex;
+    partial[local] = sum;
+    barrier();
+    for (uint reach = 128u; reach > 0u; reach >>= 1u) {
+        if (local < reach) {
+            const uvec4 other = partial[local + reach];
+            const uvec4 own = partial[local];
+            partial[local] = uvec4(own.x + other.x, own.y + other.y, own.z ^ other.z, own.w ^ other.w);
+        }
+        barrier();
+    }
+    if (local == 0u) {
+        const uvec4 total = partial[0];
+        atomicAdd(parameters.digest.words[0], total.x);
+        atomicAdd(parameters.digest.words[1], total.y);
+        atomicXor(parameters.digest.words[2], total.z);
+        atomicXor(parameters.digest.words[3], total.w);
+    }
+}

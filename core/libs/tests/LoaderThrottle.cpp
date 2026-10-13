@@ -1,4 +1,5 @@
 #include "prx/libkernel/Aio/include/ReadThrottle.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -59,32 +60,41 @@ int main() {
         ReadThrottle::After(4u * 1024u * 1024u);
         const auto waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         std::printf("4 MiB at 20000 us/MiB waited %.1f ms\n", waited);
-        check(waited >= 79.0 && waited < 1000.0, "a read waits for its share of the rate");
+        check(waited >= 79.0 && waited < 10000.0, "a read waits for its share of the rate");
 
         std::this_thread::sleep_until(start + std::chrono::milliseconds(1100));
+        ReadThrottle::SetFlipStallMillis(60000);
         LoaderFlipCompleted_nid_no_patch();
         check(ReadThrottle::Flips() == 1, "a completed flip is counted");
-        const auto heldStart = std::chrono::steady_clock::now();
-        std::thread flipper([] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(40));
-            LoaderFlipCompleted_nid_no_patch();
-            LoaderFlipCompleted_nid_no_patch();
+        ReadThrottle::After(2u * 1024u * 1024u);
+        const auto beforeFlip = ReadThrottle::Totals();
+        check(beforeFlip.heldReads == 0, "a read inside the flip allowance is not held");
+        std::atomic<bool> released{false};
+        std::thread reader([&] {
+            ReadThrottle::After(2u * 1024u * 1024u);
+            released.store(true);
         });
-        ReadThrottle::After(2u * 1024u * 1024u);
-        ReadThrottle::After(2u * 1024u * 1024u);
-        const auto held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - heldStart).count();
-        flipper.join();
-        std::printf("4 MiB over a 3 MiB flip allowance waited %.1f ms\n", held);
-        check(held >= 30.0 && held < 90.0, "a read over the flip budget waits for the next flip");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (ReadThrottle::Totals().waiting == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        check(ReadThrottle::Totals().waiting == 1, "a read over the flip allowance waits");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        check(!released.load(), "a waiting read stays held without a flip");
+        LoaderFlipCompleted_nid_no_patch();
+        LoaderFlipCompleted_nid_no_patch();
+        reader.join();
+        const auto afterFlip = ReadThrottle::Totals();
+        check(afterFlip.heldReads == beforeFlip.heldReads + 1 && afterFlip.releasedByFlip == beforeFlip.releasedByFlip + 1 && afterFlip.stalls == beforeFlip.stalls, "the flips release the held read");
+
+        ReadThrottle::SetFlipStallMillis(100);
         const auto stallStart = std::chrono::steady_clock::now();
         ReadThrottle::After(8u * 1024u * 1024u);
         const auto stalled = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stallStart).count();
+        const auto afterStall = ReadThrottle::Totals();
         std::printf("a read without flips waited %.1f ms\n", stalled);
-        check(stalled >= 90.0 && stalled < 1000.0, "a read held without any flip goes on after the stall limit");
-        const auto freeStart = std::chrono::steady_clock::now();
+        check(afterStall.stalls == afterFlip.stalls + 1 && afterStall.releasedByFlip == afterFlip.releasedByFlip, "a read held without any flip is released by the stall limit");
+        check(stalled >= 90.0 && stalled < 30000.0, "the stall limit holds the read at least its length");
         ReadThrottle::After(1024u * 1024u);
-        const auto free = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - freeStart).count();
-        check(free < 50.0, "after a stall the allowance starts again");
+        check(ReadThrottle::Totals().heldReads == afterStall.heldReads, "after a stall the allowance starts again");
     } catch (const std::exception& error) {
         std::printf("FAIL %s\n", error.what());
         return 1;

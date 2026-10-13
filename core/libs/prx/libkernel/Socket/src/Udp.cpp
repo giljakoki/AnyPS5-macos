@@ -113,8 +113,8 @@ Waker& ThreadWaker() {
     thread_local Waker waker;
     return waker;
 }
-std::mutex socketsMutex;
-std::map<int, std::shared_ptr<Socket>> sockets;
+std::mutex& socketsMutex = *new std::mutex();
+std::map<int, std::shared_ptr<Socket>>& sockets = *new std::map<int, std::shared_ptr<Socket>>();
 int nextDescriptor = GuestSockets::FirstDescriptor;
 std::shared_ptr<Socket> Lookup(int descriptor) {
     std::lock_guard lock(socketsMutex);

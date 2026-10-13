@@ -30,6 +30,8 @@ struct FlipPacing {
     std::uint64_t stalls = 0;
     double heldMillis = 0.0;
     double reportedAt = 0.0;
+    unsigned stallMillis = FlipStallMillis;
+    PacingTotals totals;
 };
 
 FlipPacing& Pacing() {
@@ -63,6 +65,18 @@ std::uint64_t Flips() {
     return pacing.flips;
 }
 
+PacingTotals Totals() {
+    auto& pacing = Pacing();
+    std::lock_guard lock(pacing.mutex);
+    return pacing.totals;
+}
+
+void SetFlipStallMillis(unsigned millis) {
+    auto& pacing = Pacing();
+    std::lock_guard lock(pacing.mutex);
+    pacing.stallMillis = millis;
+}
+
 namespace {
 
 void PaceToFlips(const Settings& settings, std::uint64_t bytes) {
@@ -72,18 +86,26 @@ void PaceToFlips(const Settings& settings, std::uint64_t bytes) {
     pacing.consumed += bytes;
     const auto start = std::chrono::steady_clock::now();
     bool held = false;
+    bool stalled = false;
     while (!FlipAllows(settings.bytesPerFlip, pacing.consumed, pacing.flips - pacing.baseFlips)) {
         held = true;
         const auto flips = pacing.flips;
-        if (!pacing.flipped.wait_for(lock, std::chrono::milliseconds(FlipStallMillis), [&] { return pacing.flips != flips; })) {
+        ++pacing.totals.waiting;
+        const bool flipped = pacing.flipped.wait_for(lock, std::chrono::milliseconds(pacing.stallMillis), [&] { return pacing.flips != flips; });
+        --pacing.totals.waiting;
+        if (!flipped) {
             pacing.baseFlips = pacing.flips;
             pacing.consumed = 0;
             ++pacing.stalls;
+            ++pacing.totals.stalls;
+            stalled = true;
             break;
         }
     }
     const auto now = std::chrono::steady_clock::now();
     if (held) {
+        ++pacing.totals.heldReads;
+        if (!stalled) ++pacing.totals.releasedByFlip;
         ++pacing.heldReads;
         pacing.heldMillis += std::chrono::duration<double, std::milli>(now - start).count();
     }

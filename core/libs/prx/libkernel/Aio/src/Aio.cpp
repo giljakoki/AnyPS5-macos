@@ -36,7 +36,7 @@ constexpr std::int32_t AioDelayedCountMax = 128;
 constexpr std::uint32_t AioSplitSizeMax = 0x1000000;
 constexpr std::uint32_t AioSplitChunkSizeMax = 0x1000000;
 
-std::mutex g_mutex;
+std::mutex& g_mutex = *new std::mutex();
 std::array<std::int32_t, AioMaxQueues> g_states{};
 std::int32_t g_nextId = 1;
 

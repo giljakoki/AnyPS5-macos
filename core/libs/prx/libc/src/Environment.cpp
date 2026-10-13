@@ -23,7 +23,7 @@ struct EnvironmentEntry {
         return separator && std::string_view(data, separator - data) == name;
     }
 };
-std::mutex environmentMutex;
+std::mutex& environmentMutex = *new std::mutex();
 std::vector<EnvironmentEntry>& Environment() {
     // Seed once from the host. Guest mutations remain local to the guest runtime.
     static std::vector<EnvironmentEntry> entries = [] {

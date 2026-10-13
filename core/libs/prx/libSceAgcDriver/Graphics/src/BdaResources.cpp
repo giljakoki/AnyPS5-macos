@@ -80,7 +80,7 @@ void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector
 }
 
 TableCache& Tables() {
-    static TableCache cache;
+    static TableCache& cache = *new TableCache();
     return cache;
 }
 

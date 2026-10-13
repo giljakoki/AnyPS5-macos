@@ -18,8 +18,8 @@ namespace {
 void noteUnimportedLabel(std::uint64_t address, std::size_t bytes) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
-    static std::mutex mutex;
-    static std::set<std::uint64_t> seen;
+    static std::mutex& mutex = *new std::mutex();
+    static std::set<std::uint64_t>& seen = *new std::set<std::uint64_t>();
     std::lock_guard lock(mutex);
     if (seen.size() >= 32 || !seen.insert(address).second) return;
     std::fprintf(stderr, "[sync] label 0x%llx (%zu bytes) lies outside every host import: each of its stores drains the device first\n", static_cast<unsigned long long>(address), bytes);

@@ -70,6 +70,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcSurfaceHashShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/SurfaceHash.comp)
+set(agcSurfaceHashShaderSpv ${agcTextureDetileGeneratedDir}/SurfaceHash.spv)
+set(agcSurfaceHashShaderHeader ${agcTextureDetileGeneratedDir}/SurfaceHash_spv.h)
+add_custom_command(
+        OUTPUT "${agcSurfaceHashShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcSurfaceHashShaderSpv}" "${agcSurfaceHashShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcSurfaceHashShaderSpv} -DOUTPUT=${agcSurfaceHashShaderHeader}
+        -DSYMBOL=SURFACE_HASH_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcSurfaceHashShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcCmaskClearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CmaskClear.comp)
 set(agcCmaskClearShaderSpv ${agcTextureDetileGeneratedDir}/CmaskClear.spv)
 set(agcCmaskClearShaderHeader ${agcTextureDetileGeneratedDir}/CmaskClear_spv.h)
@@ -207,6 +220,7 @@ set(agcDriverSources
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
+        ${agcSurfaceHashShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
@@ -935,6 +949,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
+        ${agcSurfaceHashShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}

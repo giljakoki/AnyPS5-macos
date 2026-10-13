@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/SurfaceHash_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -62,7 +63,7 @@ struct SyncSiteWaits {
     std::uint64_t batches;
     double waitedMs;
 };
-std::vector<SyncSiteWaits> syncSites;
+std::vector<SyncSiteWaits>& syncSites = *new std::vector<SyncSiteWaits>();
 constexpr std::size_t NoSyncSite = static_cast<std::size_t>(-1);
 constexpr std::size_t SyncSiteLimit = 48;
 thread_local std::size_t activeSyncSite = NoSyncSite;
@@ -123,8 +124,8 @@ struct ThreadSyncs {
     std::array<std::uint64_t, 5> counts;
     std::array<double, 5> waitedMs;
 };
-std::vector<ThreadSyncs> threadSyncs;
-std::mutex threadSyncsMutex;
+std::vector<ThreadSyncs>& threadSyncs = *new std::vector<ThreadSyncs>();
+std::mutex& threadSyncsMutex = *new std::mutex();
 
 // This thread's fence and timeline waits in total (Recorder::ThreadWaitedMs): a caller times a span
 // of its own work and reads the difference to learn how much of it was waiting for the GPU.
@@ -172,8 +173,8 @@ std::atomic<int> unlockedWaiters[WaiterSlots]{};
 std::atomic<int>& WaitersOf(std::uint64_t id) { return unlockedWaiters[id % WaiterSlots]; }
 // Recorders alive, by id (own mutex, taken under the GpuMutex or with nothing held): a thread that
 // released the GpuMutex around a wait learns whether its recorder still exists before touching it.
-std::mutex liveRecordersMutex;
-std::vector<std::uint64_t> liveRecorders;
+std::mutex& liveRecordersMutex = *new std::mutex();
+std::vector<std::uint64_t>& liveRecorders = *new std::vector<std::uint64_t>();
 std::atomic<std::uint64_t> nextRecorderId{1};
 std::atomic<std::uint64_t> samplesPassed{0};
 constexpr std::uint32_t SampleFoldCapacity = 64;
@@ -312,7 +313,7 @@ struct HoldCounters {
     // Genuine nested hooks (depth >= 2 outside a completion action) that had to wait locked.
     std::uint64_t hookLockedWaits = 0;
 };
-HoldCounters holdCounters;
+HoldCounters& holdCounters = *new HoldCounters();
 
 // Deferred release of a finished batch's kept objects (and its completion actions, whose captures
 // hold some of the same objects): finish() moves them to this list of the finishing thread instead
@@ -535,7 +536,7 @@ bool ProcTable() {
 // instead of queueing behind a dispatch. `labelTableOwner` is the active recorder while it lives,
 // set and cleared under this mutex, so a lookup never touches a table being destroyed. Nothing
 // under this mutex takes the GPU mutex (no lock-order cycle).
-std::mutex labelTableMutex;
+std::mutex& labelTableMutex = *new std::mutex();
 Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
@@ -635,7 +636,7 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-AtomicSharedPtr<const WriteRanges> pendingWrites;
+AtomicSharedPtr<const WriteRanges>& pendingWrites = *new AtomicSharedPtr<const WriteRanges>();
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -741,7 +742,7 @@ struct HookSyncStats {
 };
 
 HookSyncStats& HookSyncs() {
-    static HookSyncStats stats;
+    static HookSyncStats& stats = *new HookSyncStats();
     return stats;
 }
 
@@ -895,7 +896,7 @@ struct RecordedStoreStats {
 };
 
 RecordedStoreStats& RecordedStoreSyncs() {
-    static RecordedStoreStats stats;
+    static RecordedStoreStats& stats = *new RecordedStoreStats();
     return stats;
 }
 
@@ -1158,6 +1159,8 @@ Recorder::~Recorder() {
     }
     if (meshArgumentPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, meshArgumentPipeline, nullptr);
     if (meshArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, meshArgumentLayout, nullptr);
+    if (surfaceHashPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, surfaceHashPipeline, nullptr);
+    if (surfaceHashLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, surfaceHashLayout, nullptr);
     if (sampleCounterState > 0) {
         samplesPassed.store(SamplesTotal(), std::memory_order_release);
         if (samplePools != nullptr) std::static_pointer_cast<SamplePoolCache>(samplePools)->close();
@@ -1747,8 +1750,8 @@ std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
-std::mutex timingMutex;
-std::map<std::uint64_t, TimingTotals> timingByKey;
+std::mutex& timingMutex = *new std::mutex();
+std::map<std::uint64_t, TimingTotals>& timingByKey = *new std::map<std::uint64_t, TimingTotals>();
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -2309,6 +2312,52 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     return true;
 }
 
+bool Recorder::RecordSurfaceHash(VkCommandBuffer commands, VkDeviceAddress surface, std::uint32_t blocks, VkDeviceAddress digest) {
+    constexpr std::uint32_t PushBytes = 32;
+    if (surfaceHashState == 0) {
+        surfaceHashState = -1;
+        VkShaderModule module = VK_NULL_HANDLE;
+        try {
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes};
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &push;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &surfaceHashLayout), "vkCreatePipelineLayout surface hash");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = sizeof(SURFACE_HASH_SPV);
+            moduleInfo.pCode = SURFACE_HASH_SPV;
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule surface hash");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = module;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.layout = surfaceHashLayout;
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &surfaceHashPipeline), "vkCreateComputePipelines surface hash");
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            surfaceHashState = 1;
+        } catch (const std::exception& error) {
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            std::fprintf(stderr, "[gpu] imported snapshots are refreshed without a change check: %s\n", error.what());
+        }
+    }
+    if (surfaceHashState < 0 || blocks == 0) return false;
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, surfaceHashPipeline);
+    struct {
+        VkDeviceAddress surface;
+        VkDeviceAddress digest;
+        std::array<std::uint32_t, 4> words;
+    } parameters{surface, digest, {blocks, 0u, 0u, 0u}};
+    static_assert(sizeof(parameters) == PushBytes);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, surfaceHashLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
+    const auto groups = std::min<std::uint32_t>((blocks + 255u) / 256u, 1024u);
+    function(cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+    CountBarriers(CommandClass::StorageUpload, 2);
+    return true;
+}
+
 void Recorder::beginSamples(Batch& batch) {
     auto cache = std::static_pointer_cast<SamplePoolCache>(samplePools);
     if (sampleCounterState > 0 && cache == nullptr) {
@@ -2436,6 +2485,11 @@ std::vector<Recorder::Completed> Recorder::CompletedBatches(std::uint64_t afterS
         else ++missing;
     }
     return found;
+}
+
+bool Recorder::BatchFinished(std::uint64_t serial) const {
+    std::lock_guard lock(completedMutex);
+    return completed[serial % completed.size()].serial >= serial;
 }
 
 std::uint64_t Recorder::NewestSubmitted(std::chrono::steady_clock::time_point* submittedAt) const {
@@ -3338,7 +3392,7 @@ struct SyncWaitStats {
 };
 
 SyncWaitStats& SyncWaits() {
-    static SyncWaitStats stats;
+    static SyncWaitStats& stats = *new SyncWaitStats();
     return stats;
 }
 

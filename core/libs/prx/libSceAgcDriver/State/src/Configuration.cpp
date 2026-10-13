@@ -14,8 +14,8 @@ struct TessellationFactorRing {
  uint32_t size = 0x20000;
 };
 
-std::mutex tessellationFactorRingMutex;
-TessellationFactorRing tessellationFactorRing;
+std::mutex& tessellationFactorRingMutex = *new std::mutex();
+TessellationFactorRing& tessellationFactorRing = *new TessellationFactorRing();
 
 }
 
