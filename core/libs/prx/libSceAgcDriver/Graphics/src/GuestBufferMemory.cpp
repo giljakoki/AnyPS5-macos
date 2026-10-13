@@ -3931,6 +3931,16 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     return entry.serial;
 }
 
+std::string DescribeLiveImport(std::uint64_t address) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    const auto* live = findImport(state, address, address + 1);
+    if (live == nullptr) return "no live import";
+    char text[224];
+    std::snprintf(text, sizeof(text), "live import 0x%llx+0x%llx at 0x%llx, buffer %p, memory %p, memory freed %.1f ms earlier per the tracer", static_cast<unsigned long long>(live->base), static_cast<unsigned long long>(live->bytes), static_cast<unsigned long long>(live->address), static_cast<void*>(live->buffer), static_cast<void*>(live->memory), StaleMemoryFreedMs(reinterpret_cast<std::uint64_t>(live->memory)));
+    return text;
+}
+
 std::uint64_t HostImportsEpoch() {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);

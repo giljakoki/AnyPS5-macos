@@ -58,6 +58,7 @@ struct Tracker {
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> bufferBound;
     std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> bufferAddress;
     std::map<std::uint64_t, AddressRange> freedRanges;
+    std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>>> memoryRanges;
     std::array<std::pair<std::uint64_t, AddressRange>, 64> freedRing{};
     std::uint64_t freedRingCount = 0;
     std::atomic<bool> dumped{false};
@@ -292,6 +293,7 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL staleGetBufferDeviceAddress(VkDevice devic
         std::lock_guard lock(tracker.mutex);
         const auto size = tracker.bufferSize.contains(key(info->buffer)) ? tracker.bufferSize[key(info->buffer)] : 1u;
         tracker.bufferAddress[key(info->buffer)] = {address, address + size};
+        if (const auto memory = tracker.bufferMemory.find(key(info->buffer)); memory != tracker.bufferMemory.end()) tracker.memoryRanges[memory->second].push_back({key(info->buffer), {address, address + size}});
         for (auto it = tracker.freedRanges.lower_bound(address); it != tracker.freedRanges.end() && it->first < address + size;) it = tracker.freedRanges.erase(it);
         if (auto it = tracker.freedRanges.lower_bound(address); it != tracker.freedRanges.begin() && std::prev(it)->second.end > address) tracker.freedRanges.erase(std::prev(it));
     }
@@ -313,6 +315,7 @@ VKAPI_ATTR VkResult VKAPI_CALL staleAllocateMemory(VkDevice device, const VkMemo
         auto& tracker = Track();
         std::lock_guard lock(tracker.mutex);
         tracker.freedMemory.erase(key(*memory));
+        tracker.memoryRanges.erase(key(*memory));
         tracker.memorySize[key(*memory)] = info->allocationSize;
         tracker.memoryMapping.erase(key(*memory));
     }
@@ -783,13 +786,13 @@ void StaleHandleRelease(StaleObject kind, std::uint64_t handle) {
     }
     tracker.freedMemory[handle] = freed;
     tracker.memoryMapping.erase(handle);
-    for (const auto& [buffer, memory] : tracker.bufferMemory) {
-        if (memory != handle) continue;
-        const auto address = tracker.bufferAddress.find(buffer);
-        if (address == tracker.bufferAddress.end()) continue;
-        AddressRange range{address->second.second, buffer, handle, freed};
-        tracker.freedRanges[address->second.first] = range;
-        tracker.freedRing[tracker.freedRingCount++ % tracker.freedRing.size()] = {address->second.first, range};
+    if (const auto ranges = tracker.memoryRanges.find(handle); ranges != tracker.memoryRanges.end()) {
+        for (const auto& [buffer, span] : ranges->second) {
+            AddressRange range{span.second, buffer, handle, freed};
+            tracker.freedRanges[span.first] = range;
+            tracker.freedRing[tracker.freedRingCount++ % tracker.freedRing.size()] = {span.first, range};
+        }
+        tracker.memoryRanges.erase(ranges);
     }
 }
 
@@ -800,6 +803,14 @@ double StaleAddressFreedMs(std::uint64_t address) {
     std::uint64_t start = 0;
     const auto* range = freedRangeAt(tracker, address, start);
     return range != nullptr ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - range->freed.at).count() : -1.0;
+}
+
+double StaleMemoryFreedMs(std::uint64_t memory) {
+    if (!StaleHandlesTraced() || memory == 0) return -1.0;
+    auto& tracker = Track();
+    std::lock_guard lock(tracker.mutex);
+    const auto found = tracker.freedMemory.find(memory);
+    return found != tracker.freedMemory.end() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - found->second.at).count() : -1.0;
 }
 
 void StaleHandleDump(const char* why) {

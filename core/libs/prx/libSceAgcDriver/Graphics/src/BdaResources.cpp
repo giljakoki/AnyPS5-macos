@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
@@ -138,7 +139,7 @@ void checkTableAddresses(const char* path, std::uint64_t serial, const std::vect
         const auto& range = ranges[index];
         const auto freedMs = StaleAddressFreedMs(range.deviceAddress);
         if (freedMs < 0.0 || reports.fetch_add(1, std::memory_order_relaxed) >= 32) continue;
-        std::fprintf(stderr, "[stale] BDA table (%s, space serial %llu, %zu ranges) entry %zu maps guest [0x%llx, 0x%llx) to device address 0x%llx, whose memory was freed %.1f ms earlier\n", path, static_cast<unsigned long long>(serial), ranges.size(), index, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.deviceAddress), freedMs);
+        std::fprintf(stderr, "[stale] BDA table (%s, space serial %llu, %zu ranges) entry %zu maps guest [0x%llx, 0x%llx) to device address 0x%llx, whose memory was freed %.1f ms earlier; %s\n", path, static_cast<unsigned long long>(serial), ranges.size(), index, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.deviceAddress), freedMs, DescribeLiveImport(range.begin).c_str());
     }
 }
 

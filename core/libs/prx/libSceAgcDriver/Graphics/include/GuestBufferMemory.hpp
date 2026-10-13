@@ -103,6 +103,7 @@ struct HostImportsProof {
 // Whether the table still matches `proof` (one lock); false for an empty or stale proof.
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof);
 std::uint64_t HostImportsEpoch();
+std::string DescribeLiveImport(std::uint64_t address);
 struct ImportBinding {
     std::uint64_t address = 0;
     std::size_t bytes = 0;
