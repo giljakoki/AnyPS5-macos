@@ -4,7 +4,10 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "spirv/unified1/spirv.hpp"
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <string>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -108,6 +111,41 @@ int main() {
     passed &= Run("triangle-strip groups advance one index per primitive", [] {
         const auto layout = Describe(64u, StripSubgroup);
         return layout.recordsPerGroup == 30u && layout.indexBytesPerGroup == 10u * 12u && layout.GroupsFor(12u) == 1u && layout.GroupsFor(13u) == 2u && layout.GroupsFor(22u) == 2u && layout.GroupsFor(23u) == 3u;
+    });
+
+    passed &= Run("the pre-pass summary counts live, degenerate and unwritten triangles and the view they reach", [] {
+        constexpr std::uint32_t maxVertices = 4u;
+        constexpr std::uint32_t maxPrimitives = 3u;
+        constexpr std::uint32_t recordDwords = 8u;
+        std::vector<std::uint32_t> records(2u * maxVertices * recordDwords, MeshPrepassUnwritten);
+        std::vector<std::uint32_t> indices(2u * maxPrimitives * 3u, MeshPrepassUnwritten);
+        const auto place = [&](std::uint32_t record, float x, float y, float z, float w) {
+            const std::array<float, 4> position{x, y, z, w};
+            std::memcpy(records.data() + record * recordDwords, position.data(), sizeof(position));
+        };
+        place(0u, -0.5f, -0.5f, 0.25f, 1.0f);
+        place(1u, 0.5f, -0.5f, 0.25f, 1.0f);
+        place(2u, 0.0f, 1.0f, 0.5f, 2.0f);
+        place(4u, 4.0f, 4.0f, 0.5f, 1.0f);
+        place(5u, 6.0f, 4.0f, 0.5f, 1.0f);
+        place(6u, 1.0f, 1.0f, 1.0f, -1.0f);
+        const std::array<std::uint32_t, 18> triangles{0u, 1u, 2u, 2u, 2u, 2u, MeshPrepassUnwritten, MeshPrepassUnwritten, MeshPrepassUnwritten, 4u, 5u, 6u, 4u, 5u, 7u, 4u, 5u, 9u};
+        std::copy(triangles.begin(), triangles.end(), indices.begin());
+        const auto summary = SummarizeMeshPrepass(records, indices, 2u, maxVertices, maxPrimitives, recordDwords);
+        return summary.triangles == 6u && summary.liveTriangles == 4u && summary.degenerateTriangles == 1u && summary.unwrittenTriangles == 1u && summary.indicesOutsideSlot == 1u && summary.cornersOnUnwrittenRecords == 1u &&
+               summary.referencedRecords == 6u && summary.positionsBehindEye == 1u && summary.nonFinitePositions == 0u && summary.trianglesInView == 1u && summary.emptySlots == 0u && summary.ndcSeen && summary.ndcMin[0] == -0.5f && summary.ndcMax[0] == 6.0f &&
+               summary.ndcMax[2] == 0.5f && summary.Describe().find("4 live") != std::string::npos;
+    });
+
+    passed &= Run("the pre-pass summary refuses buffers smaller than their slots", [] {
+        const std::vector<std::uint32_t> records(8u, 0u);
+        const std::vector<std::uint32_t> indices(3u, 0u);
+        try {
+            (void)SummarizeMeshPrepass(records, indices, 2u, 1u, 1u, 8u);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
     });
 
     passed &= Run("a request without a mesh configuration throws", [] {

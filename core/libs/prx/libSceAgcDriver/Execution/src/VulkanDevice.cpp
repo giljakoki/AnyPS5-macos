@@ -3761,7 +3761,24 @@ void VulkanDevice::DrawMeshEmulated(const Graphics::State& graphics, const Pm4::
     require(prepass.pushConstants.size() <= ShaderRecompiler::MeshDrawPushOffsetBytes, "the mesh pre-pass push data overlaps the mesh draw words");
     prepass.pushConstants.resize(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes);
     std::memcpy(prepass.pushConstants.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, drawWords.data(), sizeof(drawWords));
+    static const int verifyLimit = [] {
+        const char* value = std::getenv("APS5_VERIFY_MESH_PREPASS");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    static std::atomic<int> verified{0};
+    const bool verify = verifyLimit > 0 && verified.fetch_add(1, std::memory_order_relaxed) < verifyLimit;
+    if (verify) {
+        std::fill(records->Bytes().begin(), records->Bytes().end(), std::byte{0xff});
+        std::fill(indices->Bytes().begin(), indices->Bytes().end(), std::byte{0xff});
+    }
     Dispatch(prepass, groups, draw.instanceCount, 1, snapshots);
+    if (verify) {
+        WaitIdle();
+        const auto summary = ShaderRecompiler::SummarizeMeshPrepass(std::span(reinterpret_cast<const std::uint32_t*>(records->Bytes().data()), records->Bytes().size() / sizeof(std::uint32_t)),
+                                                                    std::span(reinterpret_cast<const std::uint32_t*>(indices->Bytes().data()), indices->Bytes().size() / sizeof(std::uint32_t)), slots, mesh.maxVertices, mesh.maxPrimitives, prepassProgram.meshRecordDwords);
+        std::fprintf(stderr, "[mesh-verify] program variant 0x%llx, %u indices, %u groups x %u instances, %u vertices and %u primitives per group, %u-dword records: %s\n", static_cast<unsigned long long>(prepassProgram.PipelineVariantId()), draw.indexCount, groups, draw.instanceCount, mesh.maxVertices,
+                     mesh.maxPrimitives, prepassProgram.meshRecordDwords, summary.Describe().c_str());
+    }
 
     auto vertex = *passThrough;
     vertex.pushConstants.assign(ShaderRecompiler::MeshDrawPushBytes, std::byte{0});

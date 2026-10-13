@@ -99,7 +99,10 @@ void Run(AgcDriver::VulkanDevice& device, const Case& setup) {
             }
         }
     }
-    std::printf("PASS %s (%u groups)\n", setup.name, groups);
+    const auto summary = ShaderRecompiler::SummarizeMeshPrepass(output.records, output.indices, static_cast<std::uint64_t>(groups) * setup.instances, mesh.maxVertices, mesh.maxPrimitives, RecordDwords);
+    Require(summary.liveTriangles == static_cast<std::uint64_t>(Triangles) * setup.instances && summary.unwrittenTriangles == 0u && summary.indicesOutsideSlot == 0u && summary.cornersOnUnwrittenRecords == 0u && summary.nonFinitePositions == 0u && summary.positionsBehindEye == 0u,
+            std::string(setup.name) + ": the pre-pass summary disagrees: " + summary.Describe());
+    std::printf("PASS %s (%u groups): %s\n", setup.name, groups, summary.Describe().c_str());
 }
 
 }
