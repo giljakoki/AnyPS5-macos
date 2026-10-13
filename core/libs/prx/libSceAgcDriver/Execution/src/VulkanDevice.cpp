@@ -3791,6 +3791,8 @@ void VulkanDevice::DrawMeshEmulated(const Graphics::State& graphics, const Pm4::
     }
     Dispatch(prepass, groups, draw.instanceCount, 1, snapshots);
     if (verify) {
+        std::fprintf(stderr, "[mesh-verify] waiting for the pre-pass of program variant 0x%llx (%u indices, %u groups x %u instances, index buffer 0x%llx, %s)\n", static_cast<unsigned long long>(prepassProgram.PipelineVariantId()), draw.indexCount, groups, draw.instanceCount,
+                     static_cast<unsigned long long>(draw.indexAddress), draw.indexed ? "indexed" : "not indexed");
         WaitIdle();
         const auto summary = ShaderRecompiler::SummarizeMeshPrepass(std::span(reinterpret_cast<const std::uint32_t*>(records->Bytes().data()), records->Bytes().size() / sizeof(std::uint32_t)),
                                                                     std::span(reinterpret_cast<const std::uint32_t*>(indices->Bytes().data()), indices->Bytes().size() / sizeof(std::uint32_t)), slots, mesh.maxVertices, mesh.maxPrimitives, prepassProgram.meshRecordDwords);
