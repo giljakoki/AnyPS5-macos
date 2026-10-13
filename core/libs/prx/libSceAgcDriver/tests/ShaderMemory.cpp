@@ -1516,6 +1516,13 @@ void verifyStagesWithoutSubgroups() {
         0xf80008cfu, 0x01010101u, 0xbf810000u,
     };
     const std::vector<std::uint32_t> dpp{0x7e0202fau, 0xff011105u, 0xf80008cfu, 0x01010101u, 0xbf810000u};
+    const std::vector<std::uint32_t> relativeWaterfall{
+        0x36140a83u, 0x34141481u, 0x7e000281u, 0x7e020282u, 0x7e040283u, 0x7e060284u, 0x7e080285u, 0x7e0a0286u,
+        0x7e0c0287u, 0x7e0e0288u, 0xbea2047eu, 0xbea0047eu, 0x7e12050au, 0x7da41409u, 0xbefc0309u, 0x7e108700u,
+        0x7e128701u, 0x8aa27e22u, 0xbefe0422u, 0xbf85fff8u, 0xbefe0420u, 0xf80008cfu, 0x09080908u, 0xbf810000u,
+    };
+    auto escapingRead = relativeWaterfall;
+    escapingRead.insert(escapingRead.begin() + 21, 0x7e100209u);
 
     const auto lowered = prepared(masks, 32u, 32u, withoutVertex);
     require(!lowered.empty() && subgroupWords(lowered) == 0u, "stages without subgroups: a wave32 program with v_cmp/v_cndmask, a carry chain and an s_cbranch_execz region over masked writes and an export kept subgroup operations");
@@ -1535,10 +1542,14 @@ void verifyStagesWithoutSubgroups() {
     expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, refused, "stages without subgroups: s_bcnt1 of EXEC was accepted");
     expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, "a ballot read as a value at 0x60000-0x", "stages without subgroups: s_bcnt1 of EXEC was not reported as a ballot read as a value");
     expectFailure([&] { static_cast<void>(prepared(scalarLeak, 32u, 32u, withoutVertex)); }, "a wave-mask branch whose region leaves a value that the skipped path does not have", "stages without subgroups: an execz region writing an SGPR read after the join was accepted");
-    expectFailure([&] { static_cast<void>(prepared(waterfall, 32u, 32u, withoutVertex)); }, "a wave-mask branch controls a loop", "stages without subgroups: a waterfall loop was accepted");
-    expectFailure([&] { static_cast<void>(prepared(waterfall, 32u, 32u, withoutVertex)); }, "v_readfirstlane/v_readlane of a lane-varying value", "stages without subgroups: the waterfall loop's v_readfirstlane of the vertex index was not reported");
+    const auto perLane = prepared(waterfall, 32u, 32u, withoutVertex);
+    require(!perLane.empty() && subgroupWords(perLane) == 0u, "stages without subgroups: a waterfall loop of v_readfirstlane, v_cmp_eq, s_and_saveexec and s_xor exec over a masked write kept subgroup operations");
+    const auto relative = prepared(relativeWaterfall, 64u, 32u, withoutVertex);
+    require(!relative.empty() && subgroupWords(relative) == 0u, "stages without subgroups: a wave64 waterfall loop of v_readfirstlane, v_cmpx_eq, v_movrels, s_andn2_b64 and s_cbranch_scc1 kept subgroup operations");
+    expectFailure([&] { static_cast<void>(prepared(escapingRead, 64u, 32u, withoutVertex)); }, "v_readfirstlane/v_readlane of a lane-varying value", "stages without subgroups: a waterfall loop whose v_readfirstlane result is read after the loop was accepted");
     expectFailure([&] { static_cast<void>(prepared(dpp, 32u, 32u, withoutVertex)); }, "DPP at 0x60000-0x", "stages without subgroups: a DPP row shift was accepted");
-    require(!prepared(waterfall, 32u, 32u, ~0u).empty() && !prepared(dpp, 32u, 32u, ~0u).empty(), "stages without subgroups: programs refused without vertex subgroups did not prepare with them");
+    require(subgroupWords(prepared(waterfall, 32u, 32u, ~0u)) != 0u && subgroupWords(prepared(relativeWaterfall, 64u, 32u, ~0u)) != 0u, "stages without subgroups: a waterfall loop on a device with vertex subgroups lost its subgroup operations");
+    require(!prepared(escapingRead, 64u, 32u, ~0u).empty() && !prepared(dpp, 32u, 32u, ~0u).empty(), "stages without subgroups: programs refused without vertex subgroups did not prepare with them");
 
     const auto serialized = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(vertex(masks, 32u, 32u, withoutVertex, false)));
     require(serialized.request.target.subgroupStages == withoutVertex, "stages without subgroups: the request serializer lost the target's subgroup stages");

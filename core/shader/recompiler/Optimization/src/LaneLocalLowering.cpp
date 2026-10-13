@@ -5,6 +5,7 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include <algorithm>
 #include <bit>
+#include <functional>
 #include <cstddef>
 #include <map>
 #include <optional>
@@ -165,6 +166,7 @@ private:
     bool sameBase(IrValue* first, IrValue* second, Implications& implies) const;
     bool mergePhisTransparent(const Construct& construct, Implications& implies, std::string& reason) const;
     void lowerWaveMaskBranches();
+    void lowerWaterfallLoops();
 
     std::vector<SubgroupUse> describe() const;
 
@@ -744,6 +746,388 @@ void Lowering::lowerWaveMaskBranches() {
     }
 }
 
+class WaterfallLoop {
+public:
+    WaterfallLoop(IrProgram& program, IrBuilder& builder, const std::unordered_map<std::uint32_t, std::size_t>& blockById, std::size_t header)
+        : program(program), builder(builder), blockById(blockById), header(header) {}
+
+    bool Lower() {
+        if (!match() || !classify() || !simulate()) return false;
+        rewrite();
+        return true;
+    }
+
+private:
+    static constexpr std::size_t MaximumStatePhis = 12;
+    static constexpr std::uint32_t DepthLimit = 64;
+
+    bool inLoop(const IrValue* value) const {
+        return value->Parent() == head || value->Parent() == body;
+    }
+
+    bool match() {
+        auto& info = program.Metadata().blockInfo;
+        const auto& order = program.BlockOrder();
+        const auto& term = info[header].terminator;
+        if (term.kind != TerminatorKind::Branch || term.continueBlock != term.trueBlock) return false;
+        const auto bodyIndex = blockById.find(term.trueBlock);
+        const auto mergeIndex = blockById.find(term.mergeBlock);
+        if (bodyIndex == blockById.end() || mergeIndex == blockById.end() || bodyIndex->second == header) return false;
+        latch = &info[bodyIndex->second];
+        head = order[header];
+        body = order[bodyIndex->second];
+        const auto& exit = latch->terminator;
+        if (exit.kind != TerminatorKind::ConditionalBranch || latch->condition == nullptr || exit.loopHeader) return false;
+        const auto headId = info[header].id;
+        const auto mergeId = info[mergeIndex->second].id;
+        if (exit.trueBlock == headId && exit.falseBlock == mergeId) continueOnTrue = true;
+        else if (exit.falseBlock == headId && exit.trueBlock == mergeId) continueOnTrue = false;
+        else return false;
+        for (const IrValue* inst : head->Instructions()) {
+            if (!inst->IsPhi()) return false;
+        }
+        IrValue* condition = latch->condition->Resolve();
+        switch (exit.condition) {
+        case BranchCondition::ExecNonZero:
+        case BranchCondition::VccNonZero:
+            if (!continueOnTrue) return false;
+            pending = condition;
+            break;
+        case BranchCondition::ExecZero:
+        case BranchCondition::VccZero:
+            if (continueOnTrue) return false;
+            pending = condition;
+            break;
+        case BranchCondition::SccZero:
+        case BranchCondition::SccNonZero:
+            pending = ballotOperand(condition, continueOnTrue);
+            scalarCondition = condition;
+            break;
+        default:
+            return false;
+        }
+        if (pending == nullptr) return false;
+        for (IrValue* inst : head->Instructions()) {
+            if (inst->ArgumentCount() != 2u || inst->PhiBlockCount() != 2u) return false;
+            const bool firstBack = inst->PhiBlock(0) == body;
+            if (firstBack == (inst->PhiBlock(1) == body)) return false;
+            entries.emplace(inst, inst->Argument(firstBack ? 1u : 0u)->Resolve());
+            backs.emplace(inst, inst->Argument(firstBack ? 0u : 1u)->Resolve());
+        }
+        for (IrValue* inst : body->Instructions()) {
+            positions.emplace(inst, positions.size());
+            if (inst->Opcode() == IrOpcode::ReadFirstLane) {
+                if (read != nullptr) return false;
+                read = inst;
+            }
+            if (inst->Opcode() == IrOpcode::StoreVectorWindow) {
+                const IrValue* index = inst->Argument(0)->Resolve();
+                if (!index->HasImmediate()) return false;
+                stored.insert(index->ImmediateU32());
+            }
+        }
+        if (read == nullptr || read->ArgumentCount() != 2u) return false;
+        index = read->Argument(0)->Resolve();
+        if (inLoop(index) && !invariantWindowLoad(index)) return false;
+        for (IrValue* user : read->Uses()) {
+            if (user->Opcode() != IrOpcode::IEqual32 || user->ArgumentCount() != 2u) continue;
+            IrValue* other = user->Argument(0)->Resolve() == read ? user->Argument(1)->Resolve() : user->Argument(0)->Resolve();
+            if (sameIndex(other)) matches.insert(user);
+        }
+        return !matches.empty();
+    }
+
+    IrValue* ballotOperand(IrValue* condition, bool any) const {
+        if (condition->Opcode() != (any ? IrOpcode::INotEqual32 : IrOpcode::IEqual32) || condition->ArgumentCount() != 2u) return nullptr;
+        IrValue* word = nullptr;
+        if (IsImmediateU32(condition->Argument(1), 0u)) word = condition->Argument(0)->Resolve();
+        else if (IsImmediateU32(condition->Argument(0), 0u)) word = condition->Argument(1)->Resolve();
+        if (word == nullptr) return nullptr;
+        const auto extract = [](IrValue* value, std::uint32_t component) -> IrValue* {
+            value = value->Resolve();
+            if (value->Opcode() != IrOpcode::CompositeExtractU32x4 || !IsImmediateU32(value->Argument(1), component)) return nullptr;
+            IrValue* ballot = value->Argument(0)->Resolve();
+            return ballot->Opcode() == IrOpcode::Ballot ? ballot : nullptr;
+        };
+        IrValue* ballot = extract(word, 0u);
+        if (ballot == nullptr && word->Opcode() == IrOpcode::BitwiseOr32) {
+            for (const std::size_t low : {0u, 1u}) {
+                IrValue* first = extract(word->Argument(low), 0u);
+                IrValue* second = extract(word->Argument(1u - low), 1u);
+                if (first != nullptr && first == second) ballot = first;
+            }
+        }
+        if (ballot == nullptr) return nullptr;
+        return ballot->Argument(0)->Resolve();
+    }
+
+    bool invariantWindowLoad(const IrValue* value) const {
+        if (value->Opcode() != IrOpcode::LoadVectorWindow || value->Parent() != body) return false;
+        const IrValue* slot = value->Argument(0)->Resolve();
+        return slot->HasImmediate() && !stored.contains(slot->ImmediateU32());
+    }
+
+    bool sameIndex(const IrValue* value) const {
+        value = value->Resolve();
+        if (value == index) return true;
+        return invariantWindowLoad(value) && invariantWindowLoad(index) && value->Argument(0)->Resolve()->ImmediateU32() == index->Argument(0)->Resolve()->ImmediateU32();
+    }
+
+    bool evaluable(const IrValue* value, std::uint32_t depth = 0) {
+        value = value->Resolve();
+        if (value->HasImmediate()) return value->Type() == IrType::U1;
+        if (value->Type() != IrType::U1) return false;
+        if (const auto known = mask.find(value); known != mask.end()) return known->second;
+        if (depth > DepthLimit) return false;
+        bool result = false;
+        if (matches.contains(value)) result = true;
+        else if (value->Parent() == head) result = statePhis.contains(value);
+        else if (value->Parent() == body) {
+            switch (value->Opcode()) {
+            case IrOpcode::LogicalAnd:
+            case IrOpcode::LogicalOr:
+            case IrOpcode::LogicalXor:
+            case IrOpcode::LogicalNot:
+            case IrOpcode::SelectU1:
+                result = true;
+                for (const IrValue* argument : value->Arguments()) result = result && evaluable(argument, depth + 1u);
+                break;
+            default:
+                break;
+            }
+        }
+        mask[value] = result;
+        return result;
+    }
+
+    bool evaluate(const IrValue* value, std::uint32_t state, bool equal) const {
+        value = value->Resolve();
+        if (value->HasImmediate()) return value->ImmediateBool();
+        if (matches.contains(value)) return equal;
+        if (value->Parent() == head) return ((state >> statePhis.at(value)) & 1u) != 0u;
+        const auto argument = [&](std::size_t index) { return evaluate(value->Argument(index), state, equal); };
+        switch (value->Opcode()) {
+        case IrOpcode::LogicalAnd: return argument(0) && argument(1);
+        case IrOpcode::LogicalOr: return argument(0) || argument(1);
+        case IrOpcode::LogicalXor: return argument(0) != argument(1);
+        case IrOpcode::LogicalNot: return !argument(0);
+        case IrOpcode::SelectU1: return argument(0) ? argument(1) : argument(2);
+        default: throw std::runtime_error("lane-local lowering: a waterfall mask value cannot be evaluated");
+        }
+    }
+
+    bool idleBase(IrValue* value, const std::function<bool(const IrValue*)>& base, std::uint32_t depth = 0) {
+        value = value->Resolve();
+        if (base(value)) return true;
+        if (depth > DepthLimit || value->Parent() != body || !IsSelect(value->Opcode())) return false;
+        IrValue* condition = value->Argument(0)->Resolve();
+        if (condition->Opcode() == IrOpcode::LogicalNot && condition->Parent() == body && evaluable(condition->Argument(0))) {
+            fires.insert(condition->Argument(0)->Resolve());
+            return idleBase(value->Argument(1), base, depth + 1u);
+        }
+        if (!evaluable(condition) || condition->HasImmediate()) return false;
+        fires.insert(condition);
+        return idleBase(value->Argument(2), base, depth + 1u);
+    }
+
+    bool idleStore(IrValue* store) {
+        const auto slot = store->Argument(0)->Resolve()->ImmediateU32();
+        const auto at = positions.at(store);
+        return idleBase(store->Argument(1), [&](const IrValue* value) {
+            if (value->Opcode() != IrOpcode::LoadVectorWindow || value->Parent() != body) return false;
+            const IrValue* loaded = value->Argument(0)->Resolve();
+            if (!loaded->HasImmediate() || loaded->ImmediateU32() != slot) return false;
+            const auto from = positions.at(value);
+            if (from > at) return false;
+            for (const IrValue* inst : body->Instructions()) {
+                const auto position = positions.at(inst);
+                if (position > from && position < at && inst->Opcode() == IrOpcode::StoreVectorWindow && inst->Argument(0)->Resolve()->ImmediateU32() == slot) return false;
+            }
+            return true;
+        });
+    }
+
+    bool classify() {
+        std::vector<IrValue*> work;
+        const auto mark = [&](IrValue* value) {
+            value = value->Resolve();
+            if (!value->HasImmediate() && inLoop(value) && useful.insert(value).second) work.push_back(value);
+        };
+        mark(scalarCondition != nullptr ? scalarCondition : pending);
+        for (IrBlock* block : {head, body}) {
+            for (IrValue* inst : block->Instructions()) {
+                if (inst->MayHaveSideEffects()) mark(inst);
+                for (const IrValue* user : inst->Uses()) {
+                    if (!inLoop(user)) mark(inst);
+                }
+            }
+        }
+        while (!work.empty()) {
+            IrValue* value = work.back();
+            work.pop_back();
+            for (IrValue* argument : value->Arguments()) {
+                if (argument != nullptr) mark(argument);
+            }
+        }
+        for (IrValue* inst : body->Instructions()) {
+            if (!useful.contains(inst)) continue;
+            switch (inst->Opcode()) {
+            case IrOpcode::Ballot:
+                if (scalarCondition == nullptr || inst->Argument(0)->Resolve() != pending) return false;
+                break;
+            case IrOpcode::ReadLane:
+            case IrOpcode::WriteLane:
+            case IrOpcode::LaneId:
+            case IrOpcode::DppMoveU32:
+            case IrOpcode::DppUpdateU32:
+            case IrOpcode::Permlane16U32:
+            case IrOpcode::SwizzleU32:
+            case IrOpcode::PermuteU32:
+            case IrOpcode::BpermuteU32:
+                return false;
+            default:
+                break;
+            }
+        }
+        for (IrValue* phi : head->Instructions()) {
+            if (!useful.contains(phi) || phi->Type() != IrType::U1) continue;
+            if (!entries.at(phi)->HasImmediate() || statePhis.size() == MaximumStatePhis) return false;
+            statePhis.emplace(phi, static_cast<std::uint32_t>(statePhis.size()));
+            if (entries.at(phi)->ImmediateBool()) start |= 1u << statePhis.at(phi);
+        }
+        for (IrValue* phi : head->Instructions()) {
+            if (useful.contains(phi) && phi->Type() != IrType::U1 && !idleBase(backs.at(phi), [phi](const IrValue* value) { return value == phi; })) return false;
+        }
+        if (!evaluable(pending)) return false;
+        for (IrValue* phi : head->Instructions()) {
+            if (statePhis.contains(phi) && !evaluable(backs.at(phi))) return false;
+        }
+        IrValue* active = read->Argument(1)->Resolve();
+        if (!evaluable(active)) return false;
+        readMask = active;
+        for (IrValue* inst : body->Instructions()) {
+            if (!useful.contains(inst) || !inst->MayHaveSideEffects()) continue;
+            if (!effectIdle(inst)) return false;
+        }
+        for (IrBlock* block : {head, body}) {
+            for (IrValue* inst : block->Instructions()) {
+                if (!useful.contains(inst)) continue;
+                bool outside = false;
+                for (const IrValue* user : inst->Uses()) outside = outside || !inLoop(user);
+                if (outside) {
+                    if (inst->Type() == IrType::U1 || inst->Parent() == head) return false;
+                    bool carried = false;
+                    for (const auto& [phi, back] : backs) carried = carried || (back == inst && useful.contains(phi) && !statePhis.contains(phi));
+                    if (!carried) return false;
+                }
+                if (!evaluable(inst)) continue;
+                for (const IrValue* user : inst->Uses()) {
+                    if (!useful.contains(user) || evaluable(user) || user->Opcode() == IrOpcode::Reference) continue;
+                    if (user->IsPhi() && user->Parent() == head) continue;
+                    if (user == read && read->Argument(1)->Resolve() == inst) continue;
+                    if (user->Opcode() == IrOpcode::Ballot && inst == pending && scalarCondition != nullptr) continue;
+                    fires.insert(inst);
+                }
+            }
+        }
+        return true;
+    }
+
+    bool effectIdle(IrValue* inst) {
+        switch (inst->Opcode()) {
+        case IrOpcode::Reference:
+        case IrOpcode::ReferenceU32:
+        case IrOpcode::ControlNop:
+        case IrOpcode::Waitcnt:
+        case IrOpcode::Sendmsg:
+        case IrOpcode::TtraceData:
+        case IrOpcode::InstPrefetch:
+            return true;
+        case IrOpcode::StoreVectorWindow:
+            return idleStore(inst);
+        case IrOpcode::SetAttribute:
+            return guardFires(inst->Argument(1));
+        default:
+            break;
+        }
+        const auto opcode = inst->Opcode();
+        const auto buffer = BufferAccessOf(opcode);
+        const auto shared = SharedAccessOf(opcode);
+        const auto address = AddressOpcodeInfoOf(opcode).access;
+        const auto image = ImageOpcodeInfoOf(opcode).access;
+        const bool masked = buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || shared == SharedAccess::Write || shared == SharedAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
+        return masked && inst->ArgumentCount() != 0u && guardFires(inst->Argument(inst->ArgumentCount() - 1u));
+    }
+
+    bool guardFires(IrValue* guard) {
+        guard = guard->Resolve();
+        if (guard->HasImmediate() || !evaluable(guard)) return false;
+        fires.insert(guard);
+        return true;
+    }
+
+    bool simulate() {
+        std::unordered_set<std::uint64_t> seen;
+        std::vector<std::pair<std::uint32_t, bool>> work{{start, false}};
+        seen.insert(start);
+        while (!work.empty()) {
+            const auto [state, done] = work.back();
+            work.pop_back();
+            for (const bool equal : {false, true}) {
+                if (!done && !evaluate(readMask, state, equal)) return false;
+                const bool fire = !done && equal;
+                for (const IrValue* guard : fires) {
+                    if (evaluate(guard, state, equal) != fire) return false;
+                }
+                const bool next = done || fire;
+                if (!next && !evaluate(pending, state, equal)) return false;
+                std::uint32_t following = 0;
+                for (const auto& [phi, bit] : statePhis) {
+                    if (evaluate(backs.at(phi), state, equal)) following |= 1u << bit;
+                }
+                const auto key = static_cast<std::uint64_t>(following) | (static_cast<std::uint64_t>(next) << 32u);
+                if (seen.insert(key).second) work.emplace_back(following, next);
+            }
+        }
+        return true;
+    }
+
+    void rewrite() {
+        read->ReplaceUsesWith(index, true);
+        IrValue& active = builder.ConstantBool(true);
+        for (IrValue* guard : fires) guard->ReplaceUsesWith(&active, true);
+        for (IrValue* phi : head->Instructions()) {
+            if (!useful.contains(phi)) phi->ReplaceUsesWith(entries.at(phi), true);
+        }
+        if (scalarCondition != nullptr) scalarCondition->ReplaceUsesWith(&builder.ConstantBool(!continueOnTrue), true);
+        else latch->condition = &builder.ConstantBool(false);
+    }
+
+    IrProgram& program;
+    IrBuilder& builder;
+    const std::unordered_map<std::uint32_t, std::size_t>& blockById;
+    std::size_t header;
+    BlockInfo* latch = nullptr;
+    IrBlock* head = nullptr;
+    IrBlock* body = nullptr;
+    bool continueOnTrue = false;
+    IrValue* pending = nullptr;
+    IrValue* scalarCondition = nullptr;
+    IrValue* read = nullptr;
+    IrValue* index = nullptr;
+    IrValue* readMask = nullptr;
+    std::uint32_t start = 0;
+    std::unordered_map<const IrValue*, IrValue*> entries;
+    std::unordered_map<const IrValue*, IrValue*> backs;
+    std::unordered_map<const IrValue*, std::size_t> positions;
+    std::unordered_set<std::uint32_t> stored;
+    std::unordered_set<const IrValue*> matches;
+    std::unordered_map<const IrValue*, bool> mask;
+    std::unordered_map<const IrValue*, std::uint32_t> statePhis;
+    std::unordered_set<const IrValue*> useful;
+    std::unordered_set<IrValue*> fires;
+};
+
 std::vector<SubgroupUse> Describe(const IrProgram& program, const std::map<std::size_t, std::string>& branchReasons) {
     std::vector<SubgroupUse> uses;
     const auto& order = program.BlockOrder();
@@ -785,6 +1169,12 @@ std::vector<SubgroupUse> Describe(const IrProgram& program, const std::map<std::
     return uses;
 }
 
+void Lowering::lowerWaterfallLoops() {
+    for (std::size_t header = 0; header < program.Metadata().blockInfo.size(); ++header) {
+        if (program.Metadata().blockInfo[header].terminator.loopHeader) static_cast<void>(WaterfallLoop(program, builder, blockById, header).Lower());
+    }
+}
+
 std::vector<SubgroupUse> Lowering::describe() const {
     return Describe(program, branchReasons);
 }
@@ -796,6 +1186,9 @@ std::vector<SubgroupUse> Lowering::Run() {
     rewriteThreadBits();
     cleanup();
     rewriteUniformLaneReads();
+    cleanup();
+    indexBlocks();
+    lowerWaterfallLoops();
     cleanup();
     indexBlocks();
     lowerWaveMaskBranches();
