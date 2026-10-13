@@ -50,6 +50,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${LIBS_INCLUDE_DIR}/nid/src/Sha1.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Aio/src/Aio.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Aio/src/ReadTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Aio/src/ReadThrottle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Coredump.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Exception.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Sanitizer.cpp
@@ -106,6 +107,15 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
         endif()
     endforeach()
+    add_test_executable(loader_throttle_tests ${LIBS_INCLUDE_DIR}/tests/LoaderThrottle.cpp)
+    target_include_directories(loader_throttle_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(loader_throttle_tests PRIVATE libkernel libc)
+    configure_windows_unwind(loader_throttle_tests)
+    add_test(NAME loader_throttle COMMAND loader_throttle_tests)
+    if(WIN32)
+        set_tests_properties(loader_throttle PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(param_json_parser_tests ${LIBS_INCLUDE_DIR}/tests/ParamJsonParser.cpp)
     target_include_directories(param_json_parser_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(param_json_parser_tests PRIVATE libkernel libc)
