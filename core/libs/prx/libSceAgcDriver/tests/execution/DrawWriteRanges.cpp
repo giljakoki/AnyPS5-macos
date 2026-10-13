@@ -72,6 +72,16 @@ int main() {
         }
         program.bindings[0].imageWritten.clear();
         Require(Contains(DrawWriteRanges(state, stages, true), readOnly, readOnly + surfaceBytes), "an image without written flags is not a write range");
+        auto nullImage = ImageWords(0, 256, 128);
+        nullImage[0] = 0;
+        nullImage[1] &= ~0xffu;
+        std::copy(nullImage.begin(), nullImage.end(), program.bindings[0].guestDescriptor.begin() + 8);
+        program.bindings[0].imageWritten = {true, true};
+        for (const bool exact : {false, true}) {
+            const auto ranges = DrawWriteRanges(state, stages, exact);
+            Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a null one is not a write range");
+            Require(!Touches(ranges, 0, surfaceBytes), "a null storage image is a write range");
+        }
         AgcDriver::Graphics::State targets{};
         targets.hasColorTarget = true;
         auto& color = targets.color;
