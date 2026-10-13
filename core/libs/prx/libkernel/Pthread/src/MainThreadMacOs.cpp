@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <algorithm>
 #include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 
@@ -24,6 +25,10 @@ std::atomic<bool> mainLoopRunning {false};
 
 void* RunGuest(void* argument) {
     const auto start = *static_cast<const GuestStart*>(argument);
+    sigset_t emulatorSignals;
+    sigemptyset(&emulatorSignals);
+    for (const int emulatorSignal : {SIGUSR1, SIGBUS, SIGSEGV}) sigaddset(&emulatorSignals, emulatorSignal);
+    pthread_sigmask(SIG_UNBLOCK, &emulatorSignals, nullptr);
     start.entry(start.block, nullptr);
     std::fprintf(stderr, "guest entry returned\n");
     std::abort();
