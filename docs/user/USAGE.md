@@ -149,7 +149,7 @@ GPU results in storage images and render targets stay on the GPU until something
 
 ### Barycentric registers reused as temporaries
 
-A pixel shader that reuses its barycentric registers as temporaries in lanes a branch leaves inactive normally needs a geometry shader on devices without `VK_KHR_fragment_shader_barycentric`, which MoltenVK lacks, and stops with `Barycentric geometry SPIR-V: geometry shaders are unavailable`. `APS5_BARYCENTRIC_MASKED_ZERO=1` replaces those leftover barycentric values with 0 when they only reach inactive lanes, sample coordinates or arithmetic whose result those lanes never export; the only visible effect is the mip level of some pixels on the edge of partially covered quads ([TechnicalDebt](../dev/TechnicalDebt.md)). Any other value leaves it off.
+A pixel shader that reuses its barycentric registers as temporaries in lanes a branch leaves inactive normally needs a geometry shader on devices without `VK_KHR_fragment_shader_barycentric`, which MoltenVK lacks, and stops with `Barycentric geometry SPIR-V: geometry shaders are unavailable`. `APS5_BARYCENTRIC_MASKED_ZERO=1` replaces those leftover barycentric values with 0 when they only reach inactive lanes, sample coordinates, arithmetic whose result those lanes never export, or cross-lane moves out of lanes that are not running; the only visible effect is the mip level of some pixels on the edge of partially covered quads ([TechnicalDebt](../dev/TechnicalDebt.md)). Any other value leaves it off.
 
 ### Slowing a title's loader
 

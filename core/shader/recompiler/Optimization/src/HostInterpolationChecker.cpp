@@ -338,36 +338,63 @@ bool laneLocalValue(const IrValue& value) {
     return BufferAccessOf(value.Opcode()) == BufferAccess::None && SharedAccessOf(value.Opcode()) == SharedAccess::None && AddressOpcodeInfoOf(value.Opcode()).access == AddressAccess::None && ImageOpcodeInfoOf(value.Opcode()).access == ImageAccess::None;
 }
 
+bool wordWithinPredicate(const IrValue* word, const IrValue* predicate, std::uint32_t half, std::uint32_t depth = 0) {
+    word = word->Resolve();
+    if (depth > 12) return false;
+    if (word->Opcode() == IrOpcode::BitwiseAnd32) return wordWithinPredicate(word->Argument(0), predicate, half, depth + 1) || wordWithinPredicate(word->Argument(1), predicate, half, depth + 1);
+    const auto* ballot = ballotOf(word, half);
+    return ballot != nullptr && implies(ballot->Argument(0), predicate);
+}
+
 bool guards(const IrValue* guard, const IrValue* keep) {
     if (implies(guard, keep)) return true;
     const auto guardWords = ownBitWords(guard);
     const auto keepWords = ownBitWords(keep);
+    if (guardWords && !keepWords) return wordWithinPredicate(guardWords->low, keep, 0u) && wordWithinPredicate(guardWords->high, keep, 1u);
     return guardWords && keepWords && coversLanes(*keepWords, *guardWords);
 }
 
-bool maskedOnly(const IrValue& value, const IrValue* keep, std::vector<const IrValue*>& visited) {
+bool keepsOnlyIdleLanes(const IrValue* keep) {
+    const auto words = ownBitWords(keep);
+    if (!words) return false;
+    const auto* low = ballotOf(words->low, 0u);
+    const auto* high = ballotOf(words->high, 1u);
+    return low != nullptr && high != nullptr && low->Parent() == high->Parent() && alwaysTrue(low->Argument(0)) && alwaysTrue(high->Argument(0));
+}
+
+bool maskedOnly(const IrValue& value, const IrValue* keep, std::vector<const IrValue*>& visited, bool otherLanes = false) {
     for (const auto& use : value.OperandUses()) {
         const auto& user = *use.user;
         if (std::find(visited.begin(), visited.end(), &user) != visited.end()) continue;
         if (isCopy(user) || user.IsPhi()) {
             visited.push_back(&user);
-            if (!maskedOnly(user, keep, visited)) return false;
+            if (!maskedOnly(user, keep, visited, otherLanes)) return false;
             continue;
         }
         if (user.Opcode() == IrOpcode::SelectU32 && use.operand == 2u) {
             visited.push_back(&user);
-            if (!maskedOnly(user, keep != nullptr ? keep : user.Argument(0)->Resolve(), visited)) return false;
+            if (!maskedOnly(user, keep != nullptr ? keep : user.Argument(0)->Resolve(), visited, otherLanes)) return false;
             continue;
         }
         if (keep == nullptr) return false;
-        if (user.Opcode() == IrOpcode::LogicalAnd && guards(user.Argument(use.operand == 0u ? 1u : 0u), keep)) continue;
+        if (!otherLanes) {
+            if (user.Opcode() == IrOpcode::LogicalAnd && guards(user.Argument(use.operand == 0u ? 1u : 0u), keep)) continue;
+            if (user.Opcode() == IrOpcode::SelectU32 && use.operand == 1u && user.Argument(2)->Resolve() != &value && guards(user.Argument(0), keep)) continue;
+            if (user.Opcode() == IrOpcode::SetAttribute && use.operand == 0u && guards(user.Argument(1), keep)) continue;
+        }
+        if (otherLanes && user.Opcode() == IrOpcode::SetAttribute && use.operand == 0u && keepsOnlyIdleLanes(keep)) continue;
         if (user.Opcode() == IrOpcode::MakeImageAddress) {
             const bool sampled = usesAll(user, [](const IrValue& sample, std::size_t) { return ImageOpcodeInfoOf(sample.Opcode()).access == ImageAccess::Read; });
             if (sampled) continue;
         }
+        if (user.Opcode() == IrOpcode::DppMoveU32 || user.Opcode() == IrOpcode::DppUpdateU32) {
+            visited.push_back(&user);
+            if (!maskedOnly(user, keep, visited, true)) return false;
+            continue;
+        }
         if (laneLocalValue(user)) {
             visited.push_back(&user);
-            if (!maskedOnly(user, keep, visited)) return false;
+            if (!maskedOnly(user, keep, visited, otherLanes)) return false;
             continue;
         }
         return false;
