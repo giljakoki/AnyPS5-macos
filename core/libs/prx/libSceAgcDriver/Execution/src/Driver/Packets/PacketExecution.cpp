@@ -379,7 +379,7 @@ void Driver::execute(const Submission& submission) {
             }
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
-        if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork(drawPacket);
         if ((drawPacket || opcode == 0x15 || opcode == 0x16) && SerializeWork()) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());

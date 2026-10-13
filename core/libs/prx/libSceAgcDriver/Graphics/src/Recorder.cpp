@@ -518,6 +518,8 @@ std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
 std::atomic<std::uint64_t> completionLabelsCountedLate{0};
 std::atomic<std::uint64_t> workSinceSubmit{0};
+std::atomic<std::uint64_t> timingDraws{0};
+std::atomic<std::uint64_t> timingDispatches{0};
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -1209,8 +1211,9 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
     return workSinceSubmit.load(std::memory_order_relaxed);
 }
 
-void Recorder::CountRecordedWork() {
+void Recorder::CountRecordedWork(bool draw) {
     workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
+    (draw ? timingDraws : timingDispatches).fetch_add(1, std::memory_order_relaxed);
 }
 
 Recorder* Recorder::Active() {
@@ -2448,6 +2451,8 @@ void Recorder::readGpuTiming(Batch& batch) {
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
+    const auto draws = timingDraws.exchange(0, std::memory_order_relaxed);
+    const auto dispatches = timingDispatches.exchange(0, std::memory_order_relaxed);
     std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
     std::string classes;
     for (const auto& [key, totals] : timingByKey) {
@@ -2461,7 +2466,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents, %llu draws and %llu dispatches, %.1f draws and %.1f dispatches per present; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(draws), static_cast<unsigned long long>(dispatches), static_cast<double>(draws) * perPresent, static_cast<double>(dispatches) * perPresent, static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();

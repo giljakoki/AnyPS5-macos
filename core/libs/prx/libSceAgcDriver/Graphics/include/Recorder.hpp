@@ -381,7 +381,7 @@ public:
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
-    static void CountRecordedWork();
+    static void CountRecordedWork(bool draw = false);
 
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
