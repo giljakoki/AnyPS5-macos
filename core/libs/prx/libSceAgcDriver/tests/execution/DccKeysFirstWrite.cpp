@@ -462,6 +462,7 @@ void RunUntrackedRefreshWithoutWait(AgcDriver::VulkanDevice& device, std::uint8_
     Require(image->Refresh() && image->Version() == version, "the landed baseline does not match the uploaded image");
     std::memset(block + SurfaceBytes, 0x44, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
+    AgcDriver::Graphics::Recorder::CountPresent();
     Require(!image->Refresh(), "a CPU edit after the baseline landed was missed");
     StorageTexture::FlushPending(address, BlockBytes, nullptr, "test untracked refresh");
     device.WaitIdle();
