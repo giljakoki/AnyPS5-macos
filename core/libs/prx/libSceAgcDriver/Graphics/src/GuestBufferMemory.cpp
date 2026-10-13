@@ -212,7 +212,81 @@ struct RetiredImport {
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
-void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
+enum class RetireCause : std::uint8_t { Replaced, Refresh, PinWaiter };
+
+const char* retireCauseName(RetireCause cause) {
+    switch (cause) {
+    case RetireCause::Replaced: return "a new import of its run";
+    case RetireCause::Refresh: return "a registry reconcile";
+    case RetireCause::PinWaiter: return "the pin waiter";
+    }
+    return "?";
+}
+
+struct RetirementNote {
+    std::chrono::steady_clock::time_point at;
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t serial = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    RetireCause cause = RetireCause::Replaced;
+    bool locked = false;
+    bool recorder = false;
+    Recorder::WorkSummary work;
+};
+
+struct RetirementLog {
+    std::mutex mutex;
+    std::array<RetirementNote, 64> ring{};
+    std::uint64_t count = 0;
+    std::uint64_t unlocked = 0;
+    std::atomic<bool> reported{false};
+};
+
+RetirementLog& Retirements() {
+    static RetirementLog& log = *new RetirementLog();
+    return log;
+}
+
+bool TraceImportRetire() {
+    static const bool trace = std::getenv("APS5_TRACE_IMPORT_RETIRE") != nullptr;
+    return trace;
+}
+
+void printRetirement(const char* prefix, const RetirementNote& note, std::chrono::steady_clock::time_point now) {
+    const auto age = std::chrono::duration<double, std::milli>(now - note.at).count();
+    if (!note.recorder) {
+        std::fprintf(stderr, "[import-retire] %s-%.1f ms 0x%llx+0x%llx buffer %p serial %llu by %s, %s the device lock, no recorder state\n", prefix, age, static_cast<unsigned long long>(note.base), static_cast<unsigned long long>(note.bytes), static_cast<void*>(note.buffer), static_cast<unsigned long long>(note.serial), retireCauseName(note.cause), note.locked ? "under" : "OUTSIDE");
+        return;
+    }
+    const auto& work = note.work;
+    std::fprintf(stderr, "[import-retire] %s-%.1f ms 0x%llx+0x%llx buffer %p serial %llu by %s, under the device lock; open batch %llu%s, in flight %zu (%llu..%llu, %zu unsignaled), submit thread queue %zu (%llu..%llu), carried %zu\n", prefix, age, static_cast<unsigned long long>(note.base), static_cast<unsigned long long>(note.bytes), static_cast<void*>(note.buffer), static_cast<unsigned long long>(note.serial), retireCauseName(note.cause), static_cast<unsigned long long>(work.openSerial), work.open ? "" : " (none open)", work.inFlight, static_cast<unsigned long long>(work.firstInFlight), static_cast<unsigned long long>(work.lastInFlight), work.unsignaled, work.submitQueue.jobs, static_cast<unsigned long long>(work.submitQueue.first), static_cast<unsigned long long>(work.submitQueue.last), work.carried);
+}
+
+void noteRetirement(const HostImport& entry, RetireCause cause) {
+    if (!TraceImportRetire()) return;
+    RetirementNote note;
+    note.at = std::chrono::steady_clock::now();
+    note.base = entry.base;
+    note.bytes = entry.bytes;
+    note.serial = entry.serial;
+    note.buffer = entry.buffer;
+    note.cause = cause;
+    note.locked = GuestMemory::GpuMutex().HeldByThisThread();
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && note.locked) {
+        note.recorder = true;
+        note.work = recorder->Summary();
+    }
+    printRetirement("", note, note.at);
+    auto& log = Retirements();
+    std::lock_guard lock(log.mutex);
+    if (!note.locked) ++log.unlocked;
+    log.ring[log.count % log.ring.size()] = note;
+    ++log.count;
+}
+
+void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, RetireCause cause) {
+    noteRetirement(it->second, cause);
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
@@ -627,14 +701,14 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     const auto bytes = run.bytes;
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (sameRun(found->second, run)) return &found->second;
-        retireImport(context.device, state, found, lease);
+        retireImport(context.device, state, found, lease, RetireCause::Replaced);
     }
     for (auto it = state.imports.lower_bound(base); it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
+        retireImport(context.device, state, it, lease, RetireCause::Replaced);
         it = next;
     }
-    if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
+    if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease, RetireCause::Replaced);
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
@@ -805,7 +879,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
+        retireImport(context.device, state, it, lease, RetireCause::Refresh);
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
@@ -1552,7 +1626,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                         continue;
                     }
                     const auto next = std::next(it);
-                    retireImport(imports.device, imports, it, lease);
+                    retireImport(imports.device, imports, it, lease, RetireCause::PinWaiter);
                     it = next;
                     retiredImport = true;
                 }
@@ -1620,7 +1694,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                             continue;
                         }
                         const auto next = std::next(it);
-                        retireImport(imports.device, imports, it, lease);
+                        retireImport(imports.device, imports, it, lease, RetireCause::PinWaiter);
                         it = next;
                         retiredImport = true;
                     }
@@ -1737,6 +1811,18 @@ void ClearImageMirrors(VkDevice device) {
         state.device = VK_NULL_HANDLE;
     }
     Spaces().current.store(nullptr);
+}
+
+void ReportImportRetirements(const char* why) {
+    if (!TraceImportRetire()) return;
+    auto& log = Retirements();
+    if (log.reported.exchange(true)) return;
+    std::unique_lock lock(log.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto shown = std::min<std::uint64_t>(log.count, log.ring.size());
+    std::fprintf(stderr, "[import-retire] %s: %llu host imports retired (%llu outside the device lock), the last %llu oldest first\n", why, static_cast<unsigned long long>(log.count), static_cast<unsigned long long>(log.unlocked), static_cast<unsigned long long>(shown));
+    for (std::uint64_t n = log.count - shown; n < log.count; ++n) printRetirement("  ", log.ring[n % log.ring.size()], now);
 }
 
 void ClearHostImports(VkDevice device) {

@@ -47,6 +47,7 @@ public:
     static bool Enabled();
     static std::shared_ptr<QueueSubmitter> Acquire(VkQueue queue, PFN_vkQueueSubmit submit);
     static void Drain(VkQueue queue);
+    static void DrainAll();
     static std::unique_lock<std::mutex> Access(VkQueue queue);
     static bool SubmitSignaling(VkQueue queue, VkCommandBuffer commands, VkFence fence, VkSemaphore signal);
     static std::uint64_t Submitted();
@@ -56,6 +57,12 @@ public:
     QueueSubmitter& operator=(const QueueSubmitter&) = delete;
     void Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value, VkSemaphore signal = VK_NULL_HANDLE);
     void Drain();
+    struct Queued {
+        std::size_t jobs = 0;
+        std::uint64_t first = 0;
+        std::uint64_t last = 0;
+    };
+    Queued Pending();
 
 private:
     struct Job {
@@ -125,6 +132,20 @@ public:
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepPastNextBatch(std::shared_ptr<void> object);
+    std::size_t CarriedObjects() const { return carriedToNextBatch.size(); }
+    void SettleCarried();
+    struct WorkSummary {
+        bool open = false;
+        std::uint64_t openSerial = 0;
+        std::size_t inFlight = 0;
+        std::uint64_t firstInFlight = 0;
+        std::uint64_t lastInFlight = 0;
+        std::size_t unsignaled = 0;
+        QueueSubmitter::Queued submitQueue;
+        std::size_t carried = 0;
+    };
+    WorkSummary Summary() const;
+    void DrainSubmitQueue();
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();

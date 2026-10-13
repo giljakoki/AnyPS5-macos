@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <atomic>
 #include <cstdio>
@@ -6,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -50,6 +52,18 @@ std::shared_ptr<QueueSubmitter> QueueSubmitter::Acquire(VkQueue queue, PFN_vkQue
 
 void QueueSubmitter::Drain(VkQueue queue) {
     if (const auto submitter = registeredSubmitter(queue)) submitter->Drain();
+}
+
+void QueueSubmitter::DrainAll() {
+    std::vector<std::shared_ptr<QueueSubmitter>> live;
+    {
+        auto& registry = submitterRegistry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [queue, submitter] : registry.submitters) {
+            if (auto held = submitter.lock()) live.push_back(std::move(held));
+        }
+    }
+    for (const auto& submitter : live) submitter->Drain();
 }
 
 std::unique_lock<std::mutex> QueueSubmitter::Access(VkQueue queue) {
@@ -99,6 +113,12 @@ void QueueSubmitter::Drain() {
     Check(error, "vkQueueSubmit recorder (submit thread)");
 }
 
+QueueSubmitter::Queued QueueSubmitter::Pending() {
+    std::lock_guard lock(mutex);
+    if (jobs.empty()) return {};
+    return {jobs.size(), jobs.front().value, jobs.back().value};
+}
+
 void QueueSubmitter::run() {
     std::unique_lock lock(mutex);
     for (;;) {
@@ -131,6 +151,7 @@ void QueueSubmitter::run() {
         if (result != VK_SUCCESS && error == VK_SUCCESS) {
             error = result;
             std::fprintf(stderr, "[gpu] vkQueueSubmit on the submit thread failed (%d)\n", static_cast<int>(result));
+            ReportImportRetirements("vkQueueSubmit failed on the submit thread");
         }
         drained.notify_all();
     }

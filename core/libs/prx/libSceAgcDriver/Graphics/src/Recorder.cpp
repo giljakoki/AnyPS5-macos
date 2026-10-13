@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -2522,6 +2523,31 @@ void Recorder::KeepPastNextBatch(std::shared_ptr<void> object) {
     Keep(std::move(object));
 }
 
+void Recorder::SettleCarried() {
+    if (carriedToNextBatch.empty()) return;
+    ensureOpen();
+    Sync();
+}
+
+Recorder::WorkSummary Recorder::Summary() const {
+    WorkSummary summary;
+    summary.open = open != nullptr;
+    summary.openSerial = submissions + 1;
+    summary.inFlight = inFlight.size();
+    if (!inFlight.empty()) {
+        summary.firstInFlight = inFlight.front()->serial;
+        summary.lastInFlight = inFlight.back()->serial;
+    }
+    summary.unsignaled = UnsignaledBatches();
+    if (submitter != nullptr) summary.submitQueue = submitter->Pending();
+    summary.carried = carriedToNextBatch.size();
+    return summary;
+}
+
+void Recorder::DrainSubmitQueue() {
+    if (submitter != nullptr) submitter->Drain();
+}
+
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
@@ -3671,6 +3697,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
+            ReportImportRetirements("recorder fence wait failed");
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }

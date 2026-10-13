@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -168,9 +169,10 @@ void DumpRecentWork(const char* why) {
 }
 
 void InstallRecentWorkDump() {
-    if (RecentWorkCapacity() == 0 || PreviousTerminate() != nullptr) return;
+    if ((RecentWorkCapacity() == 0 && std::getenv("APS5_TRACE_IMPORT_RETIRE") == nullptr) || PreviousTerminate() != nullptr) return;
     PreviousTerminate() = std::set_terminate([] {
         DumpRecentWork("terminating");
+        Graphics::ReportImportRetirements("terminating");
         if (const auto previous = PreviousTerminate()) previous();
         std::abort();
     });
