@@ -33,19 +33,19 @@ bool SkipFailedDraws() {
     return skip;
 }
 
-void NoteSkippedDraw(const char* reason) {
+void NoteSkippedDraw(const char* reason, const char* kind) {
     static std::mutex mutex;
     static std::map<std::string, std::uint64_t> skipped;
     static std::uint64_t total = 0;
-    std::string key(reason);
+    std::string key = std::string(kind) + ": " + reason;
     if (const auto request = key.find("\nRecompileRequest:"); request != std::string::npos) key.resize(request);
     std::lock_guard lock(mutex);
     ++total;
     const auto count = ++skipped[key];
     if (count == 1u) {
-        std::fprintf(stderr, "[draw] skipped a draw the driver cannot run (APS5_SKIP_FAILED_DRAWS, %llu skipped so far): %s\n", static_cast<unsigned long long>(total), reason);
+        std::fprintf(stderr, "[draw] skipped a %s the driver cannot run (APS5_SKIP_FAILED_DRAWS, %llu skipped so far): %s\n", kind, static_cast<unsigned long long>(total), reason);
     } else if ((count & (count - 1u)) == 0u) {
-        std::fprintf(stderr, "[draw] skipped %llu draws for: %.300s\n", static_cast<unsigned long long>(count), key.c_str());
+        std::fprintf(stderr, "[draw] skipped %llu packets for %.300s\n", static_cast<unsigned long long>(count), key.c_str());
     }
 }
 
@@ -317,8 +317,13 @@ void Driver::execute(const Submission& submission) {
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
             const auto traceDispatchStart = std::chrono::steady_clock::now();
-            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            try {
+                if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
+                else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            } catch (const std::exception& error) {
+                if (!SkipFailedDraws()) throw;
+                NoteSkippedDraw(error.what(), "dispatch");
+            }
             if (Graphics::UploadTraceEnabled()) {
                 const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceDispatchStart).count();
                 if (ms >= 1.0) Graphics::UploadTrace("dispatch at DWORD %zu of serial=%llu took %.1f ms on the worker", cursor, static_cast<unsigned long long>(submission.serial), ms);
@@ -376,7 +381,7 @@ void Driver::execute(const Submission& submission) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
                     if (!SkipFailedDraws()) throw;
-                    NoteSkippedDraw(error.what());
+                    NoteSkippedDraw(error.what(), "draw");
                 }
             });
             finishDrawPacket(drawn);
