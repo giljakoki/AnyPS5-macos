@@ -707,6 +707,33 @@ void RunGpuFillLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     std::cout << "GPU fill over a target, draw, present, repeat: ok\n";
 }
 
+void RunPendingKeyValues(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    std::uint8_t* keys = block + KeysOffset;
+    std::memset(keys, 0xff, KeyBytes);
+    const auto address = AddressOf(keys);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    if (recorder == nullptr) {
+        std::cout << "no active recorder: keys under pending fills not tested\n";
+        return;
+    }
+    const std::array<std::uint32_t, 4> clear{0u, 0u, 0u, 0u};
+    Require(device.FillBuffer(address, KeyBytes, clear), "the key fill was not recorded");
+    const auto submissions = recorder->Submissions();
+    Require(AgcDriver::Graphics::CurrentDccKeys(address, SurfaceBytes) == DccKeys::Clear0000, "keys under a pending 0x00 fill do not read as the 0000 clear code");
+    Require(recorder->Submissions() == submissions, "keys under a pending fill waited for the GPU");
+    const std::array<std::uint32_t, 4> uncompressed{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    Require(device.FillBuffer(address, KeyBytes / 2, uncompressed), "the half key fill was not recorded");
+    Require(AgcDriver::Graphics::CurrentDccKeys(address, SurfaceBytes) == DccKeys::Mixed, "keys half under a newer 0xff fill do not read mixed");
+    Require(recorder->Submissions() == submissions, "keys under two pending fills waited for the GPU");
+    const std::array<std::uint32_t, 4> pattern{0x01020304u, 0x01020304u, 0x01020304u, 0x01020304u};
+    Require(device.FillBuffer(address, KeyBytes, pattern), "the patterned key fill was not recorded");
+    Require(AgcDriver::Graphics::CurrentDccKeys(address, SurfaceBytes) == DccKeys::Mixed, "keys under a patterned fill do not read mixed");
+    device.WaitIdle();
+    Require(keys[0] == 0x04 && keys[KeyBytes - 1] == 0x01, "the patterned key fill did not land");
+    std::cout << "keys under pending GPU fills: ok\n";
+}
+
 int main() {
     try {
         std::optional<GuestBlock> block;
@@ -732,6 +759,9 @@ int main() {
         std::optional<GuestBlock> filled;
         filled.emplace(false);
         RunGpuFillLoop(*device, filled->Data());
+        std::optional<GuestBlock> pendingKeys;
+        pendingKeys.emplace(false);
+        RunPendingKeyValues(*device, pendingKeys->Data());
         std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());
