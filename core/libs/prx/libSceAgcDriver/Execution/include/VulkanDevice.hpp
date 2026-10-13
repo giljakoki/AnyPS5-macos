@@ -238,6 +238,8 @@ public:
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.
     void Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr);
+    bool MeshEmulation() const;
+    void DrawMeshEmulated(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     struct MeshPrepassOutput {
         std::vector<std::uint32_t> records;
         std::vector<std::uint32_t> indices;

@@ -106,6 +106,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
+    const bool meshEmulated = graphics.stages.mesh.has_value() && localDevice->MeshEmulation();
     const std::vector<Role>& roles = decode->roles;
     phaseTiming.Phase(DrawRowDecode);
 
@@ -364,14 +365,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
             snapshot();
-            if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
+            if (auto known = meshEmulated ? std::nullopt : localDevice->KnownDrawRejection(graphics, stages)) {
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
-            localDevice->Draw(graphics, direct, stages, snapshots);
+            if (meshEmulated) localDevice->DrawMeshEmulated(graphics, direct, stages, snapshots);
+            else localDevice->Draw(graphics, direct, stages, snapshots);
             phaseTiming.Phase(DrawRowGraphics);
         }
         timing.Mark("draw_and_resource_release");
@@ -379,7 +381,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !meshEmulated && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
@@ -389,7 +391,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         recipe = findDrawRecipe(drawKey, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
-    if (recipe == nullptr) {
+    if (recipe == nullptr && !meshEmulated) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
@@ -406,6 +408,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
 
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+    }
+    if (meshEmulated) {
+        localDevice->DrawMeshEmulated(graphics, drawParameters, stages, snapshots);
+        phaseTiming.Phase(DrawRowGraphics);
+        timing.Mark("draw_and_resource_release");
+        return drawn();
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);

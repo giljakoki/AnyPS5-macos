@@ -19,12 +19,14 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
+    auto mesh = graphics.stages.mesh;
+    if (mesh && localDevice->MeshEmulation()) mesh->compute = true;
     ShaderRecompiler::RecompileRequest request{
         program.binary,
         {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfos[i], memory, RegisteredFloatMode(*program.snapshot)},
         localDevice->Target(),
         {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushSlotBytes) - pushOffset % Graphics::PipelinePushSlotBytes},
-        ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, graphics.stages.positionExportControl}
+        ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, graphics.stages.positionExportControl}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
