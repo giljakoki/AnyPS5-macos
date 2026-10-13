@@ -4623,6 +4623,17 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     Require(draw() == made, "an unchanged imported snapshot was made again");
     if (refreshed) Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites && SampledSnapshotTotals().refreshes == refreshesBeforeWrites + 1, "a driver write over an imported snapshot was not refreshed");
     else Require(AgcDriver::GuestMemory::ComparedBytes() - beforeWrites == bytes, "a driver write over an imported snapshot was not compared");
+    if (refreshed && !hashed) {
+        for (int present = 0; present < 200; ++present) {
+            order();
+            Require(draw() == made, "an unchanged imported snapshot was made again");
+        }
+        recorder.Sync();
+        static_cast<volatile std::uint8_t*>(block)[bytes / 8] = 0x5d;
+        order();
+        Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+        Require(readBlock(made, bytes / 8) == 0x5d, "an atlas unchanged for 200 presents sampled stale bytes at the first draw after it changed");
+    }
     const auto refreshesBeforeStore = SampledSnapshotTotals().refreshes;
     static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x77;
     order();

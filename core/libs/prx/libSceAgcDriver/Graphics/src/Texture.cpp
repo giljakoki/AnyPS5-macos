@@ -1769,6 +1769,7 @@ bool StorageTexture::Refresh() {
         }
         for (std::size_t k = 0; k < cpuBlocks.size(); ++k) {
             if (cpuBlocks[k] != 0 && (compared || (tracked && generations[k] != 0))) cpuWrote = true;
+            if (cpuBlocks[k] != 0 && compared) cpuWriter = true;
         }
         // Unchanged bytes rescue an upload only when nothing else moved: with the keys changed
         // the same bytes read differently, and a changed unit holding pending results must take
@@ -2108,7 +2109,9 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     const auto now = std::chrono::steady_clock::now();
     const auto forget = GuestMemory::ForgetSerial();
     const auto writes = GuestMemory::DriverWriteSerial();
-    if (whole && untrackedProof.has_value() && untrackedProof->present == present && now - untrackedProof->at < std::chrono::milliseconds(500) && untrackedProof->forget == forget && (forget & 1u) == 0 && !GuestMemory::DriverWroteOver(address, bytes, untrackedProof->writes, true)) {
+    const auto epoch = GuestMemory::CollectEpoch();
+    const bool epochHolds = !cpuWriter || (epoch != 0 && untrackedProof.has_value() && untrackedProof->epoch == epoch);
+    if (whole && epochHolds && untrackedProof.has_value() && untrackedProof->present == present && now - untrackedProof->at < std::chrono::milliseconds(500) && untrackedProof->forget == forget && (forget & 1u) == 0 && !GuestMemory::DriverWroteOver(address, bytes, untrackedProof->writes, true)) {
         untrackedProof->writes = writes;
         untrackedProofHits.fetch_add(1, std::memory_order_relaxed);
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
@@ -2128,7 +2131,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         if (cacheable) comparedGuestBytes = stamp;
-        if (whole && (forget & 1u) == 0) untrackedProof = UntrackedProof{present, forget, writes, now};
+        if (whole && (forget & 1u) == 0) untrackedProof = UntrackedProof{present, forget, writes, epoch, now};
         return true;
     }
     originalChanged();

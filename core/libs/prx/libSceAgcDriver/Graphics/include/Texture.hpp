@@ -497,9 +497,11 @@ private:
         std::uint64_t present = 0;
         std::uint64_t forget = 0;
         std::uint64_t writes = 0;
+        std::uint64_t epoch = 0;
         std::chrono::steady_clock::time_point at{};
     };
     mutable std::optional<UntrackedProof> untrackedProof;
+    bool cpuWriter = false;
     void originalChanged() const;
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.

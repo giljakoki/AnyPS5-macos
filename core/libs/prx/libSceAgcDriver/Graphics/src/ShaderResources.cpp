@@ -250,8 +250,8 @@ bool snapshotProofMemo() {
 }
 
 bool importedSnapshotHash() {
-    static const bool disabled = std::getenv("APS5_NO_IMPORTED_SNAPSHOT_HASH") != nullptr;
-    return !disabled;
+    static const bool enabled = std::getenv("APS5_IMPORTED_SNAPSHOT_HASH") != nullptr && std::getenv("APS5_NO_IMPORTED_SNAPSHOT_HASH") == nullptr;
+    return enabled;
 }
 
 bool importedSnapshotRefresh() {
