@@ -22,6 +22,20 @@ alignas(256) inline constexpr std::array<std::uint32_t, 104> Code{
     0xdbfc0410, 0x3000002b, 0xbf8cc07f, 0xf80008cf, 0x2f2e2d2c, 0xf800020f, 0x33323130, 0xbf810000,
 };
 
+alignas(256) inline constexpr auto CullingCode = [] {
+    std::array<std::uint32_t, Code.size() + 1u> code{};
+    std::size_t out = 0;
+    for (const auto word : Code) {
+        if (word == 0x4a521c82u) {
+            code[out++] = 0xd76d0029u;
+            code[out++] = 0x045d050eu;
+            continue;
+        }
+        code[out++] = word == 0xbf88002eu ? 0xbf88002fu : word;
+    }
+    return code;
+}();
+
 alignas(256) inline constexpr auto Wave32Code = [] {
     auto code = Code;
     code[10] = 0x04190a6bu;

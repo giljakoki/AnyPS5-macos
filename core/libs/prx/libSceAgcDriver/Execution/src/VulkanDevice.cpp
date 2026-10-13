@@ -3704,7 +3704,7 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
     static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe));
 }
 
-VulkanDevice::MeshPrepassOutput VulkanDevice::DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
+VulkanDevice::MeshPrepassOutput VulkanDevice::DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots, const MeshEmulationDraw* emulated) {
     if (!mesh.compute || groups == 0 || draw.instanceCount == 0 || recordDwords == 0 || recordDwords % 4u != 0) throw std::runtime_error("Vulkan mesh pre-pass: invalid configuration");
     const auto context = graphicsContext();
     const auto slots = static_cast<std::size_t>(groups) * draw.instanceCount;
@@ -3727,6 +3727,15 @@ VulkanDevice::MeshPrepassOutput VulkanDevice::DispatchMeshPrepass(const ShaderRe
     std::memcpy(prepass.pushConstants.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, drawWords.data(), sizeof(drawWords));
     Dispatch(prepass, groups, draw.instanceCount, 1, snapshots);
     WaitIdle();
+    if (emulated != nullptr) {
+        if (emulated->fragment == nullptr || emulated->state.stages.mesh.has_value() || emulated->layout.recordDwords != recordDwords) throw std::runtime_error("Vulkan mesh pre-pass: invalid pass-through draw");
+        auto vertex = ShaderRecompiler::BuildMeshPassThroughVertexShader(emulated->layout, Target(), false);
+        std::memcpy(vertex.pushConstants.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, drawWords.data(), sizeof(drawWords));
+        const std::array<Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, emulated->fragment, static_cast<std::uint32_t>(vertex.pushConstants.size())}}};
+        const Pm4::DrawParameters corners{0, static_cast<std::uint32_t>(slots * mesh.maxPrimitives * 3u), 0, 1, 0, false};
+        Draw(emulated->state, corners, shaders);
+        WaitIdle();
+    }
     MeshPrepassOutput output;
     output.records.resize(records.Bytes().size() / sizeof(std::uint32_t));
     output.indices.resize(indices.Bytes().size() / sizeof(std::uint32_t));
