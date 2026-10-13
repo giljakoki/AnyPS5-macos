@@ -102,7 +102,10 @@ private:
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
+        const void* recorder = nullptr;
+        std::uint64_t releasedBefore = 0;
     };
+    static bool Reusable(const Slot& slot);
     struct SlotKey {
         std::size_t bytes;
         VkBufferUsageFlags usage;
@@ -137,7 +140,7 @@ private:
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.
-    void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
+    bool evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
     std::size_t maxSlots;
@@ -148,6 +151,8 @@ private:
     PFN_vkAllocateMemory allocateMemory;
     PFN_vkMapMemory mapMemory;
     std::mutex mutex;
+    std::deque<Slot> doomed;
+    void takeDoomed(std::vector<BufferAllocation>& gone);
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
     std::uint64_t exactTakes = 0;
     Tier smallTier;

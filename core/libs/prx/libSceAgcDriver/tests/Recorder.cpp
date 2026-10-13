@@ -1136,6 +1136,35 @@ int importLifetimeTests(const Device& device, Recorder& recorder) {
     return 0;
 }
 
+void pooledBufferQuarantineTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    constexpr std::size_t bytes = 12345;
+    VkBuffer first = VK_NULL_HANDLE;
+    {
+        Buffer buffer(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        first = buffer.Handle();
+        static_cast<void>(recorder.Commands());
+    }
+    {
+        Buffer again(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        Require(again.Handle() != first, "a pooled buffer released while a batch was open was reused before that batch completed");
+    }
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    static_cast<void>(recorder.Commands());
+    recorder.Sync();
+    bool reused = false;
+    std::vector<std::unique_ptr<Buffer>> taken;
+    for (int attempt = 0; attempt < 4 && !reused; ++attempt) {
+        taken.push_back(std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT));
+        reused = taken.back()->Handle() == first;
+    }
+    Require(reused, "a pooled buffer was not reused once the batch open at its release completed");
+    std::cout << "Pooled buffer quarantine tests passed\n";
+}
+
 void layeredAttachmentTests(const Device& device) {
     const auto& base = device.GetContext();
     TextureDetiler detiler(base);
@@ -6069,6 +6098,7 @@ int main(int argc, char** argv) {
         remappedImportTests(device);
         movedMetadataTests(device, recorder);
         layeredAttachmentTests(device);
+        pooledBufferQuarantineTests(device, recorder);
         viewPastLastMipTests(device, recorder);
         keysFillTests(device, recorder);
         denormalClearTests(device, recorder);

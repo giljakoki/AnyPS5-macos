@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -38,6 +39,7 @@ BufferPool::~BufferPool() {
             for (const auto& slot : slots) destroy(slot.allocation);
         }
     }
+    for (const auto& slot : doomed) destroy(slot.allocation);
     for (auto& [memory, block] : slabBlocks) freeBlock(*block);
 }
 
@@ -250,20 +252,29 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     auto& tier = tierFor(capacity, properties);
     const auto largest = &tier == &deviceTier && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
     auto found = tier.free.end();
-    for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) found = tier.free.find({size, usage, properties});
-    if (found == tier.free.end() || found->second.empty()) {
+    auto chosen = std::deque<Slot>::iterator{};
+    const auto holds = [&](const BufferAllocation& allocation) { return allocation.bufferBytes == bytes || std::any_of(allocation.alternates.begin(), allocation.alternates.end(), [&](const BufferView& alternate) { return alternate.buffer != VK_NULL_HANDLE && alternate.bytes == bytes; }); };
+    for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) {
+        const auto candidate = tier.free.find({size, usage, properties});
+        if (candidate == tier.free.end()) continue;
+        auto& slots = candidate->second;
+        auto reusable = slots.end();
+        std::size_t scanned = 0;
+        for (auto it = slots.begin(); it != slots.end(); ++it) {
+            if (!Reusable(*it)) break;
+            reusable = it;
+            if (holds(it->allocation)) break;
+            if (++scanned == 16) break;
+        }
+        if (reusable == slots.end()) continue;
+        found = candidate;
+        chosen = reusable;
+    }
+    if (found == tier.free.end()) {
         ++tier.misses;
         return std::nullopt;
     }
     auto& slots = found->second;
-    auto chosen = std::prev(slots.end());
-    const auto holds = [&](const BufferAllocation& allocation) { return allocation.bufferBytes == bytes || std::any_of(allocation.alternates.begin(), allocation.alternates.end(), [&](const BufferView& alternate) { return alternate.buffer != VK_NULL_HANDLE && alternate.bytes == bytes; }); };
-    for (auto it = slots.rbegin(); it != slots.rend() && it - slots.rbegin() < 16; ++it) {
-        if (holds(it->allocation)) {
-            chosen = std::prev(it.base());
-            break;
-        }
-    }
     auto result = chosen->allocation;
     if (result.bufferBytes == bytes || TakeAlternate(result, bytes)) ++exactTakes;
     slots.erase(chosen);
@@ -274,8 +285,26 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     return result;
 }
 
-void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted) {
-    const auto oldest = std::min_element(tier.free.begin(), tier.free.end(), [](const auto& left, const auto& right) { return left.second.front().lastUse < right.second.front().lastUse; });
+void BufferPool::takeDoomed(std::vector<BufferAllocation>& gone) {
+    while (!doomed.empty() && Reusable(doomed.front())) {
+        gone.push_back(doomed.front().allocation);
+        doomed.pop_front();
+    }
+}
+
+bool BufferPool::Reusable(const Slot& slot) {
+    if (slot.recorder == nullptr) return true;
+    const auto* recorder = Recorder::Active();
+    return recorder != slot.recorder || recorder->BatchFinished(slot.releasedBefore);
+}
+
+bool BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted) {
+    auto oldest = tier.free.end();
+    for (auto it = tier.free.begin(); it != tier.free.end(); ++it) {
+        if (it->second.empty() || !Reusable(it->second.front())) continue;
+        if (oldest == tier.free.end() || it->second.front().lastUse < oldest->second.front().lastUse) oldest = it;
+    }
+    if (oldest == tier.free.end()) return false;
     // First: a throw here leaves the slot retained and counted.
     evicted.push_back(oldest->second.front().allocation);
     tier.retainedBytes -= oldest->second.front().allocation.allocationBytes;
@@ -283,6 +312,7 @@ void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted)
     if (oldest->second.empty()) tier.free.erase(oldest);
     --tier.slots;
     ++tier.evictions;
+    return true;
 }
 
 std::size_t BufferPool::MaxSlots() {
@@ -303,11 +333,21 @@ VkDeviceSize BufferPool::trim() {
     {
         std::lock_guard lock(mutex);
         for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}}) {
-            tier->free.swap(retired->free);
-            tier->evictions += tier->slots;
-            tier->retainedBytes = 0;
-            tier->slots = 0;
+            for (auto it = tier->free.begin(); it != tier->free.end();) {
+                auto& slots = it->second;
+                while (!slots.empty() && Reusable(slots.front())) {
+                    tier->retainedBytes -= slots.front().allocation.allocationBytes;
+                    retired->free[it->first].push_back(slots.front());
+                    slots.pop_front();
+                    --tier->slots;
+                    ++tier->evictions;
+                }
+                it = slots.empty() ? tier->free.erase(it) : std::next(it);
+            }
         }
+        std::vector<BufferAllocation> gone;
+        takeDoomed(gone);
+        for (auto& allocation : gone) retiredLarge.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, 0});
     }
     VkDeviceSize bytes = 0;
     for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice}) {
@@ -340,11 +380,14 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     try {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
+        takeDoomed(evicted);
+        const auto* recorder = Recorder::Active();
+        const auto releasedBefore = recorder != nullptr ? recorder->NewestSubmitted() + 1u : 0u;
         if (allocation.allocationBytes > tier.budget) {
-            evicted.push_back(allocation);
+            doomed.push_back({allocation, ++clock, recorder, releasedBefore});
         } else {
-            while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
-            tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock});
+            while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots) && evictOldest(tier, evicted)) {}
+            tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock, recorder, releasedBefore});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
         }
