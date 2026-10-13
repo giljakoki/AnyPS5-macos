@@ -242,7 +242,12 @@ public:
         std::vector<std::uint32_t> records;
         std::vector<std::uint32_t> indices;
     };
-    MeshPrepassOutput DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
+    struct MeshEmulationDraw {
+        Graphics::State state;
+        ShaderRecompiler::MeshProgramLayout layout;
+        const ShaderRecompiler::RecompileResult* fragment;
+    };
+    MeshPrepassOutput DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, const MeshEmulationDraw* emulated = nullptr);
     struct IndirectOutcome {
         int cpuReason;
         double argumentReadMs;

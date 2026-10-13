@@ -588,6 +588,7 @@ inline constexpr std::uint32_t PositionExportLayerViewportBits = (1u << 18u) | (
 [[nodiscard]] ShaderStage HostStage(const RecompileRequest& request);
 
 [[nodiscard]] MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request);
+[[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const MeshProgramLayout& layout, const SpirvTarget& target, bool writeLayer);
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
