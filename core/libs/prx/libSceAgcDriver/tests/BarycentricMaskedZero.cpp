@@ -182,5 +182,47 @@ int main(int argc, char** argv) {
         return !b.lower();
     });
 
+    passed &= run("a kept barycentric overwritten under the keep condition before an export is unobserved", [&] {
+        Builder b;
+        auto& i = b.barycentric(0u);
+        auto& condition = b.laneCondition();
+        auto& kept = b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &b.constant(5u), &i});
+        auto& changed = b.emit(IrOpcode::IAdd32, IrType::U32, {&kept, &b.constant(1u)});
+        auto& rewritten = b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &changed, &b.constant(9u)});
+        const auto exported = b.ballotWords(condition);
+        b.exportWord(rewritten, &b.ownBit(*exported.first, *exported.second));
+        return b.lower() && !i.HasUses();
+    });
+
+    passed &= run("a kept barycentric exported under a mask wider than the keep condition is refused", [&] {
+        Builder b;
+        auto& i = b.barycentric(0u);
+        auto& condition = b.laneCondition();
+        auto& kept = b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &b.constant(5u), &i});
+        auto& changed = b.emit(IrOpcode::IAdd32, IrType::U32, {&kept, &b.constant(1u)});
+        const auto exported = b.ballotWords(b.emit(IrOpcode::IEqual32, IrType::U1, {&b.emit(IrOpcode::LaneId, IrType::U32, {}), &b.constant(4u)}));
+        b.exportWord(changed, &b.ownBit(*exported.first, *exported.second));
+        return !b.lower();
+    });
+
+    const auto readAcrossLanes = [&](bool everyRunningLane) {
+        Builder b;
+        auto& i = b.barycentric(0u);
+        const auto running = b.ballotWords(b.constant(1u, IrType::U1));
+        auto& condition = everyRunningLane ? b.ownBit(*running.first, *running.second) : b.laneCondition();
+        auto& kept = b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &b.constant(5u), &i});
+        auto& neighbour = b.emit(IrOpcode::DppMoveU32, IrType::U32, {&kept, &condition});
+        b.exportWord(b.emit(IrOpcode::ISub32, IrType::U32, {&neighbour, &kept}));
+        return b.lower() && !i.HasUses();
+    };
+
+    passed &= run(enabled ? "a barycentric kept outside every running lane and read across lanes into an export is zeroed" : "without the flag a barycentric read across lanes is refused", [&] {
+        return readAcrossLanes(true) == enabled;
+    });
+
+    passed &= run("a barycentric kept outside a narrower mask and read across lanes into an export is refused", [&] {
+        return !readAcrossLanes(false);
+    });
+
     return passed ? 0 : 1;
 }

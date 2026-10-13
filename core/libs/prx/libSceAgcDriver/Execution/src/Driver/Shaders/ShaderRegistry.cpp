@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -21,6 +22,9 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
+#include <string>
+#include <chrono>
 #include <pthread.h>
 #include <stdexcept>
 #include <thread>
@@ -127,8 +131,46 @@ bool RawGraphicsDrawn() {
 
 namespace {
 
+struct InFlightPreparation {
+    std::uint64_t address = 0;
+    std::chrono::steady_clock::time_point started;
+    std::string request;
+    bool reported = false;
+};
+
+std::mutex& InFlightMutex() {
+    static auto* mutex = new std::mutex();
+    return *mutex;
+}
+
+std::map<const PreparedShaders*, InFlightPreparation>& InFlightPreparations() {
+    static auto* preparations = new std::map<const PreparedShaders*, InFlightPreparation>();
+    return *preparations;
+}
+
+constexpr auto SlowPreparation = std::chrono::seconds(5);
+
+void ReportSlowPreparation(const PreparedShaders& prepared) {
+    std::string line;
+    {
+        std::lock_guard lock(InFlightMutex());
+        const auto found = InFlightPreparations().find(&prepared);
+        if (found == InFlightPreparations().end() || found->second.reported) return;
+        found->second.reported = true;
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - found->second.started).count();
+        char text[200];
+        std::snprintf(text, sizeof(text), "[shader] a guest thread waits for shader 0x%llx, whose registration preparation has run for %.1f s", static_cast<unsigned long long>(found->second.address), seconds);
+        line = std::string(text) + "\nRecompileRequest:\n" + found->second.request + "\n";
+    }
+    std::fwrite(line.data(), 1, line.size(), stderr);
+}
+
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
-    prepared.settled.wait(lock, [&] { return !prepared.pending; });
+    while (!prepared.settled.wait_for(lock, SlowPreparation, [&] { return !prepared.pending; })) {
+        lock.unlock();
+        ReportSlowPreparation(prepared);
+        lock.lock();
+    }
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
@@ -587,7 +629,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     case 1: stage = Stage::Fragment; programRegister = 0x008; resourceRegister = 0x00b; break;
     case 2: stage = Stage::Vertex; programRegister = 0x0c8; resourceRegister = 0x08b; firstUser = 8; break;
     case 4: stage = Stage::Mesh; programRegister = 0x0c8; resourceRegister = 0x08b; break;
-    case 5: return {};
+    case 5: case 8: return {};
     case 6: stage = Stage::Mesh; programRegister = 0x088; resourceRegister = 0x08b; break;
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default:
@@ -780,6 +822,11 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
         std::exception_ptr failure;
+        const auto started = std::chrono::steady_clock::now();
+        {
+            std::lock_guard lock(InFlightMutex());
+            InFlightPreparations()[snapshot->prepared.get()] = {snapshot->codeAddress, started, ShaderRecompiler::RequestSerializer{}.Serialize(*plan->request), false};
+        }
         try {
             entries = PrepareRegistered(*plan);
         } catch (const std::exception& error) {
@@ -788,6 +835,12 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         } catch (...) {
             failure = std::current_exception();
         }
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        {
+            std::lock_guard lock(InFlightMutex());
+            InFlightPreparations().erase(snapshot->prepared.get());
+        }
+        if (seconds >= std::chrono::duration<double>(SlowPreparation).count()) std::fprintf(stderr, "[shader] registration preparation of shader 0x%llx took %.1f s\n", static_cast<unsigned long long>(snapshot->codeAddress), seconds);
         auto& prepared = *snapshot->prepared;
         {
             std::lock_guard lock(prepared.mutex);

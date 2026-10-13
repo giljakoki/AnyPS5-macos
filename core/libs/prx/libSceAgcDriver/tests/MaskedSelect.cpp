@@ -8,6 +8,8 @@
 #include <functional>
 #include <initializer_list>
 #include <utility>
+#include <vector>
+#include <algorithm>
 
 using namespace ShaderRecompiler;
 
@@ -103,8 +105,8 @@ struct Builder {
         (void)emit(IrOpcode::ReferenceU32, IrType::Void, {&value});
     }
 
-    std::uint32_t eliminate() {
-        return MaskedSelectEliminator{}.Eliminate(program).removedSelects;
+    std::uint32_t eliminate(std::size_t walkBudget = MaskedSelectEliminator::DefaultWalkBudget) {
+        return MaskedSelectEliminator{walkBudget}.Eliminate(program).removedSelects;
     }
 };
 
@@ -197,6 +199,60 @@ int main() {
         auto& next = b.select(exec, b.add(written, 2u), old);
         b.keep(next);
         return b.eliminate() == 1u && removed(written) && !removed(next);
+    });
+
+    passed &= run("a program whose walk budget is spent keeps a select it could otherwise drop", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& next = b.select(exec, b.add(written, 2u), old);
+        b.keep(next);
+        return b.eliminate(0u) == 0u && !removed(written);
+    });
+
+    passed &= run("one walk budget covers every select of a program", [] {
+        const auto build = [](Builder& b) {
+            auto& exec = b.mask(16u);
+            for (std::uint32_t step = 0; step < 1000u; ++step) {
+                auto& old = b.add(b.lane(), step);
+                auto& written = b.select(exec, b.add(old, 1u), old);
+                b.keep(b.select(exec, b.add(written, 2u), old));
+            }
+        };
+        Builder full;
+        build(full);
+        Builder limited;
+        build(limited);
+        const auto all = full.eliminate();
+        const auto some = limited.eliminate(100u);
+        return all == 1000u && some != 0u && some <= 100u;
+    });
+
+    const auto rebuiltOwnWords = [](bool narrowed) {
+        Builder b;
+        const auto [firstLow, firstHigh] = b.ballotWords(b.mask(40u));
+        const auto [secondLow, secondHigh] = b.ballotWords(b.mask(24u));
+        auto& low = b.wordAnd(*firstLow, *secondLow);
+        auto& high = b.wordAnd(*firstHigh, *secondHigh);
+        auto& exec = b.threadBit(low, high);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [runLow, runHigh] = b.ballotWords(b.truth());
+        auto& readLow = narrowed ? b.wordAnd(low, *runLow) : *firstLow;
+        auto& readHigh = narrowed ? b.wordAnd(high, *runHigh) : *firstHigh;
+        auto& read = b.threadBit(readLow, readHigh);
+        b.keep(b.select(read, b.add(written, 2u), old));
+        static_cast<void>(b.eliminate());
+        return removed(written);
+    };
+
+    passed &= run("an exec rebuilt from the write's own mask words implies the write's exec", [&] {
+        return rebuiltOwnWords(true);
+    });
+
+    passed &= run("an exec rebuilt from one ballot of the write's mask words keeps the select", [&] {
+        return !rebuiltOwnWords(false);
     });
 
     passed &= run("a write read under a wider exec must keep its select", [] {

@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <string_view>
 #include <vector>
@@ -591,6 +592,30 @@ inline constexpr std::uint32_t PositionExportLayerViewportBits = (1u << 18u) | (
 [[nodiscard]] ShaderStage HostStage(const RecompileRequest& request);
 
 [[nodiscard]] MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request);
+
+inline constexpr std::uint32_t MeshPrepassUnwritten = 0xffffffffu;
+
+struct MeshPrepassSummary {
+    std::uint64_t slots = 0;
+    std::uint64_t triangles = 0;
+    std::uint64_t unwrittenTriangles = 0;
+    std::uint64_t degenerateTriangles = 0;
+    std::uint64_t liveTriangles = 0;
+    std::uint64_t indicesOutsideSlot = 0;
+    std::uint64_t cornersOnUnwrittenRecords = 0;
+    std::uint64_t referencedRecords = 0;
+    std::uint64_t nonFinitePositions = 0;
+    std::uint64_t positionsBehindEye = 0;
+    std::uint64_t trianglesInView = 0;
+    std::uint64_t emptySlots = 0;
+    std::array<float, 3> ndcMin{};
+    std::array<float, 3> ndcMax{};
+    bool ndcSeen = false;
+
+    [[nodiscard]] std::string Describe() const;
+};
+
+[[nodiscard]] MeshPrepassSummary SummarizeMeshPrepass(std::span<const std::uint32_t> records, std::span<const std::uint32_t> indices, std::uint64_t slots, std::uint32_t maxVertices, std::uint32_t maxPrimitives, std::uint32_t recordDwords);
 [[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const MeshProgramLayout& layout, const SpirvTarget& target, bool writeLayer);
 [[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target);
 

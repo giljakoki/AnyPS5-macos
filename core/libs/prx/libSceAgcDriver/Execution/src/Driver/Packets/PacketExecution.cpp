@@ -14,7 +14,12 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
+#include <cstdio>
+#include <map>
+#include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
@@ -276,6 +281,7 @@ void Driver::execute(const Submission& submission) {
                 }
                 if (!queued) request->GpuFinished();
             }
+        } else if ((opcode == 0x15 || opcode == 0x16) && ProgramSkipped(queue, true)) {
         } else if (opcode == 0x15 || opcode == 0x16) {
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
@@ -283,9 +289,15 @@ void Driver::execute(const Submission& submission) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
+            if (RecentWorkTraced()) NoteRecentWork(opcode == 0x15 ? "dispatch" : "indirect dispatch", submission.queue, submission.serial, cursor, queue, packet);
             const auto traceDispatchStart = std::chrono::steady_clock::now();
-            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            try {
+                if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
+                else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            } catch (const std::exception& error) {
+                if (!SkipFailedWork()) throw;
+                NoteSkippedWork(error.what(), "dispatch");
+            }
             if (Graphics::UploadTraceEnabled()) {
                 const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceDispatchStart).count();
                 if (ms >= 1.0) Graphics::UploadTrace("dispatch at DWORD %zu of serial=%llu took %.1f ms on the worker", cursor, static_cast<unsigned long long>(submission.serial), ms);
@@ -309,7 +321,9 @@ void Driver::execute(const Submission& submission) {
                     next += nextCount;
                 }
             }
+        } else if (drawPacket && ProgramSkipped(queue, false)) {
         } else if (drawPacket) {
+            if (RecentWorkTraced()) NoteRecentWork("draw", submission.queue, submission.serial, cursor, queue, packet);
             landPendingWaits(submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
@@ -342,7 +356,8 @@ void Driver::execute(const Submission& submission) {
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
-                    throw;
+                    if (!SkipFailedWork()) throw;
+                    NoteSkippedWork(error.what(), "draw");
                 }
             });
             finishDrawPacket(drawn);
@@ -365,6 +380,11 @@ void Driver::execute(const Submission& submission) {
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
         if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        if ((drawPacket || opcode == 0x15 || opcode == 0x16) && SerializeWork()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+        }
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();

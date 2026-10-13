@@ -1,7 +1,11 @@
 #include "Recompiler.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include <algorithm>
 #include <bit>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -93,6 +97,95 @@ MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request) {
     layout.vertexBytesPerGroup = static_cast<std::uint64_t>(layout.recordsPerGroup) * layout.recordDwords * 4u;
     layout.indexBytesPerGroup = static_cast<std::uint64_t>(layout.configuration.maxPrimitives) * 3u * 4u;
     return layout;
+}
+
+
+MeshPrepassSummary SummarizeMeshPrepass(std::span<const std::uint32_t> records, std::span<const std::uint32_t> indices, std::uint64_t slots, std::uint32_t maxVertices, std::uint32_t maxPrimitives, std::uint32_t recordDwords) {
+    if (recordDwords < 4u || maxVertices == 0u || maxPrimitives == 0u) throw std::runtime_error("mesh pre-pass summary: invalid slot shape");
+    if (records.size() < slots * maxVertices * recordDwords || indices.size() < slots * maxPrimitives * 3u) throw std::runtime_error("mesh pre-pass summary: the buffers are smaller than their slots");
+    MeshPrepassSummary summary;
+    summary.slots = slots;
+    std::vector<std::uint8_t> seen(slots * maxVertices, 0u);
+    const auto position = [&](std::uint64_t record) {
+        std::array<float, 4> value{};
+        std::memcpy(value.data(), records.data() + record * recordDwords, sizeof(value));
+        return value;
+    };
+    const auto written = [&](std::uint64_t record) {
+        const auto* words = records.data() + record * recordDwords;
+        return !(words[0] == MeshPrepassUnwritten && words[1] == MeshPrepassUnwritten && words[2] == MeshPrepassUnwritten && words[3] == MeshPrepassUnwritten);
+    };
+    for (std::uint64_t slot = 0; slot < slots; ++slot) {
+        const auto base = slot * maxVertices;
+        std::uint64_t live = 0;
+        for (std::uint32_t primitive = 0; primitive < maxPrimitives; ++primitive) {
+            const auto* corner = indices.data() + (slot * maxPrimitives + primitive) * 3u;
+            ++summary.triangles;
+            if (corner[0] == MeshPrepassUnwritten || corner[1] == MeshPrepassUnwritten || corner[2] == MeshPrepassUnwritten) {
+                ++summary.unwrittenTriangles;
+                continue;
+            }
+            if (corner[0] == corner[1] || corner[1] == corner[2] || corner[0] == corner[2]) {
+                ++summary.degenerateTriangles;
+                continue;
+            }
+            ++summary.liveTriangles;
+            ++live;
+            bool inside = true;
+            bool inView = false;
+            for (std::uint32_t index = 0; index < 3u; ++index) {
+                if (corner[index] < base || corner[index] >= base + maxVertices) {
+                    inside = false;
+                    ++summary.indicesOutsideSlot;
+                }
+            }
+            if (!inside) continue;
+            for (std::uint32_t index = 0; index < 3u; ++index) {
+                const auto record = static_cast<std::uint64_t>(corner[index]);
+                if (!written(record)) {
+                    ++summary.cornersOnUnwrittenRecords;
+                    continue;
+                }
+                const auto value = position(record);
+                const bool first = seen[record] == 0u;
+                seen[record] = 1u;
+                if (first) ++summary.referencedRecords;
+                if (!std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) || !std::isfinite(value[3])) {
+                    if (first) ++summary.nonFinitePositions;
+                    continue;
+                }
+                if (value[3] <= 0.0f) {
+                    if (first) ++summary.positionsBehindEye;
+                    continue;
+                }
+                const std::array<float, 3> ndc{value[0] / value[3], value[1] / value[3], value[2] / value[3]};
+                if (std::fabs(ndc[0]) <= 1.0f && std::fabs(ndc[1]) <= 1.0f) inView = true;
+                for (std::uint32_t axis = 0; axis < 3u; ++axis) {
+                    summary.ndcMin[axis] = summary.ndcSeen ? std::min(summary.ndcMin[axis], ndc[axis]) : ndc[axis];
+                    summary.ndcMax[axis] = summary.ndcSeen ? std::max(summary.ndcMax[axis], ndc[axis]) : ndc[axis];
+                }
+                summary.ndcSeen = true;
+            }
+            if (inView) ++summary.trianglesInView;
+        }
+        if (live == 0u) ++summary.emptySlots;
+    }
+    return summary;
+}
+
+std::string MeshPrepassSummary::Describe() const {
+    char text[640];
+    std::snprintf(text, sizeof(text),
+                  "%llu slots (%llu without a live triangle), %llu triangles: %llu live, %llu degenerate, %llu never written; %llu indices outside their slot, %llu corners on unwritten records; %llu records referenced: %llu non-finite, %llu with w <= 0; %llu live triangles reach the view",
+                  static_cast<unsigned long long>(slots), static_cast<unsigned long long>(emptySlots), static_cast<unsigned long long>(triangles), static_cast<unsigned long long>(liveTriangles), static_cast<unsigned long long>(degenerateTriangles),
+                  static_cast<unsigned long long>(unwrittenTriangles), static_cast<unsigned long long>(indicesOutsideSlot), static_cast<unsigned long long>(cornersOnUnwrittenRecords), static_cast<unsigned long long>(referencedRecords),
+                  static_cast<unsigned long long>(nonFinitePositions), static_cast<unsigned long long>(positionsBehindEye), static_cast<unsigned long long>(trianglesInView));
+    std::string result = text;
+    if (ndcSeen) {
+        std::snprintf(text, sizeof(text), "; NDC x [%g, %g] y [%g, %g] z [%g, %g]", ndcMin[0], ndcMax[0], ndcMin[1], ndcMax[1], ndcMin[2], ndcMax[2]);
+        result += text;
+    }
+    return result;
 }
 
 }

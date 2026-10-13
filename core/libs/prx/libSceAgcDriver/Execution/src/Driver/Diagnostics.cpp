@@ -1,8 +1,204 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <cstring>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <exception>
+#include <vector>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+struct RecentWork {
+    const char* kind = nullptr;
+    std::uint32_t queue = 0;
+    std::uint64_t serial = 0;
+    std::size_t offset = 0;
+    std::uint64_t first = 0;
+    std::uint64_t pixel = 0;
+    std::uint64_t compute = 0;
+    std::uint64_t color = 0;
+    std::uint64_t index = 0;
+    std::array<std::uint32_t, 6> words{};
+    std::array<std::uint64_t, 8> buffers{};
+    std::array<std::array<std::uint32_t, 4>, 8> heads{};
+    std::chrono::steady_clock::time_point at;
+};
+
+std::size_t RecentWorkCapacity() {
+    static const std::size_t capacity = [] {
+        const char* value = std::getenv("APS5_TRACE_RECENT_WORK");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{0};
+    }();
+    return capacity;
+}
+
+std::mutex& RecentWorkMutex() {
+    static auto* mutex = new std::mutex();
+    return *mutex;
+}
+
+std::vector<RecentWork>& RecentWorkRing() {
+    static auto* ring = new std::vector<RecentWork>();
+    return *ring;
+}
+
+std::uint64_t& RecentWorkCount() {
+    static std::uint64_t count = 0;
+    return count;
+}
+
+std::uint64_t ProgramAt(const Registers& registers, std::uint32_t low) {
+    const auto lo = registers.find(low);
+    const auto hi = registers.find(low + 1u);
+    if (lo == registers.end()) return 0;
+    return (static_cast<std::uint64_t>(lo->second) << 8u) | (hi == registers.end() ? 0u : static_cast<std::uint64_t>(hi->second & 0xffu) << 40u);
+}
+
+std::terminate_handler& PreviousTerminate() {
+    static std::terminate_handler previous = nullptr;
+    return previous;
+}
+
+}
+
+bool SerializeWork() {
+    static const bool serialize = [] {
+        const char* value = std::getenv("APS5_SERIALIZE_WORK");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return serialize;
+}
+
+bool ProgramSkipped(const QueueState& state, bool compute) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> result;
+        const char* value = std::getenv("APS5_SKIP_PROGRAMS");
+        if (value == nullptr) return result;
+        for (const char* cursor = value; *cursor != '\0';) {
+            char* end = nullptr;
+            const auto address = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            result.push_back(address);
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        return result;
+    }();
+    if (programs.empty()) return false;
+    const std::array<std::uint64_t, 3> bound = compute ? std::array<std::uint64_t, 3>{ProgramAt(state.shader, 0x20c), 0, 0} : std::array<std::uint64_t, 3>{ProgramAt(state.shader, 0xc8), ProgramAt(state.shader, 0x08), ProgramAt(state.shader, 0x88)};
+    for (const auto address : bound) {
+        if (address == 0 || std::find(programs.begin(), programs.end(), address) == programs.end()) continue;
+        static std::mutex mutex;
+        static std::vector<std::uint64_t> reported;
+        std::lock_guard lock(mutex);
+        if (std::find(reported.begin(), reported.end(), address) == reported.end()) {
+            reported.push_back(address);
+            std::fprintf(stderr, "[draw] APS5_SKIP_PROGRAMS drops every %s that runs program 0x%llx\n", compute ? "dispatch" : "draw", static_cast<unsigned long long>(address));
+        }
+        return true;
+    }
+    return false;
+}
+
+bool RecentWorkTraced() {
+    return RecentWorkCapacity() != 0;
+}
+
+void NoteRecentWork(const char* kind, std::uint32_t queue, std::uint64_t serial, std::size_t offset, const QueueState& state, std::span<const std::uint32_t> packet) {
+    const auto capacity = RecentWorkCapacity();
+    if (capacity == 0) return;
+    RecentWork work{kind, queue, serial, offset};
+    work.first = ProgramAt(state.shader, 0xc8);
+    work.pixel = ProgramAt(state.shader, 0x08);
+    work.compute = ProgramAt(state.shader, 0x20c);
+    const auto colorLow = state.context.find(0x318);
+    const auto colorHigh = state.context.find(0x390);
+    work.color = colorLow == state.context.end() ? 0 : (static_cast<std::uint64_t>(colorLow->second) << 8u) | (colorHigh == state.context.end() ? 0u : static_cast<std::uint64_t>(colorHigh->second) << 40u);
+    work.index = state.indexBase;
+    for (std::size_t i = 0; i < work.words.size() && i < packet.size(); ++i) work.words[i] = packet[i];
+    const std::uint32_t userBase = std::string_view(kind) == "draw" ? 0x0cu : 0x240u;
+    for (std::uint32_t group = 0; group < work.buffers.size(); ++group) {
+        const auto low = state.shader.find(userBase + group * 4u);
+        const auto high = state.shader.find(userBase + group * 4u + 1u);
+        if (low == state.shader.end() || high == state.shader.end()) continue;
+        const auto address = static_cast<std::uint64_t>(low->second) | (static_cast<std::uint64_t>(high->second & 0xffffu) << 32u);
+        if (address == 0 || (address & 3u) != 0) continue;
+        const auto* pointer = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+        if (!GuestMemory::Accessible(pointer, sizeof(work.heads[group]))) continue;
+        work.buffers[group] = address;
+        std::memcpy(work.heads[group].data(), pointer, sizeof(work.heads[group]));
+    }
+    work.at = std::chrono::steady_clock::now();
+    std::lock_guard lock(RecentWorkMutex());
+    auto& ring = RecentWorkRing();
+    if (ring.size() < capacity) ring.push_back(work);
+    else ring[RecentWorkCount() % capacity] = work;
+    ++RecentWorkCount();
+}
+
+void DumpRecentWork(const char* why) {
+    const auto capacity = RecentWorkCapacity();
+    if (capacity == 0) return;
+    std::unique_lock lock(RecentWorkMutex(), std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto& ring = RecentWorkRing();
+    const auto count = RecentWorkCount();
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[recent-work] %s: the last %zu of %llu draws and dispatches, oldest first\n", why, ring.size(), static_cast<unsigned long long>(count));
+    for (std::size_t n = 0; n < ring.size(); ++n) {
+        const auto& work = ring[ring.size() < capacity ? n : (count + n) % capacity];
+        std::fprintf(stderr, "[recent-work] -%.1f ms queue 0x%x serial %llu dword %zu %s first 0x%llx pixel 0x%llx compute 0x%llx color 0x%llx index 0x%llx words %08x %08x %08x %08x %08x %08x\n",
+                     std::chrono::duration<double, std::milli>(now - work.at).count(), work.queue, static_cast<unsigned long long>(work.serial), work.offset, work.kind, static_cast<unsigned long long>(work.first), static_cast<unsigned long long>(work.pixel),
+                     static_cast<unsigned long long>(work.compute), static_cast<unsigned long long>(work.color), static_cast<unsigned long long>(work.index), work.words[0], work.words[1], work.words[2], work.words[3], work.words[4], work.words[5]);
+        for (std::size_t group = 0; group < work.buffers.size(); ++group) {
+            if (work.buffers[group] == 0) continue;
+            std::fprintf(stderr, "[recent-work]     user data %zu points at 0x%llx, which the CPU sees as %08x %08x %08x %08x\n", group * 4u, static_cast<unsigned long long>(work.buffers[group]), work.heads[group][0], work.heads[group][1], work.heads[group][2], work.heads[group][3]);
+        }
+    }
+}
+
+void InstallRecentWorkDump() {
+    if (RecentWorkCapacity() == 0 || PreviousTerminate() != nullptr) return;
+    PreviousTerminate() = std::set_terminate([] {
+        DumpRecentWork("terminating");
+        if (const auto previous = PreviousTerminate()) previous();
+        std::abort();
+    });
+}
+
+bool SkipFailedWork() {
+    static const bool skip = [] {
+        const char* value = std::getenv("APS5_SKIP_FAILED_DRAWS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return skip;
+}
+
+void NoteSkippedWork(const char* reason, const char* kind) {
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> skipped;
+    static std::uint64_t total = 0;
+    std::string key = std::string(kind) + ": " + reason;
+    if (const auto request = key.find("\nRecompileRequest:"); request != std::string::npos) key.resize(request);
+    std::lock_guard lock(mutex);
+    ++total;
+    const auto count = ++skipped[key];
+    if (count == 1u) {
+        std::fprintf(stderr, "[draw] skipped a %s the driver cannot run (APS5_SKIP_FAILED_DRAWS, %llu skipped so far): %s\n", kind, static_cast<unsigned long long>(total), reason);
+    } else if ((count & (count - 1u)) == 0u) {
+        std::fprintf(stderr, "[draw] skipped %llu packets for %.300s\n", static_cast<unsigned long long>(count), key.c_str());
+    }
+}
 
 double TraceMs() {
     static const auto origin = std::chrono::steady_clock::now();

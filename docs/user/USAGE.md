@@ -149,7 +149,7 @@ GPU results in storage images and render targets stay on the GPU until something
 
 ### Barycentric registers reused as temporaries
 
-A pixel shader that reuses its barycentric registers as temporaries in lanes a branch leaves inactive normally needs a geometry shader on devices without `VK_KHR_fragment_shader_barycentric`, which MoltenVK lacks, and stops with `Barycentric geometry SPIR-V: geometry shaders are unavailable`. `APS5_BARYCENTRIC_MASKED_ZERO=1` replaces those leftover barycentric values with 0 when they only reach inactive lanes, sample coordinates or arithmetic whose result those lanes never export; the only visible effect is the mip level of some pixels on the edge of partially covered quads ([TechnicalDebt](../dev/TechnicalDebt.md)). Any other value leaves it off.
+A pixel shader that reuses its barycentric registers as temporaries in lanes a branch leaves inactive normally needs a geometry shader on devices without `VK_KHR_fragment_shader_barycentric`, which MoltenVK lacks, and stops with `Barycentric geometry SPIR-V: geometry shaders are unavailable`. `APS5_BARYCENTRIC_MASKED_ZERO=1` replaces those leftover barycentric values with 0 when they only reach inactive lanes, sample coordinates, arithmetic whose result those lanes never export, or cross-lane moves out of lanes that are not running; the only visible effect is the mip level of some pixels on the edge of partially covered quads ([TechnicalDebt](../dev/TechnicalDebt.md)). Any other value leaves it off.
 
 ### Slowing a title's loader
 
@@ -178,6 +178,18 @@ A device whose `Selected GPU` log line lacks the vertex bit in `stages=` (Molten
 ### Geometry programs on devices without mesh shaders
 
 Titles draw geometry-shader and other NGG programs through the mesh path, which needs `VK_EXT_mesh_shader`. MoltenVK has no mesh shaders, so such a draw stops the title with `device does not support mesh shaders`, or earlier with `needs subgroup operations` when the program uses wave-wide operations. `APS5_MESH_EMULATION=1` runs these programs as a compute pre-pass instead: each draw records the program as a compute dispatch that writes its vertices and triangles into scratch buffers, then draws them with a generated vertex shader and the title's pixel shader under the draw's own render state ([GeometryEmulation](../dev/GeometryEmulation.md)). It is ignored on devices with mesh shaders. Every emulated draw ends the open render pass and starts a new one, which costs a store and reload of the color and depth targets on tile-based GPUs. Indirect mesh draws whose arguments are only on the GPU and indexed strips or fans with primitive restart still stop the title with a message naming `APS5_MESH_EMULATION`. Any other value leaves the emulation off.
+
+`APS5_SKIP_FAILED_DRAWS=1` drops a draw or dispatch the driver cannot run (it throws while decoding the packet, preparing its shaders or building its pipeline), and ignores a failed static shader ABI resolution a guest thread requests, instead of stopping the title, and logs `[draw] skipped a draw the driver cannot run` (or `a dispatch`) with the reason once per reason; the frame then lacks that geometry ([TechnicalDebt](../dev/TechnicalDebt.md)). Any other value leaves it off.
+
+The driver prints `[env] APS5 settings in effect: ...` once its Vulkan device is ready, listing every `APS5_` variable the title process received, so a launcher that drops the environment shows up in the log.
+
+Debug aid: `APS5_SKIP_PROGRAMS=<hex>[,<hex>...]` drops every draw whose vertex, geometry or pixel program, and every dispatch whose compute program, starts at one of the listed addresses (as printed by `[recent-work]`), logging each address once; it bisects which program breaks a frame or the device, and the frame then lacks that work.
+
+Debug aid: `APS5_SERIALIZE_WORK=1` waits for the GPU after every draw and dispatch packet, so a GPU fault surfaces right after the packet that caused it (combine it with `APS5_TRACE_RECENT_WORK`, whose last line is then that packet). It is very slow.
+
+Debug aid: `APS5_TRACE_RECENT_WORK=<n>` keeps the last `n` draw and dispatch packets (queue, submission, program addresses, colour target, index base, the first packet words and, for each user-data pair that points at readable guest memory, the first four dwords the CPU sees there) and prints them as `[recent-work]` lines when the process terminates on an uncaught error, such as a lost Vulkan device, so the work submitted just before a GPU fault is known.
+
+Debug aid: `APS5_VERIFY_MESH_PREPASS=<n>` checks what the pre-pass writes for the first `n` emulated draws. It fills the scratch buffers with a sentinel, waits for the pre-pass, and prints one `[mesh-verify]` line per draw: slots without a live triangle, live, degenerate and never-written triangles, indices outside their group slot, corners on records the program never wrote, non-finite positions or w <= 0, how many live triangles reach the view and the NDC range of the referenced positions. Each checked draw drains the GPU, so keep `n` small.
 
 ### Mixed-precision arithmetic on devices without 64-bit floats
 

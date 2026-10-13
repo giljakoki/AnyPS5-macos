@@ -564,6 +564,7 @@ public:
 
     void Reset(const IrValue* writeMask, bool acrossLoops) {
         mask = writeMask;
+        maskWords = threadBit(writeMask, waveSize);
         loops = acrossLoops;
         always = alwaysTrue(writeMask, waveSize);
         running = always || everyRunningLane(writeMask, waveSize);
@@ -651,6 +652,7 @@ private:
 
     bool wordsImply(const IrValue* low, const IrValue* high, std::uint32_t depth) {
         if (isImmediate(low, 0u) && (waveSize == 32u || isImmediate(high, 0u))) return true;
+        if (maskWords && low == maskWords->low && (waveSize == 32u || high == maskWords->high)) return true;
         const ImplicationKey key{low, high};
         if (const auto known = lookup(key)) return *known;
         if (depth > ImplicationDepthLimit || work == 0) return false;
@@ -690,6 +692,7 @@ private:
     std::uint32_t waveSize;
     std::size_t& work;
     const IrValue* mask = nullptr;
+    std::optional<ThreadBit> maskWords;
     bool loops = false;
     bool always = false;
     bool running = false;
@@ -748,12 +751,19 @@ std::size_t walkLimit(const IrProgram& program) {
 
 class MaskedLaneWalk {
 public:
-    MaskedLaneWalk(const IrProgram& program, const std::vector<Region>& regions) : program(program), regions(regions), uniform(uniformEntryBlocks(program)), limit(walkLimit(program)), implications(regions, uniform, program.WaveSize(), work) {}
+    MaskedLaneWalk(const IrProgram& program, const std::vector<Region>& regions, std::size_t budget) : program(program), regions(regions), uniform(uniformEntryBlocks(program)), limit(walkLimit(program)), budget(budget), implications(regions, uniform, program.WaveSize(), work) {}
 
     bool UnobservedWhereMasked(const IrValue& select, const OwnLaneMask& own) {
         const IrValue* mask = own.mask;
         const bool acrossLoops = mask->HasImmediate() || regionOf(regions, mask->Parent()) == Region::Once;
-        work = limit;
+        if (budget == 0) return false;
+        work = std::min(limit, budget);
+        struct Spend {
+            std::size_t& budget;
+            const std::size_t& work;
+            std::size_t granted;
+            ~Spend() { budget -= granted - work; }
+        } spend{budget, work, work};
         implications.Reset(mask, acrossLoops);
         const bool running = implications.HoldsForRunningLanes();
         const bool quadMasked = program.Resources().stage == IrShaderStage::Pixel && (running || wholeQuadSource(mask, program.WaveSize()) != nullptr);
@@ -804,6 +814,7 @@ private:
     BlockSet uniform;
     std::size_t limit;
     std::size_t work = 0;
+    std::size_t budget;
     Implications implications;
     std::vector<const IrValue*> pending;
     std::vector<std::uint32_t> visits;
@@ -1065,7 +1076,7 @@ bool PhiIncomingUnobserved(const IrProgram& program, const IrValue& phi, std::si
 MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& program) const {
     MaskedSelectEliminationStats stats;
     const auto regions = blockRegions(program);
-    MaskedLaneWalk walk(program, regions);
+    MaskedLaneWalk walk(program, regions, walkBudget);
     bool changed = true;
     while (changed) {
         changed = false;

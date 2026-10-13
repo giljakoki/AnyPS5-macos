@@ -63,6 +63,17 @@
 #include <vector>
 #include <utility>
 
+#ifdef _WIN32
+static char** HostEnvironment() {
+    return _environ;
+}
+#else
+extern char** environ;
+static char** HostEnvironment() {
+    return environ;
+}
+#endif
+
 namespace AgcDriver {
 namespace {
 
@@ -1564,6 +1575,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (compileOnly) return;
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
+    {
+        std::string settings;
+        for (char** entry = HostEnvironment(); entry != nullptr && *entry != nullptr; ++entry) {
+            if (std::string_view(*entry).starts_with("APS5_")) settings += std::string(settings.empty() ? "" : " ") + *entry;
+        }
+        std::fprintf(stderr, "[env] APS5 settings in effect: %s\n", settings.empty() ? "none" : settings.c_str());
+    }
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
@@ -3761,7 +3779,26 @@ void VulkanDevice::DrawMeshEmulated(const Graphics::State& graphics, const Pm4::
     require(prepass.pushConstants.size() <= ShaderRecompiler::MeshDrawPushOffsetBytes, "the mesh pre-pass push data overlaps the mesh draw words");
     prepass.pushConstants.resize(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes);
     std::memcpy(prepass.pushConstants.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, drawWords.data(), sizeof(drawWords));
+    static const int verifyLimit = [] {
+        const char* value = std::getenv("APS5_VERIFY_MESH_PREPASS");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    static std::atomic<int> verified{0};
+    const bool verify = verifyLimit > 0 && verified.fetch_add(1, std::memory_order_relaxed) < verifyLimit;
+    if (verify) {
+        std::fill(records->Bytes().begin(), records->Bytes().end(), std::byte{0xff});
+        std::fill(indices->Bytes().begin(), indices->Bytes().end(), std::byte{0xff});
+    }
     Dispatch(prepass, groups, draw.instanceCount, 1, snapshots);
+    if (verify) {
+        std::fprintf(stderr, "[mesh-verify] waiting for the pre-pass of program variant 0x%llx (%u indices, %u groups x %u instances, index buffer 0x%llx, %s)\n", static_cast<unsigned long long>(prepassProgram.PipelineVariantId()), draw.indexCount, groups, draw.instanceCount,
+                     static_cast<unsigned long long>(draw.indexAddress), draw.indexed ? "indexed" : "not indexed");
+        WaitIdle();
+        const auto summary = ShaderRecompiler::SummarizeMeshPrepass(std::span(reinterpret_cast<const std::uint32_t*>(records->Bytes().data()), records->Bytes().size() / sizeof(std::uint32_t)),
+                                                                    std::span(reinterpret_cast<const std::uint32_t*>(indices->Bytes().data()), indices->Bytes().size() / sizeof(std::uint32_t)), slots, mesh.maxVertices, mesh.maxPrimitives, prepassProgram.meshRecordDwords);
+        std::fprintf(stderr, "[mesh-verify] program variant 0x%llx, %u indices, %u groups x %u instances, %u vertices and %u primitives per group, %u-dword records: %s\n", static_cast<unsigned long long>(prepassProgram.PipelineVariantId()), draw.indexCount, groups, draw.instanceCount, mesh.maxVertices,
+                     mesh.maxPrimitives, prepassProgram.meshRecordDwords, summary.Describe().c_str());
+    }
 
     auto vertex = *passThrough;
     vertex.pushConstants.assign(ShaderRecompiler::MeshDrawPushBytes, std::byte{0});

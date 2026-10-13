@@ -249,6 +249,7 @@ function(add_shader_recompiler target runtimeTarget)
             ShaderCacheDirectory
             SrgbDecodeBit
             SrgbUnormFormat
+            SummarizeMeshPrepass
             ThreadOwned
             UnresolvableSwappcTarget
             ValidateAndOptimizeSpirv
