@@ -385,10 +385,12 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(!AgcDriver::GuestMemory::Watched(address, BlockBytes), "the imported test image is still write-watched");
     AgcDriver::GuestMemory::BumpCollectEpoch();
     const auto version = image->Version();
+    const auto provedBefore = StorageTexture::RefreshesProved();
     for (int repeat = 0; repeat < 3; ++repeat) {
         Require(image->Refresh() && image->Version() == version, "an unchanged untracked image was uploaded again");
         Require(Count(block, BlockBytes, 0x55) == BlockBytes, "refresh wrote GPU results into unchanged guest memory");
     }
+    if (std::getenv("APS5_NO_UNTRACKED_REFRESH_PROOF") == nullptr && std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") == nullptr) Require(StorageTexture::RefreshesProved() - provedBefore >= 2, "repeated refreshes of an unchanged untracked image within an epoch were not answered by its refresh proof");
     std::memset(block + SurfaceBytes, 0x33, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     if (std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") == nullptr) {

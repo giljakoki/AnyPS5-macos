@@ -88,6 +88,7 @@ std::atomic<std::uint64_t> writeBackProofsKept{0};
 std::atomic<std::uint64_t> writeBackWholeBaselines{0};
 std::atomic<std::uint64_t> filledImageClears{0};
 std::atomic<std::uint64_t> maskedFlushes{0};
+std::atomic<std::uint64_t> untrackedRefreshesProved{0};
 std::atomic<std::uint64_t> filledImagesStale{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
@@ -140,8 +141,8 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; untracked compares %llu, answered by a proof %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(untrackedCompares), take(untrackedProofHits));
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; %llu upload baselines copied on the GPU, %llu refreshes answered while one was in flight, %llu taken behind a write-back (%llu keeping the match), %llu whole-surface copies behind a write-back without one, %llu images cleared under a GPU fill (%llu marked stale instead), %llu compares that waited only for writes outside copies in flight, %llu reaped for a target the CPU writes; untracked compares %llu, answered by a proof %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(gpuBaselines), take(baselineWaits), take(writeBackBaselines), take(writeBackProofsKept), take(writeBackWholeBaselines), take(filledImageClears), take(filledImagesStale), take(maskedFlushes), take(baselineSyncs), take(untrackedCompares), take(untrackedProofHits));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; untracked compares %llu, answered by a proof %llu (%llu whole refreshes)\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(untrackedCompares), take(untrackedProofHits), take(untrackedRefreshesProved));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; %llu upload baselines copied on the GPU, %llu refreshes answered while one was in flight, %llu taken behind a write-back (%llu keeping the match), %llu whole-surface copies behind a write-back without one, %llu images cleared under a GPU fill (%llu marked stale instead), %llu compares that waited only for writes outside copies in flight, %llu reaped for a target the CPU writes; untracked compares %llu, answered by a proof %llu (%llu whole refreshes)\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(gpuBaselines), take(baselineWaits), take(writeBackBaselines), take(writeBackProofsKept), take(writeBackWholeBaselines), take(filledImageClears), take(filledImagesStale), take(maskedFlushes), take(baselineSyncs), take(untrackedCompares), take(untrackedProofHits), take(untrackedRefreshesProved));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1960,7 +1961,33 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
+bool StorageTexture::untrackedProofHolds() const {
+    static const bool exact = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
+    if (exact || !untrackedProof.has_value()) return false;
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto forget = GuestMemory::ForgetSerial();
+    const bool epochHolds = epoch != 0 && (!cpuWriter || untrackedProof->epoch == epoch);
+    return epochHolds && untrackedProof->present == Recorder::Presents() && std::chrono::steady_clock::now() - untrackedProof->at < std::chrono::milliseconds(500) && untrackedProof->forget == forget && (forget & 1u) == 0 && !GuestMemory::DriverWroteOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), untrackedProof->writes, true);
+}
+
+bool StorageTexture::untrackedRefreshProved() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_REFRESH_PROOF") != nullptr;
+    if (disabled || !refreshProof.untracked || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    if (uploadedKeys != refreshProof.keys || descriptor.dccAddress != 0 || !originalValid || !pendingBaselines.empty() || std::any_of(imageStale.begin(), imageStale.end(), [](bool stale) { return stale; })) return false;
+    if (!untrackedProofHolds()) return false;
+    const auto serial = PendingSerial();
+    if (serial != refreshProof.pendingSerial) {
+        if (otherPendingOverlaps()) return false;
+        refreshProof.pendingSerial = serial;
+    }
+    untrackedProof->writes = GuestMemory::DriverWriteSerial();
+    untrackedProofHits.fetch_add(1, std::memory_order_relaxed);
+    untrackedRefreshesProved.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool StorageTexture::refreshProved() {
+    if (refreshProof.untracked) return untrackedRefreshProved();
     if (refreshProof.generation == 0) return false;
     if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto bytes = static_cast<std::size_t>(guestBytes);
@@ -1985,6 +2012,12 @@ bool StorageTexture::refreshProved() {
 
 void StorageTexture::takeRefreshProof(bool aliased) {
     refreshProof = {};
+    if (!aliased && generation == 0 && descriptor.dccAddress == 0 && GuestMemory::GpuMutex().HeldByThisThread() && untrackedProofHolds() && !otherPendingOverlaps()) {
+        refreshProof.untracked = true;
+        refreshProof.pendingSerial = PendingSerial();
+        refreshProof.keys = uploadedKeys;
+        return;
+    }
     if (aliased || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
     const auto serial = PendingSerial();

@@ -516,8 +516,11 @@ private:
         std::uint64_t pendingSerial = 0;
         std::uint64_t keyGeneration = 0;
         DccKeys keys = DccKeys::Uncompressed;
+        bool untracked = false;
     };
     RefreshProof refreshProof;
+    bool untrackedProofHolds() const;
+    bool untrackedRefreshProved();
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

@@ -4760,6 +4760,27 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
         Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
         Require(draw() == stored, "the remade imported snapshot is not the cache's");
     }
+    if (refreshed && !watched && std::getenv("APS5_NO_UNTRACKED_FAST_REVALIDATE") == nullptr && std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") == nullptr) {
+        order();
+        recorder.Sync();
+        ShaderResources resources(context, compiled);
+        Require(resources.Reusable(), "a set sampling an imported snapshot is not reusable");
+        const auto prove = [&](const char* what, ShaderResources::ProofPath expected) {
+            ShaderResources::ProofReport report{};
+            Require(resources.Revalidate(std::span(&compiled, 1), &report), std::string("an unchanged imported snapshot failed its proof ") + what);
+            Require(report.path == expected, std::string("an imported snapshot took the wrong proof path ") + what);
+        };
+        prove("within the present it was built in", ShaderResources::ProofPath::Fast);
+        prove("on a second use within the present", ShaderResources::ProofPath::Fast);
+        order();
+        prove("after the next present", ShaderResources::ProofPath::Full);
+        prove("after the walk at the new present", ShaderResources::ProofPath::Fast);
+        AgcDriver::GuestMemory::MarkWritten(address + bytes / 2, 4);
+        prove("after a driver write over the surface", ShaderResources::ProofPath::Full);
+        prove("after the walk that followed the driver write", ShaderResources::ProofPath::Fast);
+        recorder.Sync();
+        std::cout << "imported snapshot proved by the fast path within a present: ok\n";
+    }
 }
 
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)

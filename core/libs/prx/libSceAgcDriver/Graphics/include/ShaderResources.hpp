@@ -480,6 +480,14 @@ private:
     bool reusable = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
+    struct UntrackedValidation {
+        std::uint64_t present = 0;
+        std::chrono::steady_clock::time_point at{};
+        std::uint64_t forget = 1;
+        std::uint64_t writes = 0;
+        bool usable = false;
+    };
+    UntrackedValidation untrackedValidation;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,
     // no image other than the object's own sources has results pending over its surfaces and
