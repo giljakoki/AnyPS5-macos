@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -24,6 +25,8 @@ namespace AgcDriver::Graphics {
 
 class ResidentColor;
 class CommandBatch;
+class Buffer;
+class Recorder;
 class StorageTexture;
 struct HostImport;
 
@@ -342,6 +345,8 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    bool recordBaseline(const HostImport& import, const std::vector<bool>* layers, bool keepProof = false);
+    bool landBaseline();
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -402,7 +407,8 @@ private:
     // The write-back retiles into the import's unit shadow where a slab takes the piece
     // (`shadowed` receives those guest ranges, `imported` the pieces written to the import).
     std::uint64_t uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard = false);
-    std::uint64_t writeBackWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported);
+    struct PendingBaseline;
+    std::uint64_t writeBackWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, PendingBaseline* baseline = nullptr);
     // Per-layer validity (thin array surfaces whose layers are 64 KiB-aligned guest slices; every
     // other surface is one tracked layer): a layer's generation is the write generation its guest
     // bytes were last known to match the image at, and a pending layer holds results (a clear, a
@@ -487,6 +493,14 @@ private:
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    struct UntrackedProof {
+        std::uint64_t present = 0;
+        std::uint64_t forget = 0;
+        std::uint64_t writes = 0;
+        std::chrono::steady_clock::time_point at{};
+    };
+    mutable std::optional<UntrackedProof> untrackedProof;
+    void originalChanged() const;
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
@@ -549,6 +563,19 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    struct PendingBaseline {
+        std::shared_ptr<Buffer> bytes;
+        const Recorder* recorder = nullptr;
+        std::uint64_t serial = 0;
+        std::uint64_t stores = 0;
+        std::vector<bool> layers;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    std::deque<PendingBaseline> pendingBaselines;
+    bool baselineWasValid = false;
+    bool baselineComplete = false;
+    bool baselineKeepsProof = false;
+    void startBaseline(bool keepProof);
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

@@ -15,6 +15,7 @@ namespace AgcDriver::GuestMemory {
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
+std::uint64_t PageRegionCacheHits();
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while
 // the guest commits their pages on demand, so a binding can cover reserved but uncommitted pages.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable = false);
@@ -103,9 +104,9 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
-void NoteDriverWrite(std::uint64_t address, std::size_t bytes);
+void NoteDriverWrite(std::uint64_t address, std::size_t bytes, bool recorded = false);
 std::uint64_t DriverWriteSerial();
-bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t since);
+bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool storesOnly = false);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label

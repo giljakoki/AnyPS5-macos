@@ -283,7 +283,10 @@ public:
     bool NullDescriptors() const { return nullDescriptors; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
-    void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
+    void WaitQueue() const {
+        const auto access = QueueSubmitter::Access(context.queue);
+        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+    }
 
 private:
     template<typename TFunction>
@@ -4334,6 +4337,47 @@ std::array<std::uint32_t, 8> linearTextureWords(std::uint64_t address, std::uint
     return words;
 }
 
+void submitThreadOrderTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    recorder.Sync();
+    constexpr std::size_t bytes = 4096;
+    constexpr int rounds = 16;
+    const auto handedBefore = QueueSubmitter::Submitted();
+    for (int round = 0; round < rounds; ++round) {
+        auto source = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(source->Bytes().data(), 0, bytes);
+        const auto pattern = 0x01010101u * static_cast<std::uint32_t>(round + 1);
+        const auto commands = recorder.Commands();
+        recorder.Keep(source);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, source->Handle(), 0, bytes, pattern);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        const auto before = recorder.Submissions();
+        recorder.Submit();
+        Require(recorder.Submissions() == before + 1 && !recorder.Recording(), "a submitted batch was not counted when it was handed to the queue");
+        Buffer destination(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(destination.Bytes().data(), 0, bytes);
+        CommandBatch copy(context);
+        const VkBufferCopy region{0, 0, bytes};
+        RecordMemoryBarrier(context, copy.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(copy.Handle(), source->Handle(), destination.Handle(), 1, &region);
+        RecordMemoryBarrier(context, copy.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        copy.SubmitAndWait();
+        std::uint32_t first = 0;
+        std::memcpy(&first, destination.Bytes().data(), sizeof(first));
+        Require(first == pattern, "a direct submission ran before a recorded batch handed to the submit thread earlier");
+        if (round % 4 == 3) {
+            const auto serial = recorder.SubmitAndEpoch();
+            if (recorder.HasTimeline() && serial != 0) recorder.WaitSerial(serial);
+            std::uint32_t filled = 0;
+            std::memcpy(&filled, source->Bytes().data(), sizeof(filled));
+            Require(filled == pattern, "a serial wait returned before its batch ran");
+        }
+    }
+    recorder.Sync();
+    std::cout << "submit thread ordering: " << rounds << " recorded batches, " << (QueueSubmitter::Submitted() - handedBefore) << " submitted by the submit thread" << (QueueSubmitter::Enabled() ? "" : " (disabled)") << "\n";
+    Require(!QueueSubmitter::Enabled() || QueueSubmitter::Submitted() - handedBefore >= static_cast<std::uint64_t>(rounds), "recorded batches did not go through the submit thread");
+}
+
 void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     TextureDetiler detiler(base);
@@ -4600,6 +4644,14 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
             Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
             Require(SampledSnapshotTotals().refreshes - refreshesBeforeSecond == 1 && SampledSnapshotTotals().unchanged == unchangedBeforeSecond, "a changed digest did not refresh an imported snapshot exactly once");
             Require(readBlock(stored, bytes / 2) == 0x55, "a CPU store detected by the hash was not visible");
+            for (const std::uint8_t value : {std::uint8_t{0x66}, std::uint8_t{0x67}, std::uint8_t{0x68}}) {
+                const auto refreshesBeforeFrame = SampledSnapshotTotals().refreshes;
+                static_cast<volatile std::uint8_t*>(block)[bytes / 4] = value;
+                order();
+                Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+                Require(SampledSnapshotTotals().refreshes == refreshesBeforeFrame + 1, "the first draw after a present did not refresh an imported atlas that changed recently");
+                Require(readBlock(stored, bytes / 4) == value, "the first draw after a present sampled stale bytes of an imported atlas that changed recently");
+            }
         }
     } else {
         Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
@@ -5632,6 +5684,7 @@ int main(int argc, char** argv) {
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
+        submitThreadOrderTests(device, recorder);
         imageMemoTests(device, recorder);
         importedSnapshotProofTests(device, recorder);
         minLodTests(device, recorder);

@@ -3,6 +3,7 @@
 #include "../include/WindowsThreadLocal.hpp"
 #include "../include/Cancel.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libkernel/System/include/CrashReport.hpp"
@@ -153,6 +154,7 @@ static void RestoreStackPages(std::uintptr_t start, std::size_t bytes) noexcept 
 #else
     const bool restored = ::mprotect(reinterpret_cast<void*>(start), bytes, PROT_READ | PROT_WRITE) == 0;
 #endif
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(start, bytes);
     if (!restored) std::fprintf(stderr, "[thread] cannot restore the protection of guest stack pages 0x%llx+0x%zx at thread exit\n", static_cast<unsigned long long>(start), bytes);
 }
 

@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -40,6 +42,40 @@ class Buffer;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+class QueueSubmitter {
+public:
+    static bool Enabled();
+    static std::shared_ptr<QueueSubmitter> Acquire(VkQueue queue, PFN_vkQueueSubmit submit);
+    static void Drain(VkQueue queue);
+    static std::unique_lock<std::mutex> Access(VkQueue queue);
+    static std::uint64_t Submitted();
+    QueueSubmitter(VkQueue queue, PFN_vkQueueSubmit submit);
+    ~QueueSubmitter();
+    QueueSubmitter(const QueueSubmitter&) = delete;
+    QueueSubmitter& operator=(const QueueSubmitter&) = delete;
+    void Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value);
+    void Drain();
+
+private:
+    struct Job {
+        VkCommandBuffer commands;
+        VkFence fence;
+        VkSemaphore timeline;
+        std::uint64_t value;
+    };
+    void run();
+    VkQueue queue;
+    PFN_vkQueueSubmit submit;
+    std::mutex mutex;
+    std::condition_variable work;
+    std::condition_variable drained;
+    std::deque<Job> jobs;
+    VkResult error = VK_SUCCESS;
+    bool stopping = false;
+    std::mutex queueMutex;
+    std::thread thread;
+};
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
@@ -381,7 +417,7 @@ public:
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
-    static void CountRecordedWork();
+    static void CountRecordedWork(bool draw = false);
 
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
@@ -703,6 +739,7 @@ private:
     PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
+    std::shared_ptr<QueueSubmitter> submitter;
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
     PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
     PFN_vkCmdEndQuery cmdEndQuery = nullptr;

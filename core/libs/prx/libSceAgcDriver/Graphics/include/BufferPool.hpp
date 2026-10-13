@@ -135,6 +135,7 @@ private:
     PFN_vkMapMemory mapMemory;
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
+    std::uint64_t exactTakes = 0;
     Tier smallTier;
     Tier largeTier;
     Tier deviceTier;

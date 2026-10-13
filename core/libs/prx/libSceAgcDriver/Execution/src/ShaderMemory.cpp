@@ -55,6 +55,11 @@ struct CaptureProfile {
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
 
+bool DirectWords() {
+    static const bool disabled = std::getenv("APS5_NO_DIRECT_CAPTURE_WORDS") != nullptr;
+    return !disabled;
+}
+
 bool WordwisePages() {
     static const bool wordwise = std::getenv("APS5_NO_WORDWISE_CAPTURE") == nullptr;
     return wordwise;
@@ -107,6 +112,11 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             ++CaptureTotals().pagesWordwise;
             return page;
         }
+        if (DirectWords() && WordwisePages() && pendingWrite != nullptr) {
+            GuestMemory::FlushGpuWrites(base, PageBytes);
+            page.direct = true;
+            return page;
+        }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
@@ -136,6 +146,10 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     }
     auto& page = self.page(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
+    if (!page.valid.test(index) && page.direct) {
+        std::memcpy(&page.words[index], reinterpret_cast<const void*>(address), sizeof(*value));
+        page.valid.set(index);
+    }
     if (!page.valid.test(index)) {
         std::uint32_t word = 0;
         auto policy = PendingWrite::Sync;
@@ -217,7 +231,7 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
         const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
         const auto pageEnd = std::min<std::uint64_t>(base + PageBytes, end);
         const auto& page = self.page(base);
-        if (!page.wordwise && !page.valid.all() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
+        if (!page.wordwise && !page.direct && !page.valid.all() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
         address = pageEnd;
     }
     return true;

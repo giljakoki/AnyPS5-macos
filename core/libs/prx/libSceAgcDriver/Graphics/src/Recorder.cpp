@@ -518,6 +518,8 @@ std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
 std::atomic<std::uint64_t> completionLabelsCountedLate{0};
 std::atomic<std::uint64_t> workSinceSubmit{0};
+std::atomic<std::uint64_t> timingDraws{0};
+std::atomic<std::uint64_t> timingDispatches{0};
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -1209,8 +1211,9 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
     return workSinceSubmit.load(std::memory_order_relaxed);
 }
 
-void Recorder::CountRecordedWork() {
+void Recorder::CountRecordedWork(bool draw) {
     workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
+    (draw ? timingDraws : timingDispatches).fetch_add(1, std::memory_order_relaxed);
 }
 
 Recorder* Recorder::Active() {
@@ -2448,6 +2451,8 @@ void Recorder::readGpuTiming(Batch& batch) {
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
+    const auto draws = timingDraws.exchange(0, std::memory_order_relaxed);
+    const auto dispatches = timingDispatches.exchange(0, std::memory_order_relaxed);
     std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
     std::string classes;
     for (const auto& [key, totals] : timingByKey) {
@@ -2461,7 +2466,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents, %llu draws and %llu dispatches, %.1f draws and %.1f dispatches per present; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(draws), static_cast<unsigned long long>(dispatches), static_cast<double>(draws) * perPresent, static_cast<double>(dispatches) * perPresent, static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
@@ -2629,7 +2634,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
-    GuestMemory::NoteDriverWrite(address, bytes);
+    GuestMemory::NoteDriverWrite(address, bytes, true);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
@@ -2658,7 +2663,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
-    GuestMemory::NoteDriverWrite(address, bytes);
+    GuestMemory::NoteDriverWrite(address, bytes, true);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
@@ -3182,7 +3187,13 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = std::chrono::steady_clock::now();
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    if (submitter == nullptr && QueueSubmitter::Enabled()) submitter = QueueSubmitter::Acquire(context.queue, function(queueSubmit, "vkQueueSubmit"));
+    if (submitter != nullptr) {
+        submitter->Enqueue(batch->commands, batch->fence, timeline, serial);
+    } else {
+        const auto access = QueueSubmitter::Access(context.queue);
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3648,6 +3659,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+            QueueSubmitter::Drain(context.queue);
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
