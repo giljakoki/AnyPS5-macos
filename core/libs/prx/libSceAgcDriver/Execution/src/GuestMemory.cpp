@@ -11,6 +11,7 @@
 #include <atomic>
 #include <algorithm>
 #include <bit>
+#include <condition_variable>
 #include <emmintrin.h>
 #include <functional>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -1943,11 +1945,122 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     return EqualsCommittedUnsynced(address, bytes);
 }
 
+namespace {
+
+constexpr std::size_t SharedCompareMinBytes = std::size_t{512} << 10u;
+constexpr std::size_t SharedCompareChunkBytes = std::size_t{128} << 10u;
+
+class CompareCrew {
+public:
+    static CompareCrew& Get() {
+        static CompareCrew& crew = *new CompareCrew();
+        return crew;
+    }
+
+    bool Equal(const std::byte* guest, const std::byte* copy, std::size_t bytes) {
+        if (helpers == 0 || bytes < SharedCompareMinBytes) return std::memcmp(guest, copy, bytes) == 0;
+        Job job{guest, copy, bytes, (bytes + SharedCompareChunkBytes - 1) / SharedCompareChunkBytes};
+        {
+            std::unique_lock lock(mutex, std::try_to_lock);
+            if (!lock.owns_lock() || open != nullptr) return std::memcmp(guest, copy, bytes) == 0;
+            open = &job;
+            serial.fetch_add(1, std::memory_order_release);
+        }
+        wake.notify_all();
+        run(job);
+        {
+            std::lock_guard lock(mutex);
+            open = nullptr;
+        }
+        while (job.busy.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+        shared.fetch_add(1, std::memory_order_relaxed);
+        if (job.helped.load(std::memory_order_relaxed)) assisted.fetch_add(1, std::memory_order_relaxed);
+        return !job.differs.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t Shared() const {
+        return shared.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t Assisted() const {
+        return assisted.load(std::memory_order_relaxed);
+    }
+
+    std::size_t Helpers() const {
+        return helpers;
+    }
+
+private:
+    struct Job {
+        const std::byte* guest;
+        const std::byte* copy;
+        std::size_t bytes;
+        std::size_t chunks;
+        std::atomic<std::size_t> next{0};
+        std::atomic<bool> differs{false};
+        std::atomic<std::uint32_t> busy{0};
+        std::atomic<bool> helped{false};
+    };
+
+    CompareCrew() : helpers(helperCount()) {
+        for (std::size_t index = 0; index < helpers; ++index) std::thread([this] { serve(); }).detach();
+    }
+
+    static std::size_t helperCount() {
+        if (const char* text = std::getenv("APS5_GUEST_COMPARE_HELPERS")) return std::min<std::size_t>(std::strtoull(text, nullptr, 10), 8);
+        const auto cores = std::thread::hardware_concurrency();
+        return cores >= 8 ? 3 : cores >= 4 ? 1 : 0;
+    }
+
+    static void run(Job& job) {
+        for (auto chunk = job.next.fetch_add(1, std::memory_order_relaxed); chunk < job.chunks && !job.differs.load(std::memory_order_relaxed); chunk = job.next.fetch_add(1, std::memory_order_relaxed)) {
+            const auto offset = chunk * SharedCompareChunkBytes;
+            const auto length = std::min(SharedCompareChunkBytes, job.bytes - offset);
+            if (std::memcmp(job.guest + offset, job.copy + offset, length) != 0) job.differs.store(true, std::memory_order_relaxed);
+        }
+    }
+
+    void serve() {
+        std::uint64_t seen = 0;
+        for (;;) {
+            const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(200);
+            while (serial.load(std::memory_order_acquire) == seen && std::chrono::steady_clock::now() < spinUntil) std::this_thread::yield();
+            Job* job = nullptr;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return serial.load(std::memory_order_relaxed) != seen; });
+                seen = serial.load(std::memory_order_relaxed);
+                job = open;
+                if (job != nullptr) job->busy.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (job == nullptr) continue;
+            job->helped.store(true, std::memory_order_relaxed);
+            run(*job);
+            job->busy.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    const std::size_t helpers;
+    std::mutex mutex;
+    std::condition_variable wake;
+    Job* open = nullptr;
+    std::atomic<std::uint64_t> serial{0};
+    std::atomic<std::uint64_t> shared{0};
+    std::atomic<std::uint64_t> assisted{0};
+};
+
+}
+
+SharedCompareCounts SharedCompares() {
+    const auto& crew = CompareCrew::Get();
+    return {crew.Shared(), crew.Assisted(), crew.Helpers()};
+}
+
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
     comparedBytes.fetch_add(bytes.size(), std::memory_order_relaxed);
-    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
+    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return CompareCrew::Get().Equal(reinterpret_cast<const std::byte*>(address), bytes.data(), bytes.size());
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
         if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;
     }

@@ -299,10 +299,32 @@ void CheckCollectBoundaries() {
     Require(CollectWrites(base + 4096, 1) != 0, "a re-registered neighbor stayed unwatched");
 #endif
 }
+
+void CheckSharedCompare() {
+    constexpr std::size_t bytes = (std::size_t{4} << 20u) + 4099;
+    std::vector<std::byte> guest(bytes), copy(bytes);
+    for (std::size_t index = 0; index < bytes; ++index) guest[index] = static_cast<std::byte>((index * 131u) >> 3u);
+    copy = guest;
+    const auto address = reinterpret_cast<std::uint64_t>(guest.data());
+    const auto before = SharedCompares();
+    Require(EqualsCommittedUnsynced(address, copy), "a shared compare of equal bytes differed");
+    for (const std::size_t at : {std::size_t{0}, std::size_t{131072}, bytes / 2, bytes - 4100, bytes - 1}) {
+        copy[at] ^= std::byte{0x40};
+        Require(!EqualsCommittedUnsynced(address, copy), "a shared compare missed a difference at byte " + std::to_string(at));
+        copy[at] ^= std::byte{0x40};
+    }
+    Require(EqualsCommittedUnsynced(address, std::span<const std::byte>(copy).first(4096)), "a small compare of equal bytes differed");
+    const auto after = SharedCompares();
+    if (after.helpers == 0) return;
+    Require(after.shared >= before.shared + 6, "large compares were not shared with the helpers");
+    for (int attempt = 0; attempt < 400 && SharedCompares().assisted == before.assisted; ++attempt) Require(EqualsCommittedUnsynced(address, copy), "a shared compare of equal bytes differed");
+    Require(SharedCompares().assisted > before.assisted, "no helper took part in a shared compare");
+}
 }
 
 int main() {
     try {
+        CheckSharedCompare();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
