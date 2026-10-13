@@ -145,8 +145,12 @@ struct SnapshotProofCounts {
     std::atomic<std::uint64_t> hashes{0};
     std::atomic<std::uint64_t> unchanged{0};
     std::atomic<std::uint64_t> hashedBytes{0};
+    std::array<std::atomic<std::uint64_t>, 8> phaseCalls{};
+    std::array<std::atomic<std::uint64_t>, 8> phaseNanoseconds{};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
+    std::array<std::uint64_t, 8> reportedPhaseCalls{};
+    std::array<std::uint64_t, 8> reportedPhaseNanoseconds{};
     std::uint64_t reportedCompared = 0;
     std::uint64_t reportedNanoseconds = 0;
     long reportedMinorFaults = 0;
@@ -157,6 +161,29 @@ SnapshotProofCounts& snapshotProofCounts() {
     static auto& counts = *new SnapshotProofCounts;
     return counts;
 }
+
+enum class LookupPhase : std::size_t { AllLookups, ImportedHits, ImportFind, Proof, HashRecord, DigestRead, RefreshRecord, Count };
+constexpr const char* LookupPhaseNames[static_cast<std::size_t>(LookupPhase::Count)] = {"sampled lookups", "imported hits", "import find", "proof", "hash record", "digest read", "refresh record"};
+
+class PhaseTimer {
+public:
+    explicit PhaseTimer(LookupPhase phase) : phase(phase), start(std::chrono::steady_clock::now()) {}
+    ~PhaseTimer() {
+        if (!counted) return;
+        auto& counts = snapshotProofCounts();
+        const auto index = static_cast<std::size_t>(phase);
+        counts.phaseCalls[index].fetch_add(1, std::memory_order_relaxed);
+        counts.phaseNanoseconds[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+    void Skip() { counted = false; }
+
+private:
+    LookupPhase phase;
+    std::chrono::steady_clock::time_point start;
+    bool counted = true;
+};
 
 void reportSnapshotProofs() {
     auto& counts = snapshotProofCounts();
@@ -179,6 +206,17 @@ void reportSnapshotProofs() {
     const auto nanosecondsSince = nanoseconds - std::exchange(counts.reportedNanoseconds, nanoseconds);
     const auto minorFaults = minorNow - std::exchange(counts.reportedMinorFaults, minorNow);
     const auto majorFaults = majorNow - std::exchange(counts.reportedMajorFaults, majorNow);
+    std::string phases;
+    for (std::size_t index = 0; index < static_cast<std::size_t>(LookupPhase::Count); ++index) {
+        const auto calls = counts.phaseCalls[index].load(std::memory_order_relaxed);
+        const auto phaseNanoseconds = counts.phaseNanoseconds[index].load(std::memory_order_relaxed);
+        const auto callsSince = calls - std::exchange(counts.reportedPhaseCalls[index], calls);
+        const auto nanosecondsSince = phaseNanoseconds - std::exchange(counts.reportedPhaseNanoseconds[index], phaseNanoseconds);
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %s %llu in %.1f ms", index == 0 ? "" : ",", LookupPhaseNames[index], static_cast<unsigned long long>(callsSince), static_cast<double>(nanosecondsSince) / 1e6);
+        phases += text;
+    }
+    std::fprintf(stderr, "[resources] snapshot lookup CPU time since the last line:%s\n", phases.c_str());
     std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface), %llu imported refreshes on the GPU (%.1f MiB), %llu imported hash passes (%.1f MiB, %llu unchanged); since the last line %.1f MiB compared at %.2f GB/s, %ld minor and %ld major page faults\n", count(counts.hits), count(counts.compares), static_cast<double>(compared) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written), count(counts.refreshes), static_cast<double>(counts.refreshedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.hashes), static_cast<double>(counts.hashedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unchanged), static_cast<double>(comparedSince) / 1048576.0, nanosecondsSince != 0 ? static_cast<double>(comparedSince) / static_cast<double>(nanosecondsSince) : 0.0, minorFaults, majorFaults);
 }
 
@@ -275,6 +313,7 @@ bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t byt
 }
 
 bool recordImportedHash(const Context& context, ImportedHash& hash, const HostImport& import, std::uint64_t address, std::size_t bytes, bool adopt) {
+    PhaseTimer timer(LookupPhase::HashRecord);
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || hash.inFlight || import.address == 0 || bytes % 16 != 0 || address % 16 != 0 || bytes / 16 > std::numeric_limits<std::uint32_t>::max()) return false;
     if (hash.digest == nullptr) hash.digest = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
@@ -298,7 +337,10 @@ void hashThenRefresh(const Context& context, CachedTexture& entry, const HostImp
     auto& hash = *entry.hash;
     if (hash.inFlight) hash.adopt = false;
     if (hash.inFlight || !importedSnapshotHash() || !recordImportedHash(context, hash, import, address, bytes, true)) hash.known = false;
-    entry.texture->RefreshFromImport(*context.detiler, import);
+    {
+        PhaseTimer timer(LookupPhase::RefreshRecord);
+        entry.texture->RefreshFromImport(*context.detiler, import);
+    }
     auto& counts = snapshotProofCounts();
     counts.refreshes.fetch_add(1, std::memory_order_relaxed);
     counts.refreshedBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -306,28 +348,35 @@ void hashThenRefresh(const Context& context, CachedTexture& entry, const HostImp
 
 void consumeImportedHash(const Context& context, CachedTexture& entry, const HostImport& import, std::uint64_t address, std::size_t bytes) {
     auto& hash = *entry.hash;
-    if (!hash.inFlight || !hash.recorder->BatchFinished(hash.serial)) return;
-    hash.inFlight = false;
-    std::array<std::uint32_t, 4> digest{};
-    hash.digest->Invalidate();
-    std::memcpy(digest.data(), hash.digest->Bytes().data(), sizeof(digest));
-    if (std::exchange(hash.adopt, false)) {
-        hash.stored = digest;
-        hash.known = true;
-        return;
+    bool changed = false;
+    {
+        PhaseTimer timer(LookupPhase::DigestRead);
+        if (!hash.inFlight || !hash.recorder->BatchFinished(hash.serial)) return;
+        hash.inFlight = false;
+        std::array<std::uint32_t, 4> digest{};
+        hash.digest->Invalidate();
+        std::memcpy(digest.data(), hash.digest->Bytes().data(), sizeof(digest));
+        if (std::exchange(hash.adopt, false)) {
+            hash.stored = digest;
+            hash.known = true;
+            return;
+        }
+        if (hash.known && digest == hash.stored) {
+            snapshotProofCounts().unchanged.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        changed = true;
     }
-    if (hash.known && digest == hash.stored) {
-        snapshotProofCounts().unchanged.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    hashThenRefresh(context, entry, import, address, bytes);
+    if (changed) hashThenRefresh(context, entry, import, address, bytes);
 }
 
 void refreshImportedSnapshot(const Context& context, CachedTexture& entry, const HostImport& import, std::uint64_t address, std::size_t bytes) {
     if (entry.hash == nullptr) entry.hash = std::make_shared<ImportedHash>();
     consumeImportedHash(context, entry, import, address, bytes);
+    std::optional<PhaseTimer> proofTimer(std::in_place, LookupPhase::Proof);
     const auto proof = currentSnapshotProof();
     const auto state = proofState(entry, proof, address, bytes);
+    proofTimer.reset();
     if (state != ProofState::Holds) {
         if (state == ProofState::Written || !importedSnapshotHash()) {
             hashThenRefresh(context, entry, import, address, bytes);
@@ -743,6 +792,7 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
+    PhaseTimer lookupTimer(LookupPhase::AllLookups);
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
@@ -855,14 +905,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
+    std::optional<PhaseTimer> importTimer(std::in_place, LookupPhase::ImportFind);
     const bool importable = importedSnapshotRefresh() && source == nullptr && !clearThroughKeys && *keys == DccKeys::Uncompressed && !depthCompare && IsBlockCompressed(resource.format) && HostImportCovers(context, address, bytes);
     const auto* import = importable ? HostImportFor(context, address, bytes) : nullptr;
+    if (!importable) importTimer->Skip();
+    importTimer.reset();
+    std::optional<PhaseTimer> importedHitTimer(std::in_place, LookupPhase::ImportedHits);
+    importedHitTimer->Skip();
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (import != nullptr && it->importBuffer == import->buffer && it->importBase == import->base && it->keys == *keys) {
+            importedHitTimer.emplace(LookupPhase::ImportedHits);
             refreshImportedSnapshot(context, *it, *import, address, bytes);
             it->generation = generation;
             touchTexture(cache, it);
