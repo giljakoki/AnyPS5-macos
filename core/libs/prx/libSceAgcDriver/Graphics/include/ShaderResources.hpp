@@ -148,6 +148,15 @@ public:
         std::vector<std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    struct DescriptorDelta {
+        bool layout = false;
+        std::uint32_t images = 0;
+        std::uint32_t samplers = 0;
+        std::uint32_t bufferAddresses = 0;
+        std::uint32_t bufferSizes = 0;
+        std::uint32_t snapshots = 0;
+    };
+    DescriptorDelta CompareDescriptors(const ShaderResources& previous, std::size_t snapshots, std::size_t previousSnapshots) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();

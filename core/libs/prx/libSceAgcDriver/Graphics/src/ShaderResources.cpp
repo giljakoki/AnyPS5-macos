@@ -3853,6 +3853,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
+ShaderResources::DescriptorDelta ShaderResources::CompareDescriptors(const ShaderResources& previous, std::size_t snapshots, std::size_t previousSnapshots) const {
+    DescriptorDelta delta;
+    if (_layout != previous._layout || allocations.size() != previous.allocations.size() || descriptorImages.size() != previous.descriptorImages.size()) {
+        delta.layout = true;
+        return delta;
+    }
+    for (std::size_t index = 0; index < descriptorImages.size(); ++index) {
+        if (descriptorImages[index].imageView != previous.descriptorImages[index].imageView || descriptorImages[index].imageLayout != previous.descriptorImages[index].imageLayout) ++delta.images;
+        if (descriptorImages[index].sampler != previous.descriptorImages[index].sampler) ++delta.samplers;
+    }
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mine = allocations[index];
+        const auto& theirs = previous.allocations[index];
+        if (mine.size != theirs.size) ++delta.bufferSizes;
+        else if (mine.address != theirs.address || (!mine.guest && mine.dataWords != theirs.dataWords)) ++delta.bufferAddresses;
+    }
+    delta.snapshots = static_cast<std::uint32_t>(std::max(snapshots, previousSnapshots));
+    return delta;
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set == VK_NULL_HANDLE) return;
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);

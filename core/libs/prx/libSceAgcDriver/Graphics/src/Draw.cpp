@@ -536,7 +536,13 @@ struct BatchProbeCounts {
     std::array<std::atomic<std::uint64_t>, 8> lengths{};
     std::array<std::atomic<std::uint64_t>, BreakCount> breaks{};
     std::atomic<std::uint64_t> pushDiffers{0};
+    std::array<std::atomic<std::uint64_t>, 7> descriptorKinds{};
+    std::atomic<std::uint64_t> differingImages{0};
+    std::atomic<std::uint64_t> differingBuffers{0};
 };
+
+enum DescriptorKind : std::size_t { DescriptorsLayout, DescriptorsImages, DescriptorsSamplers, DescriptorsBufferSizes, DescriptorsBufferAddresses, DescriptorsSnapshots, DescriptorsSame, DescriptorKindCount };
+constexpr std::array<const char*, DescriptorKindCount> DescriptorKindNames{"another layout", "other images", "other samplers only", "buffers of other sizes", "buffers at other addresses or with other data only", "per-draw buffer snapshots only", "the same contents"};
 
 BatchProbeCounts& BatchProbe() {
     static BatchProbeCounts& counts = *new BatchProbeCounts();
@@ -547,6 +553,8 @@ struct BatchRun {
     const void* pipeline = nullptr;
     VkDescriptorSet set = VK_NULL_HANDLE;
     const void* resources = nullptr;
+    std::weak_ptr<const ShaderResources> shared;
+    std::size_t snapshots = 0;
     std::array<std::byte, PipelinePushConstantBytes> push{};
     bool pushKnown = false;
     std::uint64_t length = 0;
@@ -567,7 +575,29 @@ void closeBatchRun() {
     batchRun.length = 0;
 }
 
-void probeBatch(bool eligible, bool continued, const void* pipeline, VkDescriptorSet set, const void* resources, const std::array<std::byte, PipelinePushConstantBytes>* push) {
+void classifyDescriptors(const std::shared_ptr<const ShaderResources>& resources, std::size_t snapshots) {
+    auto& counts = BatchProbe();
+    const auto previous = batchRun.shared.lock();
+    if (previous == nullptr || resources == nullptr) return;
+    DescriptorKind kind = DescriptorsSame;
+    if (previous != resources) {
+        const auto delta = resources->CompareDescriptors(*previous, snapshots, batchRun.snapshots);
+        counts.differingImages.fetch_add(delta.images, std::memory_order_relaxed);
+        counts.differingBuffers.fetch_add(delta.bufferSizes + delta.bufferAddresses, std::memory_order_relaxed);
+        if (delta.layout) kind = DescriptorsLayout;
+        else if (delta.images != 0) kind = DescriptorsImages;
+        else if (delta.samplers != 0) kind = DescriptorsSamplers;
+        else if (delta.bufferSizes != 0) kind = DescriptorsBufferSizes;
+        else if (delta.bufferAddresses != 0) kind = DescriptorsBufferAddresses;
+        else if (delta.snapshots != 0) kind = DescriptorsSnapshots;
+    } else if (snapshots != 0 || batchRun.snapshots != 0) {
+        kind = DescriptorsSnapshots;
+    }
+    counts.descriptorKinds[kind].fetch_add(1, std::memory_order_relaxed);
+}
+
+void probeBatch(bool eligible, bool continued, const void* pipeline, VkDescriptorSet set, const std::shared_ptr<const ShaderResources>& shared, std::size_t snapshots, const std::array<std::byte, PipelinePushConstantBytes>* push) {
+    const void* resources = shared.get();
     auto& counts = BatchProbe();
     counts.draws.fetch_add(1, std::memory_order_relaxed);
     BatchBreak why = BreakCount;
@@ -575,6 +605,7 @@ void probeBatch(bool eligible, bool continued, const void* pipeline, VkDescripto
     else if (batchRun.length == 0 || !continued) why = BreakPass;
     else if (pipeline != batchRun.pipeline) why = BreakPipeline;
     else if (set != batchRun.set || (set == VK_NULL_HANDLE && resources != batchRun.resources)) why = BreakDescriptors;
+    if (why == BreakDescriptors) classifyDescriptors(shared, snapshots);
     if (why == BreakCount) {
         if (push != nullptr && batchRun.pushKnown && *push != batchRun.push) counts.pushDiffers.fetch_add(1, std::memory_order_relaxed);
         ++batchRun.length;
@@ -586,6 +617,8 @@ void probeBatch(bool eligible, bool continued, const void* pipeline, VkDescripto
     batchRun.pipeline = pipeline;
     batchRun.set = set;
     batchRun.resources = resources;
+    batchRun.shared = shared;
+    batchRun.snapshots = snapshots;
     batchRun.pushKnown = push != nullptr;
     if (push != nullptr) batchRun.push = *push;
 }
@@ -600,6 +633,16 @@ void reportBatchProbe() {
     for (std::size_t i = 1; i < counts.lengths.size(); ++i) lengths += " " + std::to_string(1u << i) + (i + 1 == counts.lengths.size() ? "+:" : "-" + std::to_string((2u << i) - 1) + ":") + std::to_string(counts.lengths[i].exchange(0, std::memory_order_relaxed));
     std::string breaks;
     for (std::size_t i = 0; i < BreakCount; ++i) breaks += std::string(i == 0 ? " " : ", ") + BatchBreakNames[i] + " " + std::to_string(counts.breaks[i].exchange(0, std::memory_order_relaxed));
+    std::string kinds;
+    std::uint64_t classified = 0;
+    for (std::size_t i = 0; i < DescriptorKindCount; ++i) {
+        const auto count = counts.descriptorKinds[i].exchange(0, std::memory_order_relaxed);
+        classified += count;
+        kinds += std::string(i == 0 ? " " : ", ") + DescriptorKindNames[i] + " " + std::to_string(count);
+    }
+    const auto images = counts.differingImages.exchange(0, std::memory_order_relaxed);
+    const auto buffers = counts.differingBuffers.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[draw-batch] descriptor breaks by their costliest difference (same pass and pipeline, %llu):%s; per break %.1f image and %.1f buffer bindings differ\n", static_cast<unsigned long long>(classified), kinds.c_str(), classified != 0 ? static_cast<double>(images) / static_cast<double>(classified) : 0.0, classified != 0 ? static_cast<double>(buffers) / static_cast<double>(classified) : 0.0);
     std::fprintf(stderr, "[draw-batch] %llu recorded draws (10 s): %llu in %llu runs of 2 or more that one multi-draw could record (%.0f%%, average run %.1f, longest %llu; runs by length%s); %llu of the joined draws changed their push constants; a run ended by:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(batchable), static_cast<unsigned long long>(runs), 100.0 * static_cast<double>(batchable) / static_cast<double>(draws), runs != 0 ? static_cast<double>(batchable) / static_cast<double>(runs) : 0.0, static_cast<unsigned long long>(counts.longest.exchange(0, std::memory_order_relaxed)), lengths.c_str(), static_cast<unsigned long long>(counts.pushDiffers.exchange(0, std::memory_order_relaxed)), breaks.c_str());
 }
 
@@ -1919,7 +1962,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
-    if (timer.profile) probeBatch(!gpuIndirect && !meshIndirect && !state.stages.mesh && draw.instanceCount == 1 && !record.pipeline->SplitsFaces() && !record.pipeline->SplitsSecondChannel(), continued, record.pipeline.get(), drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE, &resources, record.pushBytes);
+    if (timer.profile) probeBatch(!gpuIndirect && !meshIndirect && !state.stages.mesh && draw.instanceCount == 1 && !record.pipeline->SplitsFaces() && !record.pipeline->SplitsSecondChannel(), continued, record.pipeline.get(), drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE, record.resources, drawBindings != nullptr ? drawBindings->snapshots.size() : 0, record.pushBytes);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
