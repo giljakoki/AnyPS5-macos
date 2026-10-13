@@ -1,6 +1,8 @@
 #include "BdaAbi.hpp"
 #include "NggGeometryProgram.hpp"
 #include "Recompiler.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "spirv/unified1/spirv.hpp"
 #include <array>
 #include <cstdint>
@@ -32,19 +34,38 @@ SpirvTarget MeshlessTarget() {
     return target;
 }
 
-MeshProgramLayout Describe(std::uint32_t waveSize, const std::optional<MeshConfiguration>& mesh, ShaderStage stage = ShaderStage::Mesh) {
-    const auto& code = waveSize == 32u ? NggGeometryProgram::Wave32Code : NggGeometryProgram::Code;
+constexpr std::uint32_t LayerExportControl = (1u << 21u) | (1u << 18u);
+
+alignas(256) constexpr auto LayerCode = [] {
+    auto code = NggGeometryProgram::Code;
+    code[101] = 0xf80000d4u;
+    return code;
+}();
+
+template<typename TBody>
+auto WithRequest(std::span<const std::uint32_t> code, std::uint32_t waveSize, const std::optional<MeshConfiguration>& mesh, ShaderStage stage, std::uint32_t control, TBody body) {
     const std::vector<std::uint32_t> userData(12, 0u);
-    const std::array<MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
+    const std::array<MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const RecompileRequest request{
         {stage, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {waveSize, 0, userData, std::nullopt, std::nullopt, ShaderVertexStageInfo{}, memory},
         MeshlessTarget(),
         {0, 0, 0, MeshDrawPushOffsetBytes},
-        GraphicsCompileContext{0, {}, mesh, std::nullopt, {0, 0, 0, 1}},
+        GraphicsCompileContext{0, {}, mesh, std::nullopt, {0, 0, 0, 1}, control},
         false
     };
-    return DescribeMeshProgram(request);
+    return body(request);
+}
+
+MeshProgramLayout Describe(std::uint32_t waveSize, const std::optional<MeshConfiguration>& mesh, ShaderStage stage = ShaderStage::Mesh) {
+    const auto& code = waveSize == 32u ? NggGeometryProgram::Wave32Code : NggGeometryProgram::Code;
+    return WithRequest(code, waveSize, mesh, stage, 0u, [](const RecompileRequest& request) { return DescribeMeshProgram(request); });
+}
+
+MeshProgramLayout DescribeLayer(std::uint32_t control, bool compute) {
+    auto mesh = SmallSubgroup;
+    mesh.compute = compute;
+    return WithRequest(LayerCode, 64u, mesh, ShaderStage::Mesh, control, [](const RecompileRequest& request) { return DescribeMeshProgram(request); });
 }
 
 bool Run(const char* name, const std::function<bool()>& test) {
@@ -105,6 +126,49 @@ int main() {
             return true;
         }
         return false;
+    });
+
+    passed &= Run("PA_CL_VS_OUT_CNTL names position 1 z the layer of a compute-emulated program", [] {
+        const auto layout = DescribeLayer(LayerExportControl, true);
+        return layout.layer && layout.positionComponents[1] == 4u && layout.parameterMask == 0u && layout.recordDwords == 8u;
+    });
+
+    passed &= Run("without PA_CL_VS_OUT_CNTL position 1 z means nothing", [] {
+        const auto layout = DescribeLayer(0u, true);
+        return !layout.layer && layout.positionComponents[1] == 4u && layout.recordDwords == 4u;
+    });
+
+    passed &= Run("native stages keep ignoring layer and viewport exports", [] {
+        auto mesh = SmallSubgroup;
+        return WithRequest(LayerCode, 64u, mesh, ShaderStage::Mesh, LayerExportControl, [](const RecompileRequest& request) { return PositionExportControl(request) == (1u << 21u); }) &&
+               WithRequest(LayerCode, 64u, std::optional<MeshConfiguration>{}, ShaderStage::Vertex, LayerExportControl | 1u, [](const RecompileRequest& request) { return PositionExportControl(request) == ((1u << 21u) | 1u); }) &&
+               !DescribeLayer(LayerExportControl, false).layer;
+    });
+
+    passed &= Run("the request format keeps PA_CL_VS_OUT_CNTL and the mesh compute flag", [] {
+        auto mesh = SmallSubgroup;
+        mesh.compute = true;
+        return WithRequest(LayerCode, 64u, mesh, ShaderStage::Mesh, LayerExportControl, [](const RecompileRequest& request) {
+            const auto restored = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request));
+            return restored.request.graphics.has_value() && restored.request.graphics->positionExportControl == LayerExportControl && restored.request.graphics->mesh.has_value() && restored.request.graphics->mesh->compute;
+        });
+    });
+
+    passed &= Run("the cache key separates PA_CL_VS_OUT_CNTL and the mesh compute flag", [] {
+        auto mesh = SmallSubgroup;
+        const auto key = [&](std::uint32_t control) {
+            return WithRequest(LayerCode, 64u, mesh, ShaderStage::Mesh, control, [](const RecompileRequest& request) {
+                std::vector<std::uint64_t> words;
+                BuildPreparedShaderKey(request, words);
+                return words;
+            });
+        };
+        const auto native = key(LayerExportControl);
+        const auto plain = key(0u);
+        mesh.compute = true;
+        const auto emulated = key(LayerExportControl);
+        const auto emulatedPlain = key(0u);
+        return native != plain && native != emulated && emulated != emulatedPlain;
     });
 
     return passed ? 0 : 1;

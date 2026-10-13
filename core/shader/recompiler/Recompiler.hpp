@@ -284,6 +284,7 @@ struct MeshConfiguration {
     std::uint32_t ldsSizeDwords;
     std::uint32_t provokingVertex;
     std::uint32_t esgsItemSize = 0;
+    bool compute = false;
 };
 
 struct TessellationConfiguration {
@@ -319,6 +320,7 @@ struct GraphicsCompileContext {
     std::optional<MeshConfiguration> mesh;
     std::optional<TessellationConfiguration> tessellation;
     GraphicsDrawParameters draw;
+    std::uint32_t positionExportControl = 0;
 };
 
 struct RecompileRequest {
@@ -578,6 +580,9 @@ struct MeshProgramLayout {
     [[nodiscard]] bool VertexStageCandidate() const;
     [[nodiscard]] std::uint32_t GroupsFor(std::uint32_t indexCount) const;
 };
+
+inline constexpr std::uint32_t PositionExportLayerViewportBits = (1u << 18u) | (1u << 19u);
+[[nodiscard]] std::uint32_t PositionExportControl(const RecompileRequest& request);
 
 [[nodiscard]] MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request);
 

@@ -53,6 +53,7 @@ public:
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
         appendMesh(key, request);
+        append(key, PositionExportControl(request));
         appendTessellation(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
@@ -85,6 +86,7 @@ private:
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
         appendMesh(key, request);
+        append(key, PositionExportControl(request));
         appendTessellation(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
@@ -98,6 +100,7 @@ private:
         append(key, mesh != nullptr);
         if (mesh == nullptr) return;
         for (const auto value : {mesh->inputPrimitive, mesh->primitivesPerGroup, mesh->verticesPerGroup, mesh->maxVertices, mesh->maxPrimitives, mesh->threadsPerGroup, mesh->ldsSizeDwords, mesh->provokingVertex, mesh->esgsItemSize}) append(key, value);
+        append(key, mesh->compute);
     }
 
     static void appendTessellation(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
