@@ -417,10 +417,13 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     CurrentGuestState().current = self;
     RegisterStack(self);
 #ifndef _WIN32
-    const sigset_t signalMask = args->signalMask;
+    sigset_t signalMask = args->signalMask;
 #endif
     args.reset();
 #ifndef _WIN32
+    static const bool traceRaise = std::getenv("APS5_TRACE_RAISE") != nullptr;
+    if (traceRaise && sigismember(&signalMask, SIGUSR1) == 1) std::fprintf(stderr, "[raise] guest thread %p '%s' was created by a thread with the host's SIGUSR1 blocked; unblocked\n", static_cast<void*>(self), self->name.c_str());
+    for (const int emulatorSignal : {SIGUSR1, SIGBUS, SIGSEGV}) sigdelset(&signalMask, emulatorSignal);
     pthread_sigmask(SIG_SETMASK, &signalMask, nullptr);
 #endif
     finishThread(self, entry(arg));

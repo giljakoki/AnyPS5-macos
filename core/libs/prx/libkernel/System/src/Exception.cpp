@@ -4,7 +4,10 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include <algorithm>
 #include <array>
+#include <cstdio>
+#include <string>
 #include <chrono>
 #include <atomic>
 #include <cstring>
@@ -415,7 +418,21 @@ void ToHost(const GuestMcontext& m, mcontext_t& host) {
 }
 #endif
 
+std::atomic<bool> traceRaise{false};
+
+void TraceDelivery(const char* stage) {
+    if (!traceRaise.load(std::memory_order_relaxed)) return;
+    char line[160];
+    const Pthread self = scePthreadSelf();
+    const int length = std::snprintf(line, sizeof(line), "[raise] %s on guest thread %p\n", stage, static_cast<void*>(self));
+    if (length > 0) {
+        const auto written = write(STDERR_FILENO, line, static_cast<std::size_t>(std::min<int>(length, sizeof(line) - 1)));
+        (void)written;
+    }
+}
+
 void Deliver(int, siginfo_t*, void* context) {
+    TraceDelivery("handler entered");
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {
         static constexpr char message[] = "sceKernelRaiseException: the handler was removed before the signal was delivered\n";
@@ -428,10 +445,12 @@ void Deliver(int, siginfo_t*, void* context) {
     FromHost(host, ucontext.mcontext);
     CallHandler(handler, RaisedSignal, ucontext);
     ToHost(ucontext.mcontext, host);
+    TraceDelivery("handler returned");
 }
 
 void InstallDelivery() {
     static const bool installed = [] {
+        traceRaise.store(std::getenv("APS5_TRACE_RAISE") != nullptr);
         struct sigaction action{};
         action.sa_sigaction = Deliver;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -466,13 +485,26 @@ private:
     sigset_t previous;
 };
 
-bool RaiseOn(Pthread thread) {
-    InstallDelivery();
+bool RaiseOnLocked(Pthread thread) {
     if (thread == scePthreadSelf()) return Send(thread);
     HostSignalBlock block;
     std::lock_guard lock(thread->_join_mtx);
     if (thread->_finished.load(std::memory_order_acquire)) return false;
     return Send(thread);
+}
+
+bool RaiseOn(Pthread thread) {
+    InstallDelivery();
+    const bool sent = RaiseOnLocked(thread);
+    if (traceRaise.load(std::memory_order_relaxed)) {
+        std::string name;
+        {
+            std::lock_guard lock(thread->nameLock);
+            name = thread->name;
+        }
+        std::fprintf(stderr, "[raise] signal to guest thread %p '%s' %s\n", static_cast<void*>(thread), name.c_str(), sent ? "sent" : "not sent, the thread has finished");
+    }
+    return sent;
 }
 #endif
 
