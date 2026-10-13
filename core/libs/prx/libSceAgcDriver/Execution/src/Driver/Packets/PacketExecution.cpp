@@ -281,6 +281,7 @@ void Driver::execute(const Submission& submission) {
                 }
                 if (!queued) request->GpuFinished();
             }
+        } else if ((opcode == 0x15 || opcode == 0x16) && ProgramSkipped(queue, true)) {
         } else if (opcode == 0x15 || opcode == 0x16) {
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
@@ -320,6 +321,7 @@ void Driver::execute(const Submission& submission) {
                     next += nextCount;
                 }
             }
+        } else if (drawPacket && ProgramSkipped(queue, false)) {
         } else if (drawPacket) {
             if (RecentWorkTraced()) NoteRecentWork("draw", submission.queue, submission.serial, cursor, queue, packet);
             landPendingWaits(submission.queue);

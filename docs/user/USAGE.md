@@ -183,6 +183,8 @@ Titles draw geometry-shader and other NGG programs through the mesh path, which 
 
 The driver prints `[env] APS5 settings in effect: ...` once its Vulkan device is ready, listing every `APS5_` variable the title process received, so a launcher that drops the environment shows up in the log.
 
+Debug aid: `APS5_SKIP_PROGRAMS=<hex>[,<hex>...]` drops every draw whose vertex, geometry or pixel program, and every dispatch whose compute program, starts at one of the listed addresses (as printed by `[recent-work]`), logging each address once; it bisects which program breaks a frame or the device, and the frame then lacks that work.
+
 Debug aid: `APS5_SERIALIZE_WORK=1` waits for the GPU after every draw and dispatch packet, so a GPU fault surfaces right after the packet that caused it (combine it with `APS5_TRACE_RECENT_WORK`, whose last line is then that packet). It is very slow.
 
 Debug aid: `APS5_TRACE_RECENT_WORK=<n>` keeps the last `n` draw and dispatch packets (queue, submission, program addresses, colour target, index base and the first packet words) and prints them as `[recent-work]` lines when the process terminates on an uncaught error, such as a lost Vulkan device, so the work submitted just before a GPU fault is known.

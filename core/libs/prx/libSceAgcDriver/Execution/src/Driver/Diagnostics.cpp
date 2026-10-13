@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -73,6 +74,36 @@ bool SerializeWork() {
         return value != nullptr && std::string_view(value) == "1";
     }();
     return serialize;
+}
+
+bool ProgramSkipped(const QueueState& state, bool compute) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> result;
+        const char* value = std::getenv("APS5_SKIP_PROGRAMS");
+        if (value == nullptr) return result;
+        for (const char* cursor = value; *cursor != '\0';) {
+            char* end = nullptr;
+            const auto address = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            result.push_back(address);
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        return result;
+    }();
+    if (programs.empty()) return false;
+    const std::array<std::uint64_t, 3> bound = compute ? std::array<std::uint64_t, 3>{ProgramAt(state.shader, 0x20c), 0, 0} : std::array<std::uint64_t, 3>{ProgramAt(state.shader, 0xc8), ProgramAt(state.shader, 0x08), ProgramAt(state.shader, 0x88)};
+    for (const auto address : bound) {
+        if (address == 0 || std::find(programs.begin(), programs.end(), address) == programs.end()) continue;
+        static std::mutex mutex;
+        static std::vector<std::uint64_t> reported;
+        std::lock_guard lock(mutex);
+        if (std::find(reported.begin(), reported.end(), address) == reported.end()) {
+            reported.push_back(address);
+            std::fprintf(stderr, "[draw] APS5_SKIP_PROGRAMS drops every %s that runs program 0x%llx\n", compute ? "dispatch" : "draw", static_cast<unsigned long long>(address));
+        }
+        return true;
+    }
+    return false;
 }
 
 bool RecentWorkTraced() {
