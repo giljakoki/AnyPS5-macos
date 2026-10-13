@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <string_view>
 #include <type_traits>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -47,6 +49,8 @@ struct Deferred {
     VkDevice device;
     std::uint64_t handle;
     std::chrono::steady_clock::time_point due;
+    const Recorder* recorder = nullptr;
+    std::uint64_t serial = 0;
 };
 
 struct FreeState {
@@ -75,12 +79,34 @@ bool Traced() {
     return traced;
 }
 
+constexpr std::string_view BatchPrefix = "batches:";
+
 std::chrono::milliseconds DeferBy() {
     static const std::chrono::milliseconds value{[] {
         const char* text = std::getenv("APS5_DEFER_GPU_FREES");
-        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        if (text == nullptr || std::string_view(text).starts_with(BatchPrefix)) return 0ull;
+        return static_cast<unsigned long long>(std::strtoull(text, nullptr, 10));
     }()};
     return value;
+}
+
+int DeferBatches() {
+    static const int value = [] {
+        const char* text = std::getenv("APS5_DEFER_GPU_FREES");
+        if (text == nullptr || !std::string_view(text).starts_with(BatchPrefix)) return -1;
+        return static_cast<int>(std::strtol(text + BatchPrefix.size(), nullptr, 10));
+    }();
+    return value;
+}
+
+bool Deferring() {
+    return DeferBy().count() != 0 || DeferBatches() >= 0;
+}
+
+bool Due(const Deferred& entry, std::chrono::steady_clock::time_point now) {
+    if (DeferBatches() < 0) return entry.due <= now;
+    const auto* recorder = Recorder::Active();
+    return entry.recorder == nullptr || recorder != entry.recorder || recorder->BatchFinished(entry.serial);
 }
 
 void release(FreeState& state, const Deferred& entry) {
@@ -109,7 +135,7 @@ void handle(FreeKind kind, VkDevice device, std::uint64_t object) {
         note.depth = depth > 2 ? depth - 2 : 0;
 #endif
     }
-    if (DeferBy().count() == 0) {
+    if (!Deferring()) {
         if (Traced()) {
             std::lock_guard lock(state.mutex);
             state.ring[state.count % state.ring.size()] = note;
@@ -123,9 +149,16 @@ void handle(FreeKind kind, VkDevice device, std::uint64_t object) {
         state.ring[state.count % state.ring.size()] = note;
         ++state.count;
     }
-    state.deferred.push_back({kind, device, object, now + DeferBy()});
+    Deferred entry{kind, device, object, now + DeferBy()};
+    if (DeferBatches() >= 0) {
+        if (const auto* recorder = Recorder::Active(); recorder != nullptr) {
+            entry.recorder = recorder;
+            entry.serial = recorder->NewestSubmitted() + 1u + static_cast<std::uint64_t>(DeferBatches());
+        }
+    }
+    state.deferred.push_back(entry);
     ++state.deferredTotal;
-    while (!state.deferred.empty() && state.deferred.front().due <= now) {
+    while (!state.deferred.empty() && Due(state.deferred.front(), now)) {
         release(state, state.deferred.front());
         state.deferred.pop_front();
     }
@@ -197,10 +230,11 @@ void printFrame(void* frame) {
 }
 
 PFN_vkGetDeviceProcAddr GuardDeviceProc(PFN_vkGetDeviceProcAddr real) {
-    if (!Traced() && DeferBy().count() == 0) return real;
+    if (!Traced() && !Deferring()) return real;
     auto& state = State();
     state.real = real;
     if (Traced()) std::fprintf(stderr, "[gpu-free] APS5_TRACE_GPU_FREES: Vulkan frees are recorded and the last 256 printed when the device is lost\n");
+    if (DeferBatches() >= 0) std::fprintf(stderr, "[gpu-free] APS5_DEFER_GPU_FREES: Vulkan memory, buffers, images and views are freed once the batch open when the driver releases them, and %d more, completed\n", DeferBatches());
     if (DeferBy().count() != 0) std::fprintf(stderr, "[gpu-free] APS5_DEFER_GPU_FREES: Vulkan memory, buffers, images and views are freed %lld ms after the driver releases them\n", static_cast<long long>(DeferBy().count()));
     return &guardedDeviceProc;
 }

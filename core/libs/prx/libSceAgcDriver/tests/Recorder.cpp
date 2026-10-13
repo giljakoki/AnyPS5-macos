@@ -5970,6 +5970,32 @@ int gpuFreeDeferTests() {
     return 0;
 }
 
+int gpuFreeBatchDeferTests(Recorder& recorder) {
+    const char* mode = std::getenv("APS5_DEFER_GPU_FREES");
+    if (mode == nullptr || std::string_view(mode) != "batches:0") {
+        std::cout << "skipped, APS5_DEFER_GPU_FREES is not batches:0\n";
+        return 77;
+    }
+    const auto guarded = GuardDeviceProc(&fakeDeviceProc);
+    auto* device = reinterpret_cast<VkDevice>(std::uintptr_t{0x2000});
+    const auto freeMemory = reinterpret_cast<PFN_vkFreeMemory>(guarded(device, "vkFreeMemory"));
+    recorder.Sync();
+    static_cast<void>(recorder.Commands());
+    const auto before = fakeFrees.load();
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x30}), nullptr);
+    Require(fakeFrees.load() == before, "a free made while a batch was open was not deferred");
+    recorder.Submit();
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x40}), nullptr);
+    Require(fakeFrees.load() == before, "a free was made before the batch open at its release completed");
+    recorder.Sync();
+    freeMemory(device, reinterpret_cast<VkDeviceMemory>(std::uintptr_t{0x50}), nullptr);
+    Require(fakeFrees.load() >= before + 1, "a deferred free was not made once the batch open at its release completed");
+    reinterpret_cast<PFN_vkDestroyDevice>(guarded(device, "vkDestroyDevice"))(device, nullptr);
+    Require(fakeFrees.load() == before + 3, "destroying the device did not make the deferred frees first");
+    std::cout << "GPU free batch deferral tests passed\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--gpu-free-defer-only") return gpuFreeDeferTests();
@@ -6003,6 +6029,7 @@ int main(int argc, char** argv) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-free-batch-defer-only") return gpuFreeBatchDeferTests(recorder);
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
