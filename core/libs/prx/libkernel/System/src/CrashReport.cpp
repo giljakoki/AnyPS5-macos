@@ -13,7 +13,9 @@
 #include <cstring>
 #include <ctime>
 #include <dlfcn.h>
+#include <exception>
 #include <execinfo.h>
+#include <typeinfo>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -278,6 +280,40 @@ struct AlternateStack {
 
 thread_local AlternateStack alternateStack;
 
+std::terminate_handler previousTerminate = nullptr;
+std::atomic<bool> terminating{false};
+
+void Terminate() {
+    if (!terminating.exchange(true)) {
+        Writer out;
+        char hostName[64] = "";
+        pthread_getname_np(pthread_self(), hostName, sizeof(hostName));
+        const PthreadPrivate* guest = CurrentGuestThread();
+        out.Line("\n[crash] std::terminate on host thread %llu '%s'", U(HostThreadId()), hostName);
+        if (guest != nullptr) out.Line(", guest thread tid %lld '%s'", static_cast<long long>(guest->tid), guest->name.c_str());
+        out.Line("\n");
+        if (const auto current = std::current_exception()) {
+            try {
+                std::rethrow_exception(current);
+            } catch (const std::exception& error) {
+                out.Line("[crash] exception %s: %s\n", typeid(error).name(), error.what());
+            } catch (...) {
+                out.Line("[crash] a non-standard exception\n");
+            }
+        } else {
+            out.Line("[crash] no exception in flight\n");
+        }
+        out.Line("[crash] frames:\n");
+        void* frames[64];
+        const int count = backtrace(frames, 64);
+        for (int index = 0; index < count; ++index) Describe(out, "at", reinterpret_cast<std::uintptr_t>(frames[index]), false);
+        ListImages(out);
+        out.Line("[crash] end of report\n");
+    }
+    if (previousTerminate != nullptr) previousTerminate();
+    std::abort();
+}
+
 bool Handled(int signal) {
     struct sigaction current{};
     if (sigaction(signal, nullptr, &current) != 0) return false;
@@ -300,6 +336,7 @@ struct sigaction Action() {
 void Install() {
     static std::atomic<bool> attempted{false};
     if (attempted.exchange(true)) return;
+    previousTerminate = std::set_terminate(Terminate);
     if (Handled(SIGSEGV) || Handled(SIGBUS)) {
         static constexpr char message[] = "[crash] a SIGSEGV or SIGBUS handler is already installed; the crash report is not installed\n";
         Writer::Raw(message, sizeof(message) - 1);
