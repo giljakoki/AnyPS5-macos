@@ -649,6 +649,40 @@ void RunClearDrawLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     std::cout << "clear, draw, discard, present, repeat: ok\n";
 }
 
+void RunGpuFillLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, userData, false);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr, "the filled target has no pending results");
+    const std::array<std::uint32_t, 4> pattern{0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u};
+    auto uploads = StorageTexture::Uploads();
+    for (int frame = 0; frame < 8; ++frame) {
+        StorageTexture::DiscardPendingInside(address, BlockBytes);
+        StorageTexture::FlushPending(address, BlockBytes, nullptr, "test fill");
+        Require(device.FillBuffer(address, BlockBytes, pattern), "the GPU fill was not recorded");
+        const bool cleared = StorageTexture::ClearFilledInside(address, BlockBytes, pattern) == 1;
+        if (frame == 0 && !cleared) throw std::runtime_error("an image under a GPU fill was not cleared");
+        if (frame == 0) uploads = StorageTexture::Uploads();
+        Dispatch(device, WriteCode, userData, false);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        StorageTexture::FlushAllPending("idle");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::Graphics::Recorder::CountPresent();
+        if (!image->Refresh() || StorageTexture::Uploads() != uploads) throw std::runtime_error("a target filled on the GPU and drawn again was uploaded (frame " + std::to_string(frame) + ")");
+    }
+    device.WaitIdle();
+    Require(Count(block, BlockBytes, 0xff) == Threads * 4u && Count(block, BlockBytes, 0x22) == BlockBytes - Threads * 4u, "the filled and drawn target did not reach guest memory");
+    std::cout << "GPU fill over a target, draw, present, repeat: ok\n";
+}
+
 int main() {
     try {
         std::optional<GuestBlock> block;
@@ -671,6 +705,9 @@ int main() {
         std::optional<GuestBlock> cleared;
         cleared.emplace(false);
         RunClearDrawLoop(*device, cleared->Data());
+        std::optional<GuestBlock> filled;
+        filled.emplace(false);
+        RunGpuFillLoop(*device, filled->Data());
         std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());

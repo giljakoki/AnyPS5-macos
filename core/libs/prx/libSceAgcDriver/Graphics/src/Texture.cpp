@@ -86,6 +86,7 @@ std::atomic<std::uint64_t> writeBackBaselines{0};
 std::atomic<std::uint64_t> baselineSyncs{0};
 std::atomic<std::uint64_t> writeBackProofsKept{0};
 std::atomic<std::uint64_t> writeBackWholeBaselines{0};
+std::atomic<std::uint64_t> filledImageClears{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -138,7 +139,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; untracked compares %llu, answered by a proof %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(untrackedCompares), take(untrackedProofHits));
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; %llu upload baselines copied on the GPU, %llu refreshes answered while one was in flight, %llu taken behind a write-back (%llu keeping the match), %llu whole-surface copies behind a write-back without one, %llu reaped for a target the CPU writes; untracked compares %llu, answered by a proof %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(gpuBaselines), take(baselineWaits), take(writeBackBaselines), take(writeBackProofsKept), take(writeBackWholeBaselines), take(baselineSyncs), take(untrackedCompares), take(untrackedProofHits));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; %llu upload baselines copied on the GPU, %llu refreshes answered while one was in flight, %llu taken behind a write-back (%llu keeping the match), %llu whole-surface copies behind a write-back without one, %llu images cleared under a GPU fill, %llu reaped for a target the CPU writes; untracked compares %llu, answered by a proof %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(gpuBaselines), take(baselineWaits), take(writeBackBaselines), take(writeBackProofsKept), take(writeBackWholeBaselines), take(filledImageClears), take(baselineSyncs), take(untrackedCompares), take(untrackedProofHits));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1929,7 +1930,7 @@ bool StorageTexture::Refresh() {
         refreshGeneration();
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
-        uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : discardedUnits && !compared ? "discarded" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : discardedUnits ? "discarded" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
     } else {
         uploadedKeys = keys;
@@ -3556,6 +3557,78 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     }
     if (discarded != 0) BumpPendingSerial();
     return discarded;
+}
+
+std::size_t StorageTexture::ClearFilledInside(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+    static const bool disabled = std::getenv("APS5_NO_FILLED_IMAGE_CLEAR") != nullptr;
+    auto* recorder = Recorder::Active();
+    if (disabled || recorder == nullptr || !std::all_of(pattern.begin(), pattern.end(), [&](std::uint32_t word) { return word == pattern[0]; })) return 0;
+    const auto end = address + bytes;
+    std::vector<std::shared_ptr<StorageTexture>> inside;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (texture->released || texture->guestBytes == 0 || texture->descriptor.baseAddress < address || texture->descriptor.baseAddress + texture->guestBytes > end) continue;
+            if (auto shared = texture->weak_from_this().lock()) inside.push_back(std::move(shared));
+        }
+    }
+    std::size_t cleared = 0;
+    for (const auto& texture : inside) {
+        if (texture->clearFilled(*recorder, pattern[0])) ++cleared;
+    }
+    filledImageClears.fetch_add(cleared, std::memory_order_relaxed);
+    return cleared;
+}
+
+bool StorageTexture::clearFilled(Recorder& recorder, std::uint32_t word) {
+    if (dirty || anyLayerPending() || (descriptor.dccAddress != 0 && TextureClearKeys(descriptor, guestBytes) != DccKeys::Uncompressed)) return false;
+    const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+    VkClearColorValue clearValue{};
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    if (!FillClearColor(storageFormat, elementBytes, pattern, clearValue)) return false;
+    const auto commands = recorder.Commands();
+    const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::FillClear);
+    Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
+    if (auto self = weak_from_this().lock()) recorder.Keep(std::move(self));
+    if (Recorder::BarrierValidate()) {
+        const std::pair<VkImage, bool> clearedImage{image, true};
+        recorder.NoteAccess(Recorder::CommandClass::FillClear, Recorder::Access{{}, {}, std::span(&clearedImage, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toClear.image = image;
+    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
+    VkImageMemoryBarrier toGeneral = toClear;
+    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    recorder.EndGpuTiming(timing, guestBytes);
+    original.resize(static_cast<std::size_t>(guestBytes));
+    for (std::size_t offset = 0; offset + sizeof(word) <= original.size(); offset += sizeof(word)) std::memcpy(original.data() + offset, &word, sizeof(word));
+    originalValid = true;
+    pendingBaselines.clear();
+    baselineKeepsProof = false;
+    originalChanged();
+    imageStale.clear();
+    forgetBorrowed(0, trackedLayers);
+    uploadedKeys = DccKeys::Uncompressed;
+    filledKeys = DccKeys::Uncompressed;
+    layerGeneration.assign(trackedLayers, GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
+    refreshGeneration();
+    const auto forget = GuestMemory::ForgetSerial();
+    if (GuestMemory::CollectEpoch() != 0 && (forget & 1u) == 0) untrackedProof = UntrackedProof{Recorder::Presents(), forget, GuestMemory::DriverWriteSerial(), GuestMemory::CollectEpoch(), std::chrono::steady_clock::now()};
+    ++version;
+    return true;
 }
 
 StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address, std::size_t bytes) {

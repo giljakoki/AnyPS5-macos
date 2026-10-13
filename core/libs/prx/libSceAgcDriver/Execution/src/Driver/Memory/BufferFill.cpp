@@ -235,6 +235,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
         phase(FillFlush);
         const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
+        if (stored && !cleared && fillClearEnabled()) Graphics::StorageTexture::ClearFilledInside(base, bytes, pattern);
         phase(FillDevice);
         if (uniformKeysFill && stored && !cleared) {
             Graphics::DccKeys filled = Graphics::DccKeys::Mixed;

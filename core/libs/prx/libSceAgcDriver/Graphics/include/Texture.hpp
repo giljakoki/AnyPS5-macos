@@ -282,6 +282,7 @@ public:
     // Results pending in images lying wholly inside the range are dead (a fill overwrites every
     // byte of them): they are dropped instead of stored. Returns how many images were.
     static std::size_t DiscardPendingInside(std::uint64_t address, std::size_t bytes);
+    static std::size_t ClearFilledInside(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
     // A fill of the whole surface (`layer` WholeImage) or of one array layer with the 16-byte
     // `pattern`, done as a GPU clear of the image instead of a store into guest memory: the
     // pattern must be one texel of the storage format repeated, exactly representable as a clear
@@ -580,6 +581,7 @@ private:
     bool baselineKeepsProof = false;
     void startBaseline(bool keepProof);
     void dropOriginal(const char* reason);
+    bool clearFilled(Recorder& recorder, std::uint32_t word);
     bool inFlightOverlaps(std::uint64_t begin, std::uint64_t end) const;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
