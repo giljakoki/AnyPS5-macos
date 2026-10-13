@@ -224,6 +224,12 @@ void sweepRetiredImports(HostImports& state) {
     std::erase_if(state.graveyard, [recorder](const HostImports::Grave& grave) { return grave.recorder == recorder && recorder->BatchFinished(grave.serial); });
 }
 
+bool dropRetiredImportsOver(HostImports& state, std::uint64_t address, std::uint64_t end) {
+    const auto* recorder = Recorder::Active();
+    if (recorder != nullptr && !recorder->Idle()) return false;
+    return std::erase_if(state.graveyard, [address, end](const HostImports::Grave& grave) { return grave.holder->entry.base < end && address < grave.holder->entry.base + grave.holder->entry.bytes; }) != 0;
+}
+
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
@@ -1582,6 +1588,10 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                 drained = true;
             }
             if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
+            {
+                std::lock_guard importsLock(imports.mutex);
+                if (dropRetiredImportsOver(imports, address, end)) retiredImport = true;
+            }
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
         }
@@ -1649,6 +1659,10 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                     synced = true;
                     drained = true;
                 }
+            }
+            {
+                std::lock_guard importsLock(imports.mutex);
+                if (dropRetiredImportsOver(imports, address, end)) retiredImport = true;
             }
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());

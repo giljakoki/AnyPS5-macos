@@ -1418,13 +1418,13 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
     });
 }
 
-std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, bool deferred) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
-    NoteDriverWrite(address, bytes);
+    NoteDriverWrite(address, bytes, deferred);
     if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
 #ifndef _WIN32
     {
