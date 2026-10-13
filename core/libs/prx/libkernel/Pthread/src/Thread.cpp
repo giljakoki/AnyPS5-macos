@@ -25,6 +25,7 @@
 #include <cerrno>
 #include <csetjmp>
 #include <csignal>
+#include <execinfo.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -370,9 +371,34 @@ void ThreadLifecycle::SetThreadAtexitReport(thread_atexit_report_func_t callback
         throw std::runtime_error("Thread atexit report callback is already registered");
 }
 
+#ifndef _WIN32
+static bool TraceRaise() {
+    static const bool trace = std::getenv("APS5_TRACE_RAISE") != nullptr;
+    return trace;
+}
+
+static void TraceBlockedCreator(const sigset_t& creatorMask, const std::string& child) {
+    if (!TraceRaise() || sigismember(&creatorMask, SIGUSR1) != 1) return;
+    std::uint64_t bits = 0;
+    for (int signal = 1; signal < 64; ++signal)
+        if (sigismember(&creatorMask, signal) == 1) bits |= std::uint64_t{1} << (signal - 1);
+    char hostName[64] = {};
+    pthread_getname_np(pthread_self(), hostName, sizeof(hostName));
+    const PthreadPrivate* creator = CurrentGuestState().current;
+    std::fprintf(stderr, "[raise] creating guest thread '%s' from %s %p '%s' (host thread '%s') with host signal mask 0x%llx; creator stack:\n", child.c_str(), creator ? "guest thread" : "a host thread",
+                 static_cast<const void*>(creator), creator ? creator->name.c_str() : "", hostName, static_cast<unsigned long long>(bits));
+    void* frames[32];
+    const int count = backtrace(frames, 32);
+    for (int i = 0; i < count; ++i) std::fprintf(stderr, "[raise]   #%d %p\n", i, frames[i]);
+}
+#endif
+
 static void finishThread(PthreadPrivate* self, void* retval) {
     if (!self || self != CurrentGuestState().current)
         throw std::runtime_error("Finishing an unregistered guest thread");
+#ifndef _WIN32
+    if (TraceRaise()) std::fprintf(stderr, "[raise] guest thread %p '%s' finishes\n", static_cast<void*>(self), self->name.c_str());
+#endif
     if (CurrentGuestState().finishing)
         throw std::runtime_error("Guest thread is already finishing");
     CurrentGuestState().finishing = true;
@@ -609,6 +635,7 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     sigset_t creatorMask;
     pthread_sigmask(SIG_SETMASK, nullptr, &creatorMask);
     args->signalMask = creatorMask;
+    TraceBlockedCreator(creatorMask, p->name);
     auto native = std::make_unique<NativeThreadArgs>(NativeThreadArgs{std::move(args), start.get_future(), {}});
     auto initialized = native->initialized.get_future();
     pthread_attr_t nativeAttr;

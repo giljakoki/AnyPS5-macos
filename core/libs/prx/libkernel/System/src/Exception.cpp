@@ -4,6 +4,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libkernel/System/include/RaiseTrace.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -432,6 +433,7 @@ void TraceDelivery(const char* stage) {
 }
 
 void Deliver(int, siginfo_t*, void* context) {
+    RaiseTrace::Entered(scePthreadSelf());
     TraceDelivery("handler entered");
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {
@@ -445,12 +447,14 @@ void Deliver(int, siginfo_t*, void* context) {
     FromHost(host, ucontext.mcontext);
     CallHandler(handler, RaisedSignal, ucontext);
     ToHost(ucontext.mcontext, host);
+    RaiseTrace::Returned(scePthreadSelf());
     TraceDelivery("handler returned");
 }
 
 void InstallDelivery() {
     static const bool installed = [] {
-        traceRaise.store(std::getenv("APS5_TRACE_RAISE") != nullptr);
+        traceRaise.store(RaiseTrace::Enabled());
+        RaiseTrace::Start();
         struct sigaction action{};
         action.sa_sigaction = Deliver;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -502,7 +506,7 @@ bool RaiseOn(Pthread thread) {
             std::lock_guard lock(thread->nameLock);
             name = thread->name;
         }
-        std::fprintf(stderr, "[raise] signal to guest thread %p '%s' %s\n", static_cast<void*>(thread), name.c_str(), sent ? "sent" : "not sent, the thread has finished");
+        RaiseTrace::Sent(thread, name.c_str(), sent);
     }
     return sent;
 }
