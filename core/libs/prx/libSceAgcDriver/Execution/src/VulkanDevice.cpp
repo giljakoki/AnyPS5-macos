@@ -3704,6 +3704,37 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
     static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe));
 }
 
+VulkanDevice::MeshPrepassOutput VulkanDevice::DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
+    if (!mesh.compute || groups == 0 || draw.instanceCount == 0 || recordDwords == 0 || recordDwords % 4u != 0) throw std::runtime_error("Vulkan mesh pre-pass: invalid configuration");
+    const auto context = graphicsContext();
+    const auto slots = static_cast<std::size_t>(groups) * draw.instanceCount;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Graphics::Buffer arguments(context, ShaderRecompiler::MeshComputeArgumentBytes, usage);
+    Graphics::Buffer records(context, slots * mesh.maxVertices * recordDwords * sizeof(std::uint32_t), usage | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    Graphics::Buffer indices(context, slots * mesh.maxPrimitives * 3u * sizeof(std::uint32_t), usage | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    std::fill(records.Bytes().begin(), records.Bytes().end(), std::byte{0xff});
+    std::fill(indices.Bytes().begin(), indices.Bytes().end(), std::byte{0xff});
+    const auto split = [](VkDeviceAddress address) { return std::array<std::uint32_t, 2>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)}; };
+    const auto recordAddress = split(records.DeviceAddress());
+    const auto indexAddress = split(indices.DeviceAddress());
+    const std::array<std::uint32_t, ShaderRecompiler::MeshComputeArgumentBytes / 4u> words{groups, draw.instanceCount, 1u, draw.indexCount, 0u, recordAddress[0], recordAddress[1], indexAddress[0], indexAddress[1]};
+    std::memcpy(arguments.Bytes().data(), words.data(), sizeof(words));
+    auto prepass = shader;
+    if (prepass.pushConstants.size() > ShaderRecompiler::MeshDrawPushOffsetBytes) throw std::runtime_error("Vulkan mesh pre-pass: push data overlaps the mesh draw words");
+    prepass.pushConstants.resize(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes);
+    const auto argumentAddress = split(arguments.DeviceAddress());
+    const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4u> drawWords{draw.indexCount, draw.firstVertex, draw.firstInstance, draw.indexed ? draw.indexSize : 0u, argumentAddress[0], argumentAddress[1]};
+    std::memcpy(prepass.pushConstants.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, drawWords.data(), sizeof(drawWords));
+    Dispatch(prepass, groups, draw.instanceCount, 1, snapshots);
+    WaitIdle();
+    MeshPrepassOutput output;
+    output.records.resize(records.Bytes().size() / sizeof(std::uint32_t));
+    output.indices.resize(indices.Bytes().size() / sizeof(std::uint32_t));
+    std::memcpy(output.records.data(), records.Bytes().data(), records.Bytes().size());
+    std::memcpy(output.indices.data(), indices.Bytes().data(), indices.Bytes().size());
+    return output;
+}
+
 VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe) {
     return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe);
 }
