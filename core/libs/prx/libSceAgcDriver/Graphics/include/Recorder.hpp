@@ -48,12 +48,13 @@ public:
     static std::shared_ptr<QueueSubmitter> Acquire(VkQueue queue, PFN_vkQueueSubmit submit);
     static void Drain(VkQueue queue);
     static std::unique_lock<std::mutex> Access(VkQueue queue);
+    static bool SubmitSignaling(VkQueue queue, VkCommandBuffer commands, VkFence fence, VkSemaphore signal);
     static std::uint64_t Submitted();
     QueueSubmitter(VkQueue queue, PFN_vkQueueSubmit submit);
     ~QueueSubmitter();
     QueueSubmitter(const QueueSubmitter&) = delete;
     QueueSubmitter& operator=(const QueueSubmitter&) = delete;
-    void Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value);
+    void Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value, VkSemaphore signal = VK_NULL_HANDLE);
     void Drain();
 
 private:
@@ -62,6 +63,7 @@ private:
         VkFence fence;
         VkSemaphore timeline;
         std::uint64_t value;
+        VkSemaphore signal;
     };
     void run();
     VkQueue queue;

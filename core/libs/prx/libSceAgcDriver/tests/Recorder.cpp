@@ -4378,6 +4378,71 @@ void submitThreadOrderTests(const Device& device, Recorder& recorder) {
     Require(!QueueSubmitter::Enabled() || QueueSubmitter::Submitted() - handedBefore >= static_cast<std::uint64_t>(rounds), "recorded batches did not go through the submit thread");
 }
 
+void submitSignalingTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (!QueueSubmitter::Enabled()) return;
+    recorder.Sync();
+    constexpr std::size_t bytes = 4096;
+    constexpr std::uint32_t pattern = 0x5a5a5a5au;
+    auto source = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer middle(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer destination(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memset(source->Bytes().data(), 0, bytes);
+    std::memset(middle.Bytes().data(), 0, bytes);
+    std::memset(destination.Bytes().data(), 0, bytes);
+    const auto handedBefore = QueueSubmitter::Submitted();
+    const auto filling = recorder.Commands();
+    recorder.Keep(source);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(filling, source->Handle(), 0, bytes, pattern);
+    RecordMemoryBarrier(context, filling, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    recorder.Submit();
+    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocation.commandPool = context.pool;
+    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocation.commandBufferCount = 2;
+    std::array<VkCommandBuffer, 2> commands{};
+    Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, commands.data()), "vkAllocateCommandBuffers signaling");
+    const VkBufferCopy region{0, 0, bytes};
+    const VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[0], &begin), "vkBeginCommandBuffer signaling");
+    RecordMemoryBarrier(context, commands[0], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands[0], source->Handle(), middle.Handle(), 1, &region);
+    Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[0]), "vkEndCommandBuffer signaling");
+    Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[1], &begin), "vkBeginCommandBuffer waiting");
+    RecordMemoryBarrier(context, commands[1], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands[1], middle.Handle(), destination.Handle(), 1, &region);
+    RecordMemoryBarrier(context, commands[1], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[1]), "vkEndCommandBuffer waiting");
+    const VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkSemaphore signaled = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &semaphoreInfo, nullptr, &signaled), "vkCreateSemaphore signaling");
+    const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    std::array<VkFence, 2> fences{};
+    for (auto& fence : fences) Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence), "vkCreateFence signaling");
+    Require(QueueSubmitter::SubmitSignaling(context.queue, commands[0], fences[0], signaled), "a signaling submission was not handed to the submit thread");
+    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo waiting{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    waiting.waitSemaphoreCount = 1;
+    waiting.pWaitSemaphores = &signaled;
+    waiting.pWaitDstStageMask = &waitStage;
+    waiting.commandBufferCount = 1;
+    waiting.pCommandBuffers = &commands[1];
+    {
+        const auto access = QueueSubmitter::Access(context.queue);
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &waiting, fences[1]), "vkQueueSubmit waiting");
+    }
+    Check(context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 2, fences.data(), VK_TRUE, 10'000'000'000ull), "vkWaitForFences signaling");
+    std::uint32_t copied = 0;
+    std::memcpy(&copied, destination.Bytes().data(), sizeof(copied));
+    Require(copied == pattern, "a signaling submission ran before the recorded batch handed earlier, or its semaphore did not order the waiting one");
+    Require(QueueSubmitter::Submitted() - handedBefore >= 2, "the recorded batch and the signaling submission did not both go through the submit thread");
+    for (const auto fence : fences) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, signaled, nullptr);
+    context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands.data());
+    recorder.Sync();
+    std::cout << "submit thread signaling: a binary semaphore signaled in order\n";
+}
+
 void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     TextureDetiler detiler(base);
@@ -5659,6 +5724,11 @@ int main(int argc, char** argv) {
             std::cout << "CMASK copied clear, write-back and failure tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--submit-signaling-only") {
+            submitThreadOrderTests(device, recorder);
+            submitSignalingTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--multisample-only") {
             multisampleGuestAccessTests(device, recorder);
             return 0;
@@ -5723,6 +5793,7 @@ int main(int argc, char** argv) {
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
         submitThreadOrderTests(device, recorder);
+        submitSignalingTests(device, recorder);
         imageMemoTests(device, recorder);
         importedSnapshotProofTests(device, recorder);
         minLodTests(device, recorder);

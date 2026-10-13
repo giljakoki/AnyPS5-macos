@@ -59,6 +59,13 @@ std::unique_lock<std::mutex> QueueSubmitter::Access(VkQueue queue) {
     return std::unique_lock(submitter->queueMutex);
 }
 
+bool QueueSubmitter::SubmitSignaling(VkQueue queue, VkCommandBuffer commands, VkFence fence, VkSemaphore signal) {
+    const auto submitter = registeredSubmitter(queue);
+    if (submitter == nullptr) return false;
+    submitter->Enqueue(commands, fence, VK_NULL_HANDLE, 0, signal);
+    return true;
+}
+
 std::uint64_t QueueSubmitter::Submitted() {
     return threadSubmissions.load(std::memory_order_relaxed);
 }
@@ -76,11 +83,12 @@ QueueSubmitter::~QueueSubmitter() {
     if (thread.joinable()) thread.join();
 }
 
-void QueueSubmitter::Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value) {
+void QueueSubmitter::Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value, VkSemaphore signal) {
+    Require(timeline == VK_NULL_HANDLE || signal == VK_NULL_HANDLE, "a submission signals either the timeline or a binary semaphore");
     {
         std::lock_guard lock(mutex);
         Check(error, "vkQueueSubmit recorder (submit thread)");
-        jobs.push_back({commands, fence, timeline, value});
+        jobs.push_back({commands, fence, timeline, value, signal});
     }
     work.notify_one();
 }
@@ -108,6 +116,9 @@ void QueueSubmitter::run() {
             submission.pNext = &timelineInfo;
             submission.signalSemaphoreCount = 1;
             submission.pSignalSemaphores = &job.timeline;
+        } else if (job.signal != VK_NULL_HANDLE) {
+            submission.signalSemaphoreCount = 1;
+            submission.pSignalSemaphores = &job.signal;
         }
         VkResult result = VK_SUCCESS;
         {
