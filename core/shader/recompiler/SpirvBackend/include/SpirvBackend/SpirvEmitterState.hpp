@@ -211,9 +211,15 @@ struct SpirvDeferredPhiPatch {
     std::uint32_t half = 0;
 };
 
+struct StructuredLoopLatch {
+    const IrBlock* header = nullptr;
+    std::uint32_t label = 0;
+};
+
 struct StructuredFunctionState {
     std::unordered_map<const IrBlock*, std::uint32_t> blockExitLabels;
     std::vector<SpirvDeferredPhiPatch> deferredPhis;
+    std::unordered_map<const IrBlock*, StructuredLoopLatch> loopLatches;
 };
 
 enum class SpirvFormatComponentType {
