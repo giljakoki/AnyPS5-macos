@@ -1,9 +1,14 @@
 #include "Optimization/HostInterpolationChecker.hpp"
+#include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrBlock.hpp"
 #include "IntermediateRepresentation/IrMetadata/StageIO.hpp"
 #include "Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/MaskedSelectEliminator.hpp"
+#include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <optional>
+#include <string_view>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -186,6 +191,206 @@ bool sharesSlots(const IrProgram& program, const ShaderPixelInputInfo& pixel, st
     return false;
 }
 
+struct LaneWords {
+    const IrValue* low = nullptr;
+    const IrValue* high = nullptr;
+    bool operator==(const LaneWords&) const = default;
+};
+
+bool isImmediateValue(const IrValue* value, std::uint32_t immediate) {
+    value = value->Resolve();
+    return value->HasImmediate() && value->ImmediateU32() == immediate;
+}
+
+std::optional<LaneWords> ownBitWords(const IrValue* value) {
+    value = value->Resolve();
+    if (value->Opcode() != IrOpcode::INotEqual32 || !isImmediateValue(value->Argument(1), 0u)) return std::nullopt;
+    const auto* bit = value->Argument(0)->Resolve();
+    if (bit->Opcode() != IrOpcode::BitwiseAnd32 || !isImmediateValue(bit->Argument(1), 1u)) return std::nullopt;
+    const auto* shift = bit->Argument(0)->Resolve();
+    if (shift->Opcode() != IrOpcode::ShiftRightLogical32) return std::nullopt;
+    const auto* laneBits = shift->Argument(1)->Resolve();
+    if (laneBits->Opcode() != IrOpcode::BitwiseAnd32 || laneBits->Argument(0)->Resolve()->Opcode() != IrOpcode::LaneId || !isImmediateValue(laneBits->Argument(1), 31u)) return std::nullopt;
+    const auto* half = shift->Argument(0)->Resolve();
+    if (half->Opcode() != IrOpcode::SelectU32) return std::nullopt;
+    const auto* low = half->Argument(0)->Resolve();
+    if (low->Opcode() != IrOpcode::ULessThan32 || low->Argument(0)->Resolve()->Opcode() != IrOpcode::LaneId || !isImmediateValue(low->Argument(1), 32u)) return std::nullopt;
+    return LaneWords{half->Argument(1)->Resolve(), half->Argument(2)->Resolve()};
+}
+
+bool implies(const IrValue* condition, const IrValue* implied, std::uint32_t depth = 0) {
+    condition = condition->Resolve();
+    implied = implied->Resolve();
+    if (condition == implied) return true;
+    if (depth > 8 || condition->Opcode() != IrOpcode::LogicalAnd) return false;
+    return implies(condition->Argument(0), implied, depth + 1) || implies(condition->Argument(1), implied, depth + 1);
+}
+
+const IrValue* ballotOf(const IrValue* word, std::uint32_t half) {
+    word = word->Resolve();
+    if (word->Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediateValue(word->Argument(1), half)) return nullptr;
+    const auto* ballot = word->Argument(0)->Resolve();
+    return ballot->Opcode() == IrOpcode::Ballot ? ballot : nullptr;
+}
+
+bool alwaysTrue(const IrValue* value) {
+    value = value->Resolve();
+    return value->Type() == IrType::U1 && value->HasImmediate() && value->ImmediateU32() != 0u;
+}
+
+bool wordWithin(const IrValue* exec, const IrValue* condition, std::uint32_t half, std::uint32_t depth = 0) {
+    exec = exec->Resolve();
+    condition = condition->Resolve();
+    if (exec == condition) return true;
+    if (depth > 12) return false;
+    if (exec->Opcode() == IrOpcode::BitwiseAnd32 && (wordWithin(exec->Argument(0), condition, half, depth + 1) || wordWithin(exec->Argument(1), condition, half, depth + 1))) return true;
+    if (condition->Opcode() == IrOpcode::BitwiseAnd32) return wordWithin(exec, condition->Argument(0), half, depth + 1) && wordWithin(exec, condition->Argument(1), half, depth + 1);
+    if (condition->Opcode() == IrOpcode::CompositeExtractU64 && isImmediateValue(condition->Argument(1), half)) {
+        const auto* wqm = condition->Argument(0)->Resolve();
+        if (wqm->Opcode() == IrOpcode::WqmU64) {
+            const auto* pair = wqm->Argument(0)->Resolve();
+            if (pair->Opcode() == IrOpcode::CompositeConstructU64 && wordWithin(exec, pair->Argument(half), half, depth + 1)) return true;
+        }
+    }
+    const auto* conditionBallot = ballotOf(condition, half);
+    if (conditionBallot != nullptr && alwaysTrue(conditionBallot->Argument(0))) return true;
+    const auto* execBallot = ballotOf(exec, half);
+    if (execBallot == nullptr || conditionBallot == nullptr) return false;
+    return implies(execBallot->Argument(0), conditionBallot->Argument(0));
+}
+
+bool coversLanes(const LaneWords& condition, const LaneWords& exec) {
+    return wordWithin(exec.low, condition.low, 0u) && wordWithin(exec.high, condition.high, 1u);
+}
+
+const IrValue* incomingFor(const IrValue& phi, const IrBlock* block) {
+    for (std::size_t index = 0; index < phi.PhiBlockCount(); ++index) {
+        if (phi.PhiBlock(index) == block) return phi.Argument(index)->Resolve();
+    }
+    return nullptr;
+}
+
+bool execWithinCondition(const IrValue* condition, const IrValue* exec) {
+    const auto execWords = ownBitWords(exec);
+    if (!execWords) return false;
+    condition = condition->Resolve();
+    if (const auto words = ownBitWords(condition)) return coversLanes(*words, *execWords);
+    if (!condition->IsPhi() || !execWords->low->IsPhi() || !execWords->high->IsPhi() || condition->Parent() != execWords->low->Parent() || condition->Parent() != execWords->high->Parent()) return false;
+    for (std::size_t index = 0; index < condition->PhiBlockCount(); ++index) {
+        const auto* block = condition->PhiBlock(index);
+        const auto* low = incomingFor(*execWords->low, block);
+        const auto* high = incomingFor(*execWords->high, block);
+        const auto words = ownBitWords(condition->Argument(index));
+        if (low == nullptr || high == nullptr || !words || !coversLanes(*words, LaneWords{low, high})) return false;
+    }
+    return true;
+}
+
+bool carriesBarycentric(const IrValue* value, std::vector<const IrValue*>& visited) {
+    value = lookThrough(value);
+    if (isBarycentric(*value)) return true;
+    if (!value->IsPhi() || std::find(visited.begin(), visited.end(), value) != visited.end()) return false;
+    visited.push_back(value);
+    for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+        if (value->Argument(index) != nullptr && carriesBarycentric(value->Argument(index), visited)) return true;
+    }
+    return false;
+}
+
+bool takeExportedSelects(IrProgram& program) {
+    std::vector<IrValue*> proven;
+    for (const auto& block : program.Blocks()) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::SelectU32) continue;
+            std::vector<const IrValue*> visited;
+            if (!carriesBarycentric(inst->Argument(2), visited)) continue;
+            const bool exported = usesAll(*inst, [&](const IrValue& user, std::size_t) {
+                if (user.Opcode() != IrOpcode::CompositeConstructU32x4) return false;
+                return usesAll(user, [&](const IrValue& store, std::size_t operand) {
+                    return store.Opcode() == IrOpcode::SetAttribute && operand == 0u && execWithinCondition(inst->Argument(0), store.Argument(1));
+                });
+            });
+            if (exported && inst->HasUses()) proven.push_back(inst);
+        }
+    }
+    for (auto* select : proven) select->ReplaceAllUsesWith(select->Argument(1));
+    return !proven.empty();
+}
+
+bool laneLocalValue(const IrValue& value) {
+    if (IrOpcodeHasSideEffects(value.Opcode()) || value.Type() == IrType::Void) return false;
+    switch (value.Opcode()) {
+        case IrOpcode::Ballot:
+        case IrOpcode::ReadLane:
+        case IrOpcode::ReadFirstLane:
+        case IrOpcode::WriteLane:
+        case IrOpcode::DppMoveU32:
+        case IrOpcode::DppUpdateU32:
+        case IrOpcode::Permlane16U32:
+        case IrOpcode::SwizzleU32:
+        case IrOpcode::PermuteU32:
+        case IrOpcode::BpermuteU32:
+        case IrOpcode::MakeImageAddress:
+            return false;
+        default:
+            break;
+    }
+    return BufferAccessOf(value.Opcode()) == BufferAccess::None && SharedAccessOf(value.Opcode()) == SharedAccess::None && AddressOpcodeInfoOf(value.Opcode()).access == AddressAccess::None && ImageOpcodeInfoOf(value.Opcode()).access == ImageAccess::None;
+}
+
+bool guards(const IrValue* guard, const IrValue* keep) {
+    if (implies(guard, keep)) return true;
+    const auto guardWords = ownBitWords(guard);
+    const auto keepWords = ownBitWords(keep);
+    return guardWords && keepWords && coversLanes(*keepWords, *guardWords);
+}
+
+bool maskedOnly(const IrValue& value, const IrValue* keep, std::vector<const IrValue*>& visited) {
+    for (const auto& use : value.OperandUses()) {
+        const auto& user = *use.user;
+        if (std::find(visited.begin(), visited.end(), &user) != visited.end()) continue;
+        if (isCopy(user) || user.IsPhi()) {
+            visited.push_back(&user);
+            if (!maskedOnly(user, keep, visited)) return false;
+            continue;
+        }
+        if (user.Opcode() == IrOpcode::SelectU32 && use.operand == 2u) {
+            visited.push_back(&user);
+            if (!maskedOnly(user, keep != nullptr ? keep : user.Argument(0)->Resolve(), visited)) return false;
+            continue;
+        }
+        if (keep == nullptr) return false;
+        if (user.Opcode() == IrOpcode::LogicalAnd && guards(user.Argument(use.operand == 0u ? 1u : 0u), keep)) continue;
+        if (user.Opcode() == IrOpcode::MakeImageAddress) {
+            const bool sampled = usesAll(user, [](const IrValue& sample, std::size_t) { return ImageOpcodeInfoOf(sample.Opcode()).access == ImageAccess::Read; });
+            if (sampled) continue;
+        }
+        if (laneLocalValue(user)) {
+            visited.push_back(&user);
+            if (!maskedOnly(user, keep, visited)) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool zeroMaskedBarycentrics(IrProgram& program) {
+    std::vector<IrValue*> zeroed;
+    for (const auto& block : program.Blocks()) {
+        for (IrValue* inst : block->Instructions()) {
+            std::vector<const IrValue*> visited;
+            if (isBarycentric(*inst) && inst->HasUses() && maskedOnly(*inst, nullptr, visited)) zeroed.push_back(inst);
+        }
+    }
+    for (auto* barycentric : zeroed) {
+        auto& zero = program.CreateValue(IrOpcode::Void, barycentric->Type());
+        zero.SetImmediateU32(0u);
+        barycentric->ReplaceAllUsesWith(&zero);
+    }
+    return !zeroed.empty();
+}
+
 bool unhookUnobservedPhiReads(IrProgram& program) {
     std::vector<std::pair<IrValue*, std::size_t>> unobserved;
     for (const auto& block : program.Blocks()) {
@@ -206,6 +411,14 @@ bool unhookUnobservedPhiReads(IrProgram& program) {
     return !unobserved.empty();
 }
 
+}
+
+bool BarycentricMaskedZero() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BARYCENTRIC_MASKED_ZERO");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
 }
 
 bool HostInterpolationChecker::Lower(IrProgram& program, const ShaderPixelInputInfo& pixel, std::string& reason) const {
@@ -233,6 +446,8 @@ bool HostInterpolationChecker::Lower(IrProgram& program, const ShaderPixelInputI
     DeadCodeEliminator{}.Eliminate(program);
     if (MaskedSelectEliminator{}.Eliminate(program).removedSelects != 0u) DeadCodeEliminator{}.Eliminate(program);
     if (unhookUnobservedPhiReads(program)) DeadCodeEliminator{}.Eliminate(program);
+    if (takeExportedSelects(program)) DeadCodeEliminator{}.Eliminate(program);
+    if (BarycentricMaskedZero() && zeroMaskedBarycentrics(program)) DeadCodeEliminator{}.Eliminate(program);
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
             if (isBarycentric(*inst) || inst->Opcode() == IrOpcode::InterpolateHostP1) {
