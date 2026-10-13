@@ -129,12 +129,17 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
 void ReportBarycentricEmulation(const RecompileRequest& request, const std::string& reason) {
     static std::mutex mutex;
     static std::set<std::pair<std::uint64_t, std::string>> reported;
-    static const bool dump = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+    static const char* dumpMode = std::getenv("APS5_DUMP_SHADERS");
     const auto address = request.shader.codeAddress;
     const std::lock_guard lock(mutex);
     if (!reported.emplace(address, reason).second) return;
     std::fprintf(stderr, "[recompile] pixel shader 0x%llx emulates barycentrics: %s\n", static_cast<unsigned long long>(address), reason.c_str());
-    if (!dump) return;
+    if (dumpMode == nullptr) return;
+    if (std::string_view(dumpMode) == "log") {
+        const auto text = "RecompileRequest:\n" + RequestSerializer{}.Serialize(request) + "\n";
+        std::fwrite(text.data(), 1, text.size(), stderr);
+        return;
+    }
     char name[64];
     std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
     const auto text = RequestSerializer{}.Serialize(request);

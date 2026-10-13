@@ -14,9 +14,42 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
+#include <cstdio>
+#include <map>
+#include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool SkipFailedDraws() {
+    static const bool skip = [] {
+        const char* value = std::getenv("APS5_SKIP_FAILED_DRAWS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return skip;
+}
+
+void NoteSkippedDraw(const char* reason) {
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> skipped;
+    static std::uint64_t total = 0;
+    std::string key(reason);
+    if (const auto request = key.find("\nRecompileRequest:"); request != std::string::npos) key.resize(request);
+    std::lock_guard lock(mutex);
+    ++total;
+    const auto count = ++skipped[key];
+    if (count == 1u) {
+        std::fprintf(stderr, "[draw] skipped a draw the driver cannot run (APS5_SKIP_FAILED_DRAWS, %llu skipped so far): %s\n", static_cast<unsigned long long>(total), reason);
+    } else if ((count & (count - 1u)) == 0u) {
+        std::fprintf(stderr, "[draw] skipped %llu draws for: %.300s\n", static_cast<unsigned long long>(count), key.c_str());
+    }
+}
+
+}
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
@@ -342,7 +375,8 @@ void Driver::execute(const Submission& submission) {
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
-                    throw;
+                    if (!SkipFailedDraws()) throw;
+                    NoteSkippedDraw(error.what());
                 }
             });
             finishDrawPacket(drawn);
