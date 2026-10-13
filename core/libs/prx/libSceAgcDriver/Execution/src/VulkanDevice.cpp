@@ -3033,8 +3033,8 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
 }
 
-bool VulkanDevice::ClearDepthSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth) {
-    return Graphics::ClearDepthSurface(graphicsContext(), address, width, height, depth);
+bool VulkanDevice::ClearDepthSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth, std::string* refusal) {
+    return Graphics::ClearDepthSurface(graphicsContext(), address, width, height, depth, refusal);
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {

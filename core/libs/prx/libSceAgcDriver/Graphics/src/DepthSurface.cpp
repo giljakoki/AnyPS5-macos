@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -295,28 +296,47 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
     }
 }
 
-std::optional<DepthStoreClear> MatchDepthStoreClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+bool DepthStoreKernel(std::span<const std::uint32_t> code) {
     static constexpr std::array<std::uint32_t, 12> storeKernel{0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u, 0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du, 0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u};
     static constexpr std::array<std::uint32_t, 15> storeVectorKernel{0xd7460004u, 0x0401060cu, 0xf4280404u, 0xfa000000u, 0xd7460005u, 0x0405060du, 0x7e0c020eu, 0xbf8cc07fu, 0x7e000210u, 0x7e020211u, 0x7e040212u, 0x7e060213u, 0xf0200f28u, 0x00000004u, 0xbf810000u};
     const auto starts = [&](const auto& kernel) { return code.size() >= kernel.size() && std::equal(kernel.begin(), kernel.end(), code.begin()); };
-    if (!starts(storeKernel) && !starts(storeVectorKernel)) return std::nullopt;
-    if (userData.size() < 12 || numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return std::nullopt;
+    return starts(storeKernel) || starts(storeVectorKernel);
+}
+
+std::optional<DepthStoreClear> MatchDepthStoreClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups, const std::array<std::uint32_t, 3>& partialThreads, const char** refusal) {
+    const auto refuse = [&](const char* reason) -> std::optional<DepthStoreClear> {
+        if (refusal != nullptr) *refusal = reason;
+        return std::nullopt;
+    };
+    if (!DepthStoreKernel(code)) return std::nullopt;
+    if (userData.size() < 12) return refuse("its user data has fewer than 12 dwords");
+    if (numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return refuse("its thread group is not 8x8x1");
     const auto image = DecodeTextureResource(userData.first(8));
-    if (image.dimension != TextureDimension::k2DArray && image.dimension != TextureDimension::k2D) return std::nullopt;
-    if (image.baseArray != 0 || image.depthOrLastArray != 0 || groups[2] < 1u) return std::nullopt;
-    const auto width = static_cast<std::uint64_t>(groups[0]) * 8u;
-    const auto height = static_cast<std::uint64_t>(groups[1]) * 8u;
-    if (width < image.width || height < image.height) return std::nullopt;
+    if (image.dimension != TextureDimension::k2DArray && image.dimension != TextureDimension::k2D) return refuse("the image is neither 2D nor a 2D array");
+    if (image.baseArray != 0 || image.depthOrLastArray != 0) return refuse("the image views more than the first slice");
+    if (groups[2] < 1u) return refuse("the dispatch has no group along z");
+    const bool partial = partialThreads != std::array<std::uint32_t, 3>{};
+    const auto width = partial ? static_cast<std::uint64_t>(partialThreads[0]) : static_cast<std::uint64_t>(groups[0]) * 8u;
+    const auto height = partial ? static_cast<std::uint64_t>(partialThreads[1]) : static_cast<std::uint64_t>(groups[1]) * 8u;
+    if (width < image.width || height < image.height) return refuse("the dispatch's threads do not cover the image");
     const auto value = userData[8] | (static_cast<std::uint64_t>(userData[9] & 0xffffu) << 32u);
-    if (value == 0 || (value & 3u) != 0 || userData[10] == 0) return std::nullopt;
+    if (value == 0 || (value & 3u) != 0 || userData[10] == 0) return refuse("its value buffer is null, unaligned or empty");
     return DepthStoreClear{image.baseAddress, image.width, image.height, value};
 }
 
-bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth) {
+bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth, std::string* refusal) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
+        if (surface->context.device == context.device && surface->target.stencilAddress == address && surface->target.address != address && refusal != nullptr) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "the image is the stencil plane of the depth surface at 0x%llx", static_cast<unsigned long long>(surface->target.address));
+            *refusal = text;
+        }
         if (surface->context.device != context.device || surface->target.address != address) continue;
-        if (width < surface->target.extent.width || height < surface->target.extent.height) return false;
+        if (width < surface->target.extent.width || height < surface->target.extent.height) {
+            if (refusal != nullptr) *refusal = "the store covers " + std::to_string(width) + "x" + std::to_string(height) + " but the depth surface is " + std::to_string(surface->target.extent.width) + "x" + std::to_string(surface->target.extent.height);
+            return false;
+        }
         surface->clearDepth = depth;
         surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
         surface->ApplyFastClear();

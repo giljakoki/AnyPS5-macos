@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -227,6 +228,14 @@ void RunDepthSurfaceReuseTests() {
     Require(match && match->image == depth32 && match->width == 384 && match->height == 384 && match->value == 0x7000, "a constant image_store over a whole 2D surface must be recognised as a clear");
     Require(!MatchDepthStoreClear(storeKernel, covering, threads, {47u, 48u, 1u}), "a constant image_store that misses a column must not be a clear");
     Require(!MatchDepthStoreClear(storeKernel, covering, {8u, 4u, 1u}, {48u, 96u, 1u}), "another thread shape must not be recognised");
+    const auto odd = storeUserData(depth32, 380, 378, 0x7000);
+    const auto partialMatch = MatchDepthStoreClear(storeKernel, odd, threads, {48u, 48u, 1u}, {380u, 378u, 1u});
+    Require(partialMatch && partialMatch->width == 380 && partialMatch->height == 378, "a constant image_store whose partial last groups end at the image edge must be recognised as a clear");
+    const char* refusal = nullptr;
+    Require(!MatchDepthStoreClear(storeKernel, covering, threads, {48u, 48u, 1u}, {380u, 384u, 1u}, &refusal) && refusal != nullptr && std::string_view(refusal).find("cover") != std::string_view::npos, "partial last groups that stop short of the image must be refused as not covering it");
+    refusal = nullptr;
+    Require(!MatchDepthStoreClear(storeKernel, covering, {8u, 4u, 1u}, {48u, 96u, 1u}, {}, &refusal) && refusal != nullptr && std::string_view(refusal).find("thread group") != std::string_view::npos, "a refused thread shape must say so");
+    Require(DepthStoreKernel(storeKernel) && !DepthStoreKernel(std::span(storeKernel).first(11)), "only the whole store kernel is a depth store kernel");
     static constexpr std::array<std::uint32_t, 15> storeVectorKernel{0xd7460004u, 0x0401060cu, 0xf4280404u, 0xfa000000u, 0xd7460005u, 0x0405060du, 0x7e0c020eu, 0xbf8cc07fu, 0x7e000210u, 0x7e020211u, 0x7e040212u, 0x7e060213u, 0xf0200f28u, 0x00000004u, 0xbf810000u};
     const auto vectorMatch = MatchDepthStoreClear(storeVectorKernel, covering, threads, {48u, 48u, 1u});
     Require(vectorMatch && vectorMatch->image == depth32 && vectorMatch->value == 0x7000, "a four-component constant image_store over a whole 2D surface must be recognised as a clear of its first component");
@@ -236,7 +245,8 @@ void RunDepthSurfaceReuseTests() {
     Require(!MatchDepthStoreClear(storeKernel, storeUserData(depth32, 384, 384, 0), threads, {48u, 48u, 1u}), "a null value buffer must not be recognised");
     const auto before = clears;
     Require(ClearDepthSurface(context, depth32, 384, 384, 0.25f) && clears == before + 1 && lastClearDepth == 0.25f, "a recognised clear of a depth surface must clear its depth plane with the stored value");
-    Require(!ClearDepthSurface(context, depth32, 192, 384, 0.5f) && clears == before + 1, "a clear narrower than the depth surface must be refused");
+    std::string narrow;
+    Require(!ClearDepthSurface(context, depth32, 192, 384, 0.5f, &narrow) && clears == before + 1 && narrow.find("192x384") != std::string::npos, "a clear narrower than the depth surface must be refused and say why");
     Require(!ClearDepthSurface(context, 0x70000000, 384, 384, 0.5f), "a clear of memory without a depth surface must be refused");
 
     ClearDepthSurfaces(context.device);
