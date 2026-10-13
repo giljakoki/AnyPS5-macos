@@ -339,6 +339,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
     writer.Value(result.barycentricEmulation.linear);
+    writer.Value(result.meshRecordDwords);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -381,6 +382,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
     reader.Value(result.barycentricEmulation.linear);
+    reader.Value(result.meshRecordDwords);
     result.variantId = 0;
 }
 

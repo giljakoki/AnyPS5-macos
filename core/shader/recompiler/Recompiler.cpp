@@ -516,6 +516,10 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     for (const auto& output : program.Info().outputs) {
         if (output.kind == StageOutputKind::Parameter) result.parameterExports.push_back(output.location);
     }
+    if (HostStage(request) != request.shader.stage) {
+        const auto layer = std::any_of(program.Info().outputs.begin(), program.Info().outputs.end(), [](const StageOutput& output) { return output.kind == StageOutputKind::Layer; });
+        result.meshRecordDwords = (4u + 4u * static_cast<std::uint32_t>(result.parameterExports.size()) + (layer ? 1u : 0u) + 3u) & ~3u;
+    }
     if (request.shader.stage == ShaderStage::Fragment) {
         result.fragmentParameters = DescribeFragmentParameters(program, inputInfo);
         const auto& inputs = program.Info().inputs;
@@ -776,6 +780,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,
+        .meshRecordDwords = artifact.meshRecordDwords,
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{});

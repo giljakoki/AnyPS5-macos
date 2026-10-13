@@ -169,7 +169,22 @@ RecompileResult BuildMeshPassThroughVertexShader(const MeshProgramLayout& layout
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     result.spirv = ValidateAndOptimizeSpirv(result.spirv, target.vulkanVersion, target.spirvVersion);
 #endif
+    std::uint64_t variant = 0xcbf29ce484222325ull;
+    for (const auto word : result.spirv.Words()) variant = (variant ^ word) * 0x100000001b3ull;
+    result.variantId = variant | 1u;
     return result;
+}
+
+RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target) {
+    require(prepass.meshRecordDwords != 0u, "the program was not compiled as a mesh pre-pass");
+    MeshProgramLayout layout;
+    for (const auto location : prepass.parameterExports) {
+        require(location < 32u, "parameter location " + std::to_string(location) + " is out of range");
+        layout.parameterMask |= 1u << location;
+    }
+    layout.recordDwords = prepass.meshRecordDwords;
+    layout.layer = prepass.meshRecordDwords > 4u + 4u * layout.ParameterCount();
+    return BuildMeshPassThroughVertexShader(layout, target, false);
 }
 
 }

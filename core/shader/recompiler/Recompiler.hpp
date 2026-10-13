@@ -512,6 +512,7 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
+    std::uint32_t meshRecordDwords = 0;
     std::uint64_t variantId = 0;
 };
 
@@ -589,6 +590,7 @@ inline constexpr std::uint32_t PositionExportLayerViewportBits = (1u << 18u) | (
 
 [[nodiscard]] MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request);
 [[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const MeshProgramLayout& layout, const SpirvTarget& target, bool writeLayer);
+[[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target);
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
