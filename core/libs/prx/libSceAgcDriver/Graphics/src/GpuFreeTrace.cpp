@@ -8,6 +8,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <type_traits>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -108,14 +109,19 @@ void handle(FreeKind kind, VkDevice device, std::uint64_t object) {
         note.depth = depth > 2 ? depth - 2 : 0;
 #endif
     }
+    if (DeferBy().count() == 0) {
+        if (Traced()) {
+            std::lock_guard lock(state.mutex);
+            state.ring[state.count % state.ring.size()] = note;
+            ++state.count;
+        }
+        release(state, {kind, device, object, now});
+        return;
+    }
     std::lock_guard lock(state.mutex);
     if (Traced()) {
         state.ring[state.count % state.ring.size()] = note;
         ++state.count;
-    }
-    if (DeferBy().count() == 0) {
-        release(state, {kind, device, object, now});
-        return;
     }
     state.deferred.push_back({kind, device, object, now + DeferBy()});
     ++state.deferredTotal;
@@ -194,6 +200,7 @@ PFN_vkGetDeviceProcAddr GuardDeviceProc(PFN_vkGetDeviceProcAddr real) {
     if (!Traced() && DeferBy().count() == 0) return real;
     auto& state = State();
     state.real = real;
+    if (Traced()) std::fprintf(stderr, "[gpu-free] APS5_TRACE_GPU_FREES: Vulkan frees are recorded and the last 256 printed when the device is lost\n");
     if (DeferBy().count() != 0) std::fprintf(stderr, "[gpu-free] APS5_DEFER_GPU_FREES: Vulkan memory, buffers, images and views are freed %lld ms after the driver releases them\n", static_cast<long long>(DeferBy().count()));
     return &guardedDeviceProc;
 }
@@ -202,13 +209,24 @@ void ReportGpuFrees(const char* why) {
     if (!Traced()) return;
     auto& state = State();
     if (state.reported.exchange(true)) return;
-    std::unique_lock lock(state.mutex, std::try_to_lock);
-    if (!lock.owns_lock()) return;
+    std::unique_lock lock(state.mutex, std::defer_lock);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (!lock.try_lock()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr, "[gpu-free] %s: the free record stayed locked for 500 ms; printing it unlocked\n", why);
+            break;
+        }
+        std::this_thread::yield();
+    }
+    const auto ring = state.ring;
+    const auto count = state.count;
+    const auto deferredTotal = state.deferredTotal;
+    if (lock.owns_lock()) lock.unlock();
     const auto now = std::chrono::steady_clock::now();
-    const auto shown = std::min<std::uint64_t>(state.count, state.ring.size());
-    std::fprintf(stderr, "[gpu-free] %s: %llu Vulkan frees and destroys (%llu deferred), the last %llu oldest first, with the callers' module offsets\n", why, static_cast<unsigned long long>(state.count), static_cast<unsigned long long>(state.deferredTotal), static_cast<unsigned long long>(shown));
-    for (std::uint64_t n = state.count - shown; n < state.count; ++n) {
-        const auto& note = state.ring[n % state.ring.size()];
+    const auto shown = std::min<std::uint64_t>(count, ring.size());
+    std::fprintf(stderr, "[gpu-free] %s: %llu Vulkan frees and destroys (%llu deferred), the last %llu oldest first, with the callers' module offsets\n", why, static_cast<unsigned long long>(count), static_cast<unsigned long long>(deferredTotal), static_cast<unsigned long long>(shown));
+    for (std::uint64_t n = count - shown; n < count; ++n) {
+        const auto& note = ring[n % ring.size()];
         std::fprintf(stderr, "[gpu-free]   -%.1f ms %s 0x%llx from", std::chrono::duration<double, std::milli>(now - note.at).count(), kindName(note.kind), static_cast<unsigned long long>(note.handle));
         for (int i = 0; i < note.depth; ++i) printFrame(note.frames[static_cast<std::size_t>(i)]);
         std::fprintf(stderr, "\n");
