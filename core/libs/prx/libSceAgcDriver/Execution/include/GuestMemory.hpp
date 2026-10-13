@@ -15,6 +15,7 @@ namespace AgcDriver::GuestMemory {
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
+std::uint64_t PageRegionCacheHits();
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while
 // the guest commits their pages on demand, so a binding can cover reserved but uncommitted pages.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable = false);

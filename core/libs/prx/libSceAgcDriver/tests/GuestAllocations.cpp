@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -168,6 +168,43 @@ void RunGuestAllocationTests() {
         reject([&] { mutation.Unmap(&imageProbe, 1, [&](const void*, std::size_t, const void*, bool) { applied = true; }); });
         Require(!applied, "split image memory became releasable");
     }
+#endif
+}
+
+void RunRegionCacheTests() {
+#if defined(__APPLE__)
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    const auto page = static_cast<std::size_t>(getpagesize());
+    const auto bytes = 4 * page;
+    auto* block = static_cast<std::byte*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(block != MAP_FAILED, "cannot map the region cache test pages");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, false);
+    }
+    Require(GuestMemory::Accessible(block, bytes, true), "a registered writable range is not accessible");
+    const auto hits = GuestMemory::PageRegionCacheHits();
+    for (int repeat = 0; repeat < 8; ++repeat) Require(GuestMemory::Accessible(block + page, page, true), "a registered writable range is not accessible");
+    Require(GuestMemory::PageRegionCacheHits() >= hits + 8, "repeated accessibility checks of a registered range queried the kernel");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(block + page, page, true, false, false, [&] { Require(mprotect(block + page, page, PROT_READ) == 0, "cannot protect the region cache test page"); });
+    }
+    Require(GuestMemory::Accessible(block + page, page) && !GuestMemory::Accessible(block + page, page, true), "a cached region outlived a protection change");
+    Require(GuestMemory::Accessible(block + 2 * page, page, true), "a protection change of one page changed its neighbour");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(block + page, page, true, true, false, [&] { Require(mprotect(block + page, page, PROT_READ | PROT_WRITE) == 0, "cannot unprotect the region cache test page"); });
+    }
+    Require(GuestMemory::Accessible(block, bytes, true), "a cached region outlived a protection restore");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        Require(munmap(block + 3 * page, page) == 0, "cannot unmap the region cache test's last page");
+    }
+    Require(!GuestMemory::Accessible(block + 3 * page, page), "a cached region outlived an unmap");
+    Require(GuestMemory::Accessible(block, page, true), "the pages before an unmapped one are not accessible");
+    munmap(block, 3 * page);
 #endif
 }
 

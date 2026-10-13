@@ -80,6 +80,8 @@ std::atomic<std::uint64_t> forgetCalls{0};
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> regionCacheHits{0};
+std::atomic<std::uint64_t> regionQueries{0};
 std::atomic<std::uint64_t> comparedBytes{0};
 std::atomic<std::uint64_t> walkedBytes{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
@@ -314,6 +316,7 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" page regions %llu queried, %llu cached", static_cast<unsigned long long>(regionQueries.load()), static_cast<unsigned long long>(regionCacheHits.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -494,6 +497,45 @@ struct PageRun {
     bool writable;
 };
 
+#ifdef __APPLE__
+struct CachedRegion {
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t generation = 0;
+    bool writable = false;
+};
+
+struct RegionCache {
+    std::array<CachedRegion, 16> entries{};
+    std::size_t next = 0;
+};
+
+thread_local RegionCache regionCache;
+
+bool regionCacheEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_REGION_CACHE") != nullptr;
+    return !disabled;
+}
+
+const CachedRegion* cachedRegion(std::uintptr_t address, std::uint64_t generation) {
+    for (const auto& entry : regionCache.entries) {
+        if (entry.generation == generation && entry.begin <= address && address < entry.end) return &entry;
+    }
+    return nullptr;
+}
+
+void cacheRegion(std::uintptr_t begin, std::uintptr_t end, bool writable, std::uint64_t generation) {
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto found = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uintptr_t value, const auto& range) { return value < range->address; });
+    if (found == lease.begin()) return;
+    const auto& range = **std::prev(found);
+    if (range.address + range.bytes <= begin) return;
+    const auto last = std::min<std::uintptr_t>(end, static_cast<std::uintptr_t>(range.address + range.bytes));
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) return;
+    regionCache.entries[regionCache.next++ % regionCache.entries.size()] = {begin, last, generation, writable};
+}
+#endif
+
 
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
@@ -552,6 +594,17 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #elif defined(__APPLE__)
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (regionCacheEnabled()) {
+            if (const auto* region = cachedRegion(cursor, generation)) {
+                regionCacheHits.fetch_add(1, std::memory_order_relaxed);
+                const auto next = std::min<std::uintptr_t>(end, region->end);
+                if (!emit(PageRun{cursor, next, true, region->writable})) return true;
+                cursor = next;
+                continue;
+            }
+        }
+        regionQueries.fetch_add(1, std::memory_order_relaxed);
         // The region at or above the cursor, with its current protection.
         auto regionBase = static_cast<mach_vm_address_t>(cursor);
         mach_vm_size_t regionSize = 0;
@@ -573,6 +626,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         const auto next = std::min<std::uintptr_t>(end, regionBase + regionSize);
         const bool readable = (info.protection & VM_PROT_READ) != 0;
         const bool writable = readable && (info.protection & VM_PROT_WRITE) != 0;
+        if (readable && regionCacheEnabled()) cacheRegion(cursor, static_cast<std::uintptr_t>(regionBase + regionSize), writable, generation);
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
@@ -708,6 +762,10 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
+}
+
+std::uint64_t PageRegionCacheHits() {
+    return regionCacheHits.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ForgetSerial() {

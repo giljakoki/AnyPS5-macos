@@ -18,6 +18,7 @@ void RunBdaResourceTests(const AgcDriver::Graphics::Context& context, const BdaT
 void RunGuestAllocationTests();
 void RunGuestLeaseWaitTests();
 void RunUnmappedGapTests();
+void RunRegionCacheTests();
 void RunColorTargetLayoutTests();
 void RunLiveStackAccessTests();
 
