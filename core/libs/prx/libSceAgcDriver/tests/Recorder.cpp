@@ -4539,9 +4539,11 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     order();
     const auto made = draw();
     const bool refreshed = SampledSnapshotTotals().refreshes > totalsBefore.refreshes;
+    const bool hashed = SampledSnapshotTotals().hashes > totalsBefore.hashes;
     const auto compared = AgcDriver::GuestMemory::ComparedBytes();
     const auto walked = AgcDriver::GuestMemory::WalkedBytes();
     const auto refreshes = SampledSnapshotTotals().refreshes;
+    const auto hashes = SampledSnapshotTotals().hashes;
     constexpr int epochs = 10;
     constexpr int drawsPerEpoch = 10;
     for (int epoch = 0; epoch < epochs; ++epoch) {
@@ -4555,11 +4557,14 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     const auto comparedNow = AgcDriver::GuestMemory::ComparedBytes() - compared;
     const auto walkedNow = AgcDriver::GuestMemory::WalkedBytes() - walked;
     const auto refreshesNow = SampledSnapshotTotals().refreshes - refreshes;
-    std::cout << "imported snapshot proofs (" << (refreshed ? "refreshed on the GPU" : watched ? "watched" : "compared") << "): " << epochs * drawsPerEpoch << " draws of a " << (bytes >> 20u) << " MiB surface compared " << (comparedNow >> 20u) << " MiB, walked " << (walkedNow >> 20u) << " MiB, refreshed " << refreshesNow << " times\n";
+    const auto hashesNow = SampledSnapshotTotals().hashes - hashes;
+    std::cout << "imported snapshot proofs (" << (refreshed ? "refreshed on the GPU" : watched ? "watched" : "compared") << "): " << epochs * drawsPerEpoch << " draws of a " << (bytes >> 20u) << " MiB surface compared " << (comparedNow >> 20u) << " MiB, walked " << (walkedNow >> 20u) << " MiB, refreshed " << refreshesNow << " times, hashed " << hashesNow << " times\n";
     Require(comparedNow <= epochs * bytes, "an unchanged imported snapshot was compared more than once per epoch");
     Require(!watched || comparedNow < bytes, "a watched imported snapshot was compared");
     Require(walkedNow <= epochs * bytes, "an imported snapshot's pages were walked more than once per epoch");
-    Require(!refreshed || (comparedNow == 0 && refreshesNow == epochs), "an imported snapshot refreshed on the GPU was compared, or refreshed other than once per present");
+    Require(!refreshed || comparedNow == 0, "an imported snapshot refreshed on the GPU was compared");
+    Require(!refreshed || hashed || refreshesNow == epochs, "an imported snapshot refreshed on the GPU was refreshed other than once per present");
+    Require(!hashed || (refreshesNow == 0 && hashesNow == epochs && SampledSnapshotTotals().refreshes - totalsBefore.refreshes == 1), "an unchanged imported snapshot was not hashed once per present, or was refreshed after its first upload");
     std::uint64_t elsewhere = 0;
     order();
     Require(draw() == made, "an unchanged imported snapshot was made again");
@@ -4574,12 +4579,28 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     Require(draw() == made, "an unchanged imported snapshot was made again");
     if (refreshed) Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites && SampledSnapshotTotals().refreshes == refreshesBeforeWrites + 1, "a driver write over an imported snapshot was not refreshed");
     else Require(AgcDriver::GuestMemory::ComparedBytes() - beforeWrites == bytes, "a driver write over an imported snapshot was not compared");
+    const auto refreshesBeforeStore = SampledSnapshotTotals().refreshes;
     static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x77;
     order();
     const auto stored = draw();
     if (refreshed) {
+        recorder.Sync();
+        Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+        Require(!hashed || SampledSnapshotTotals().refreshes - refreshesBeforeStore == 1, "a CPU store into a hashed imported snapshot was not refreshed exactly once");
         Require(stored == made, "an imported snapshot refreshed on the GPU was made again");
         Require(readBlock(stored, bytes / 2) == 0x77, "a CPU store into an imported snapshot was not visible after the next present");
+        if (hashed) {
+            Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+            const auto refreshesBeforeSecond = SampledSnapshotTotals().refreshes;
+            const auto unchangedBeforeSecond = SampledSnapshotTotals().unchanged;
+            static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x55;
+            order();
+            Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+            recorder.Sync();
+            Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+            Require(SampledSnapshotTotals().refreshes - refreshesBeforeSecond == 1 && SampledSnapshotTotals().unchanged == unchangedBeforeSecond, "a changed digest did not refresh an imported snapshot exactly once");
+            Require(readBlock(stored, bytes / 2) == 0x55, "a CPU store detected by the hash was not visible");
+        }
     } else {
         Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
         Require(draw() == stored, "the remade imported snapshot is not the cache's");

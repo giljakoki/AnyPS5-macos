@@ -31,6 +31,8 @@ struct SampledSnapshotCounts {
     std::uint64_t compares;
     std::uint64_t refreshes;
     std::uint64_t comparedBytes;
+    std::uint64_t hashes;
+    std::uint64_t unchanged;
 };
 SampledSnapshotCounts SampledSnapshotTotals();
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
