@@ -55,6 +55,7 @@ public:
         appendMesh(key, request);
         append(key, PositionExportControl(request));
         appendTessellation(key, request);
+        append(key, BarycentricMaskedZero());
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
             hash ^= value;
@@ -91,6 +92,7 @@ private:
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
+        append(key, BarycentricMaskedZero());
         append(key, RayTracingMiss());
     }
 
