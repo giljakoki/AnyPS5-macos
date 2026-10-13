@@ -3,11 +3,13 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -107,24 +109,61 @@ struct VertexInputLayout {
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
 
+inline bool VertexFormatMemoEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_VERTEX_FORMAT_MEMO") != nullptr;
+    return !disabled;
+}
+
+inline bool VertexBufferFormatSupported(const Context& context, VkFormat format) {
+    Require(context.formatProperties != nullptr, "missing vertex format property query");
+    const auto query = [&] {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, format, &properties);
+        return (properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+    };
+    if (!VertexFormatMemoEnabled()) return query();
+    struct Entry {
+        PFN_vkGetPhysicalDeviceFormatProperties function;
+        VkPhysicalDevice physical;
+        VkFormat format;
+        bool supported;
+    };
+    thread_local std::vector<Entry> memo;
+    for (const auto& entry : memo) {
+        if (entry.format == format && entry.physical == context.physical && entry.function == context.formatProperties) return entry.supported;
+    }
+    const bool supported = query();
+    memo.push_back({context.formatProperties, context.physical, format, supported});
+    return supported;
+}
+
 inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
     VertexInputLayout result;
-    std::set<std::uint32_t> locations;
+    result.bindings.reserve(attributes.size());
+    result.attributes.reserve(attributes.size());
+    std::uint64_t lowLocations = 0;
+    std::set<std::uint32_t> highLocations;
+    const auto firstUse = [&](std::uint32_t location) {
+        if (location < 64u) {
+            const auto bit = std::uint64_t{1} << location;
+            const bool fresh = (lowLocations & bit) == 0;
+            lowLocations |= bit;
+            return fresh;
+        }
+        return highLocations.insert(location).second;
+    };
     for (const auto& attribute : attributes) {
         const auto& fields = attribute.resource.fields;
         const auto format = DecodeVertexFormat(attribute);
-        Require(attribute.location < context.limits.maxVertexInputAttributes && locations.insert(attribute.location).second, "invalid or duplicate vertex attribute location");
+        Require(attribute.location < context.limits.maxVertexInputAttributes && firstUse(attribute.location), "invalid or duplicate vertex attribute location");
         Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
         Require((fields[1] & 0x80000000u) == 0 && (fields[3] & 0x00800000u) == 0 && (fields[3] >> 30u) == 0, "unsupported vertex buffer descriptor flags");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(NullVertexDescriptor(attribute) || (address != 0 && address % format.alignment == 0 && stride % format.alignment == 0), "unaligned vertex buffer");
         Require(stride <= context.limits.maxVertexInputBindingStride, "vertex stride exceeds device limits");
-        Require(context.formatProperties != nullptr, "missing vertex format property query");
-        VkFormatProperties properties{};
-        context.formatProperties(context.physical, format.format, &properties);
-        Require((properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0, "device does not support vertex format " + std::to_string(format.format));
+        if (!VertexBufferFormatSupported(context, format.format)) Require(false, "device does not support vertex format " + std::to_string(format.format));
         const auto binding = static_cast<std::uint32_t>(result.bindings.size());
         result.bindings.push_back({binding, stride, attribute.fetchIndex == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE});
         result.attributes.push_back({attribute.location, binding, format.format, 0});
@@ -199,7 +238,10 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     VertexCopyPlan plan;
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
+    plan.copies.reserve(fetches.size());
+    plan.alignments.reserve(fetches.size());
+    thread_local std::vector<std::size_t> order;
+    order.resize(fetches.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
