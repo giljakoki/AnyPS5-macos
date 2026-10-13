@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -20,6 +21,7 @@ struct DrawCacheGovernor {
     std::uint32_t lookups = 0;
     std::uint32_t hits = 0;
     std::uint32_t paused = 0;
+    std::uint32_t streak = 0;
 
     bool Use() {
         static const bool disabled = std::getenv("APS5_NO_DRAW_CACHE_GOVERNOR") != nullptr;
@@ -33,8 +35,11 @@ struct DrawCacheGovernor {
         if (hit) ++hits;
         if (lookups < Window) return;
         if (hits < MinimumHits) {
-            paused = Pause;
-            std::fprintf(stderr, "[draw-cache] %u of the last %u lookups hit: draw entries are skipped for the next %u draws of this queue\n", hits, Window, Pause);
+            paused = Pause << std::min<std::uint32_t>(streak, 6);
+            streak = std::min<std::uint32_t>(streak + 1, 6);
+            std::fprintf(stderr, "[draw-cache] %u of the last %u lookups hit: draw entries are skipped for the next %u draws of this queue\n", hits, Window, paused);
+        } else {
+            streak = 0;
         }
         lookups = 0;
         hits = 0;
