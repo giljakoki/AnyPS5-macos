@@ -1,5 +1,6 @@
 #ifdef __APPLE__
 
+#include "prx/libkernel/System/include/CrashReport.hpp"
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <pthread.h>
@@ -29,6 +30,7 @@ void* RunGuest(void* argument) {
     sigemptyset(&emulatorSignals);
     for (const int emulatorSignal : {SIGUSR1, SIGBUS, SIGSEGV}) sigaddset(&emulatorSignals, emulatorSignal);
     pthread_sigmask(SIG_UNBLOCK, &emulatorSignals, nullptr);
+    CrashReport::PrepareThread();
     start.entry(start.block, nullptr);
     std::fprintf(stderr, "guest entry returned\n");
     std::abort();
