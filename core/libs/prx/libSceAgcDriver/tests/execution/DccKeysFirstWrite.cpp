@@ -399,11 +399,13 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(!image->Refresh(), "an untracked CPU edit was missed after the next present");
     const auto editedVersion = image->Version();
     Require(image->Refresh() && image->Version() == editedVersion, "the CPU-edited image was uploaded twice");
+    device.WaitIdle();
     std::memset(block + SurfaceBytes, 0x35, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     Require(!image->Refresh(), "a CPU store into a target the CPU wrote before was not seen at the next ordering point");
     const auto reEditedVersion = image->Version();
     Require(image->Refresh() && image->Version() == reEditedVersion, "the re-edited image was uploaded twice");
+    device.WaitIdle();
     std::memset(block + SurfaceBytes, 0x33, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     Require(!image->Refresh(), "a CPU store restoring the earlier bytes was not seen");

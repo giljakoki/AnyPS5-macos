@@ -570,14 +570,14 @@ private:
         const Recorder* recorder = nullptr;
         std::uint64_t serial = 0;
         std::uint64_t stores = 0;
+        std::uint64_t epoch = 0;
         std::vector<bool> layers;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     };
     std::deque<PendingBaseline> pendingBaselines;
-    bool baselineWasValid = false;
-    bool baselineComplete = false;
     bool baselineKeepsProof = false;
     void startBaseline(bool keepProof);
+    bool inFlightOverlaps(std::uint64_t begin, std::uint64_t end) const;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
