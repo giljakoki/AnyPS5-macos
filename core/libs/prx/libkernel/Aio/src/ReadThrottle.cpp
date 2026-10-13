@@ -24,8 +24,7 @@ struct FlipPacing {
     std::mutex mutex;
     std::condition_variable flipped;
     std::uint64_t flips = 0;
-    std::uint64_t baseFlips = 0;
-    std::uint64_t consumed = 0;
+    std::int64_t credit = 0;
     std::uint64_t heldReads = 0;
     std::uint64_t stalls = 0;
     double heldMillis = 0.0;
@@ -68,7 +67,9 @@ std::uint64_t Flips() {
 PacingTotals Totals() {
     auto& pacing = Pacing();
     std::lock_guard lock(pacing.mutex);
-    return pacing.totals;
+    auto totals = pacing.totals;
+    totals.credit = pacing.credit;
+    return totals;
 }
 
 void SetFlipStallMillis(unsigned millis) {
@@ -83,25 +84,24 @@ void PaceToFlips(const Settings& settings, std::uint64_t bytes) {
     auto& pacing = Pacing();
     std::unique_lock lock(pacing.mutex);
     if (pacing.flips == 0) return;
-    pacing.consumed += bytes;
     const auto start = std::chrono::steady_clock::now();
     bool held = false;
     bool stalled = false;
-    while (!FlipAllows(settings.bytesPerFlip, pacing.consumed, pacing.flips - pacing.baseFlips)) {
+    while (!FlipAdmits(settings.bytesPerFlip, pacing.credit)) {
         held = true;
         const auto flips = pacing.flips;
         ++pacing.totals.waiting;
         const bool flipped = pacing.flipped.wait_for(lock, std::chrono::milliseconds(pacing.stallMillis), [&] { return pacing.flips != flips; });
         --pacing.totals.waiting;
         if (!flipped) {
-            pacing.baseFlips = pacing.flips;
-            pacing.consumed = 0;
+            pacing.credit = FlipCapacity(settings.bytesPerFlip);
             ++pacing.stalls;
             ++pacing.totals.stalls;
             stalled = true;
             break;
         }
     }
+    if (!stalled) pacing.credit -= static_cast<std::int64_t>(bytes);
     const auto now = std::chrono::steady_clock::now();
     if (held) {
         ++pacing.totals.heldReads;
@@ -154,11 +154,15 @@ void After(std::uint64_t bytes) {
 }
 
 extern "C" void LoaderFlipCompleted_nid_no_patch() {
-    if (ReadThrottle::Current().bytesPerFlip == 0) return;
+    const auto bytesPerFlip = ReadThrottle::Current().bytesPerFlip;
+    if (bytesPerFlip == 0) return;
     auto& pacing = ReadThrottle::Pacing();
     {
         std::lock_guard lock(pacing.mutex);
-        ++pacing.flips;
+        if (++pacing.flips == 1)
+            std::fprintf(stderr, "[throttle] flip pacing on: %.1f MiB per completed flip, at most %llu flips of reads ahead, a held read goes on after %u ms without a flip\n",
+                         static_cast<double>(bytesPerFlip) / (1024.0 * 1024.0), static_cast<unsigned long long>(ReadThrottle::FlipHeadroom), pacing.stallMillis);
+        pacing.credit = ReadThrottle::FlipRefill(pacing.credit, bytesPerFlip);
     }
     pacing.flipped.notify_all();
 }

@@ -46,9 +46,12 @@ int main() {
         check(ReadThrottle::DelayMicros(settings, 1024 * 1024, 5.0, carry) == 0, "reads after the window are not delayed");
         check(ReadThrottle::DelayMicros(ReadThrottle::Settings{0, 5.0}, 1024 * 1024, 0.0, carry) == 0, "a zero rate is off");
 
-        check(ReadThrottle::FlipAllows(0, 1u << 30, 0), "a zero flip budget is off");
-        check(ReadThrottle::FlipAllows(1024, 2047, 0) && !ReadThrottle::FlipAllows(1024, 2048, 0), "two flips of headroom before the first counted flip");
-        check(ReadThrottle::FlipAllows(1024, 2048, 1) && !ReadThrottle::FlipAllows(1024, 3072, 1), "each flip adds one budget");
+        check(ReadThrottle::FlipAdmits(0, -(1 << 30)), "a zero flip budget is off");
+        check(ReadThrottle::FlipAdmits(1024, 1) && !ReadThrottle::FlipAdmits(1024, 0) && !ReadThrottle::FlipAdmits(1024, -5), "reads go on while credit is left");
+        check(ReadThrottle::FlipRefill(-3000, 1024) == -1976, "each flip adds one budget");
+        std::int64_t banked = 0;
+        for (int flip = 0; flip < 100; ++flip) banked = ReadThrottle::FlipRefill(banked, 1024);
+        check(banked == 2048, "idle flips bank at most two budgets");
 
         setenv("APS5_LOADER_THROTTLE_US", "20000", 1);
         setenv("APS5_LOADER_THROTTLE_SECONDS", "1", 1);
@@ -95,6 +98,33 @@ int main() {
         check(stalled >= 90.0 && stalled < 30000.0, "the stall limit holds the read at least its length");
         ReadThrottle::After(1024u * 1024u);
         check(ReadThrottle::Totals().heldReads == afterStall.heldReads, "after a stall the allowance starts again");
+
+        ReadThrottle::SetFlipStallMillis(60000);
+        for (int flip = 0; flip < 100; ++flip) LoaderFlipCompleted_nid_no_patch();
+        check(ReadThrottle::Totals().credit == 2 * 1024 * 1024, "flips without reads bank at most two budgets");
+        ReadThrottle::After(4u * 1024u * 1024u);
+        const auto beforeBurst = ReadThrottle::Totals();
+        std::atomic<bool> burstReleased{false};
+        std::thread burst([&] {
+            ReadThrottle::After(1024u * 1024u);
+            burstReleased.store(true);
+        });
+        const auto burstDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (ReadThrottle::Totals().waiting == 0 && std::chrono::steady_clock::now() < burstDeadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        check(ReadThrottle::Totals().waiting == 1, "a burst after many idle flips is held once the banked budget is spent");
+        int flipsNeeded = 0;
+        while (!burstReleased.load() && flipsNeeded < 100) {
+            ++flipsNeeded;
+            LoaderFlipCompleted_nid_no_patch();
+            const auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!burstReleased.load() && ReadThrottle::Totals().waiting == 0 && std::chrono::steady_clock::now() < settle) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            while (!burstReleased.load() && ReadThrottle::Totals().credit > 0 && std::chrono::steady_clock::now() < settle) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        burst.join();
+        std::printf("the held burst read needed %d flips\n", flipsNeeded);
+        check(flipsNeeded == 3, "the held read goes on once flips repay its debt");
+        check(ReadThrottle::Totals().releasedByFlip == beforeBurst.releasedByFlip + 1 && ReadThrottle::Totals().stalls == beforeBurst.stalls, "the burst read was released by flips");
+        ReadThrottle::SetFlipStallMillis(100);
     } catch (const std::exception& error) {
         std::printf("FAIL %s\n", error.what());
         return 1;
