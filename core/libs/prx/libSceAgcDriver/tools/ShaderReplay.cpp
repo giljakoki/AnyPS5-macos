@@ -44,6 +44,7 @@ bool g_spirv = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
+bool g_meshLayout = false;
 unsigned long g_subgroupStages = 0xffffffffu;
 
 bool Replay(const char* path) {
@@ -60,6 +61,18 @@ bool Replay(const char* path) {
         if (graphics.mesh.has_value()) {
             const auto& mesh = *graphics.mesh;
             std::printf("  mesh: input primitive %u, %u primitives / %u vertices per group, max %u vertices / %u primitives, %u threads, lds %u dwords, provoking %u, ESGS item %u\n", mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize);
+        }
+    }
+    if (g_meshLayout && request.request.graphics.has_value() && request.request.graphics->mesh.has_value()) {
+        try {
+            const auto layout = ShaderRecompiler::DescribeMeshProgram(request.request);
+            std::printf("  mesh layout: wave%u, %u waves per group, %u allocations, %u barriers, LDS %s, subgroup operations %s, vertex-stage candidate %s\n", layout.waveSize, layout.wavesPerGroup, layout.allocations, layout.barriers, layout.sharedMemory ? "yes" : "no", layout.subgroupOperations ? "yes" : "no", layout.VertexStageCandidate() ? "yes" : "no");
+            std::printf("  mesh exports: positions %x %x %x %x, parameters 0x%x (%u), primitive %s, layer %s, viewport %s, point size %s, clip/cull %u\n", layout.positionComponents[0], layout.positionComponents[1], layout.positionComponents[2], layout.positionComponents[3], layout.parameterMask, layout.ParameterCount(), layout.primitiveExport ? "yes" : "no", layout.layer ? "yes" : "no", layout.viewportIndex ? "yes" : "no", layout.pointSize ? "yes" : "no", layout.clipCullDistances);
+            std::printf("  mesh records: %u dwords, %u per group%s, %llu vertex bytes and %llu index bytes per group\n", layout.recordDwords, layout.recordsPerGroup, layout.perCornerRecords ? " (per corner)" : "", static_cast<unsigned long long>(layout.vertexBytesPerGroup), static_cast<unsigned long long>(layout.indexBytesPerGroup));
+            if (request.request.graphics->draw.indexCount != 0) std::printf("  mesh draw: %u groups for %u indices\n", layout.GroupsFor(request.request.graphics->draw.indexCount), request.request.graphics->draw.indexCount);
+        } catch (const std::exception& error) {
+            std::printf("  mesh layout failed: %s\n", FirstLine(error.what()).c_str());
+            return false;
         }
     }
     if (g_memory) {
@@ -154,7 +167,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--subgroup-stages=<hex>] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n  --subgroup-stages limits the target's subgroup stages, as MoltenVK does with 0x32\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--mesh-layout] [--maintenance8] [--subgroup-stages=<hex>] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n  --subgroup-stages limits the target's subgroup stages, as MoltenVK does with 0x32\n  --mesh-layout describes a mesh-stage program for emulation without mesh shaders\n");
         return 2;
     }
     int failures = 0;
@@ -191,6 +204,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--code") {
             g_code = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--mesh-layout") {
+            g_meshLayout = true;
             continue;
         }
         if (std::string(argv[i]) == "--spv") {
