@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -28,6 +30,8 @@ struct RecentWork {
     std::uint64_t color = 0;
     std::uint64_t index = 0;
     std::array<std::uint32_t, 6> words{};
+    std::array<std::uint64_t, 8> buffers{};
+    std::array<std::array<std::uint32_t, 4>, 8> heads{};
     std::chrono::steady_clock::time_point at;
 };
 
@@ -122,6 +126,18 @@ void NoteRecentWork(const char* kind, std::uint32_t queue, std::uint64_t serial,
     work.color = colorLow == state.context.end() ? 0 : (static_cast<std::uint64_t>(colorLow->second) << 8u) | (colorHigh == state.context.end() ? 0u : static_cast<std::uint64_t>(colorHigh->second) << 40u);
     work.index = state.indexBase;
     for (std::size_t i = 0; i < work.words.size() && i < packet.size(); ++i) work.words[i] = packet[i];
+    const std::uint32_t userBase = std::string_view(kind) == "draw" ? 0x0cu : 0x240u;
+    for (std::uint32_t group = 0; group < work.buffers.size(); ++group) {
+        const auto low = state.shader.find(userBase + group * 4u);
+        const auto high = state.shader.find(userBase + group * 4u + 1u);
+        if (low == state.shader.end() || high == state.shader.end()) continue;
+        const auto address = static_cast<std::uint64_t>(low->second) | (static_cast<std::uint64_t>(high->second & 0xffffu) << 32u);
+        if (address == 0 || (address & 3u) != 0) continue;
+        const auto* pointer = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+        if (!GuestMemory::Accessible(pointer, sizeof(work.heads[group]))) continue;
+        work.buffers[group] = address;
+        std::memcpy(work.heads[group].data(), pointer, sizeof(work.heads[group]));
+    }
     work.at = std::chrono::steady_clock::now();
     std::lock_guard lock(RecentWorkMutex());
     auto& ring = RecentWorkRing();
@@ -144,6 +160,10 @@ void DumpRecentWork(const char* why) {
         std::fprintf(stderr, "[recent-work] -%.1f ms queue 0x%x serial %llu dword %zu %s first 0x%llx pixel 0x%llx compute 0x%llx color 0x%llx index 0x%llx words %08x %08x %08x %08x %08x %08x\n",
                      std::chrono::duration<double, std::milli>(now - work.at).count(), work.queue, static_cast<unsigned long long>(work.serial), work.offset, work.kind, static_cast<unsigned long long>(work.first), static_cast<unsigned long long>(work.pixel),
                      static_cast<unsigned long long>(work.compute), static_cast<unsigned long long>(work.color), static_cast<unsigned long long>(work.index), work.words[0], work.words[1], work.words[2], work.words[3], work.words[4], work.words[5]);
+        for (std::size_t group = 0; group < work.buffers.size(); ++group) {
+            if (work.buffers[group] == 0) continue;
+            std::fprintf(stderr, "[recent-work]     user data %zu points at 0x%llx, which the CPU sees as %08x %08x %08x %08x\n", group * 4u, static_cast<unsigned long long>(work.buffers[group]), work.heads[group][0], work.heads[group][1], work.heads[group][2], work.heads[group][3]);
+        }
     }
 }
 
