@@ -131,7 +131,7 @@ void DumpThreads(const char* reason) {
 
 void DumpRaisedState() {
     for (auto& slot : slots) {
-        if (slot.key.load() == 0 || slot.sent.load() == slot.entered.load()) continue;
+        if (slot.key.load() == 0 || slot.sent.load() <= slot.entered.load()) continue;
         std::fprintf(stderr, "[raise]   reading the x86 state of '%s' (%s)\n", slot.name, Describe(slot.port).c_str());
         x86_thread_state64_t state{};
         mach_msg_type_number_t count = x86_THREAD_STATE64_COUNT;
@@ -220,10 +220,11 @@ void Watch() {
         for (auto& slot : slots) {
             if (slot.key.load() == 0) continue;
             const auto sent = slot.sent.load();
-            if (sent == slot.entered.load() || slot.reported.load() == sent || now - slot.sentNanos.load() < 1000000000ULL) continue;
+            const auto sentNanos = slot.sentNanos.load();
+            if (!Unhandled(sent, slot.entered.load(), slot.reported.load(), sentNanos, now)) continue;
             slot.reported.store(sent);
             missed = true;
-            std::fprintf(stderr, "[raise] %.3f s no handler on '%s' %.3f s after signal %u (entered %u, returned %u): %s\n", Seconds(now), slot.name, static_cast<double>(now - slot.sentNanos.load()) / 1e9, sent,
+            std::fprintf(stderr, "[raise] %.3f s no handler on '%s' %.3f s after signal %u (entered %u, returned %u): %s\n", Seconds(now), slot.name, static_cast<double>(now - sentNanos) / 1e9, sent,
                          slot.entered.load(), slot.returned.load(), Describe(slot.port).c_str());
         }
         if (missed && !dumped) {
@@ -256,12 +257,14 @@ void Start() {
 #endif
 }
 
+bool Unhandled(std::uint32_t sent, std::uint32_t entered, std::uint32_t reported, std::uint64_t sentNanos, std::uint64_t nowNanos) {
+    if (sent <= entered || reported == sent || sentNanos > nowNanos) return false;
+    return nowNanos - sentNanos >= UnhandledGraceNanos;
+}
+
 void Raising(Pthread thread) {
     if (!Enabled()) return;
-    if (Slot* slot = Claim(thread)) {
-        slot->sentNanos.store(Now());
-        slot->sent.fetch_add(1);
-    }
+    Claim(thread);
 }
 
 void Sent(Pthread thread, const char* name, const char* how) {
@@ -275,7 +278,10 @@ void Sent(Pthread thread, const char* name, const char* how) {
         state = Describe(slot->port);
 #endif
         std::snprintf(slot->name, sizeof(slot->name), "%s", name);
-        if (!sent) slot->sent.fetch_sub(1);
+        if (sent) {
+            slot->sentNanos.store(Now());
+            slot->sent.fetch_add(1);
+        }
     }
     std::fprintf(stderr, "[raise] %.3f s exception for guest thread %p '%s' %s; %s\n", Seconds(Now()), static_cast<void*>(thread), name, sent ? how : "not raised, the thread has finished", state.c_str());
 }
