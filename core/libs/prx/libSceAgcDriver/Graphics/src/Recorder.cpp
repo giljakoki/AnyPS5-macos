@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -3700,6 +3701,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         if (result != VK_SUCCESS) {
             ReportImportRetirements("recorder fence wait failed");
             ReportGpuFrees("recorder fence wait failed");
+            StaleHandleDump("recorder fence wait failed");
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }

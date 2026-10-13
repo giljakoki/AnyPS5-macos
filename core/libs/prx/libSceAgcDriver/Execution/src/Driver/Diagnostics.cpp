@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -175,6 +176,7 @@ void InstallRecentWorkDump() {
         DumpRecentWork("terminating");
         Graphics::ReportImportRetirements("terminating");
         Graphics::ReportGpuFrees("terminating");
+        Graphics::StaleHandleDump("terminating");
         if (const auto previous = PreviousTerminate()) previous();
         std::abort();
     });

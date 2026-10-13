@@ -6060,10 +6060,38 @@ int staleHandleTests(const Device& device) {
     Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale test");
     fill(commands, cleanBuffer, 0, 4096, 0);
     Check(end(commands), "vkEndCommandBuffer stale test");
+    Require(StaleHandleReports() == before + 2, "recording a live buffer was reported");
+    if (context.bufferDeviceAddress) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = 4096;
+        info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        VkBuffer addressed = VK_NULL_HANDLE;
+        Check(createBuffer(context.device, &info, nullptr, &addressed), "vkCreateBuffer stale address test");
+        VkMemoryRequirements requirements{};
+        getRequirements(context.device, addressed, &requirements);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, 0);
+        VkDeviceMemory addressedMemory = VK_NULL_HANDLE;
+        Check(allocate(context.device, &allocation, nullptr, &addressedMemory), "vkAllocateMemory stale address test");
+        Check(bind(context.device, addressed, addressedMemory, 0), "vkBindBufferMemory stale address test");
+        const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, addressed};
+        const auto address = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(resolve("vkGetBufferDeviceAddressKHR"))(context.device, &addressInfo);
+        freeMemory(context.device, addressedMemory, nullptr);
+        const std::array<std::uint64_t, 2> table{0, address + 64};
+        Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale address test");
+        reinterpret_cast<PFN_vkCmdUpdateBuffer>(resolve("vkCmdUpdateBuffer"))(commands, cleanBuffer, 0, sizeof(table), table.data());
+        Check(end(commands), "vkEndCommandBuffer stale address test");
+        Require(StaleHandleReports() == before + 3, "a command passing a device address into freed memory was not reported");
+        destroyBuffer(context.device, addressed, nullptr);
+    }
+    const auto counted = StaleHandleReports();
     freeCommands(context.device, context.pool, 1, &commands);
     freeMemory(context.device, clean, nullptr);
     destroyBuffer(context.device, cleanBuffer, nullptr);
-    Require(StaleHandleReports() == before + 2, "a free after the command buffer was released was reported");
+    Require(StaleHandleReports() == counted, "a free after the command buffer was released was reported");
     std::cout << "Stale handle tracer tests passed\n";
     return 0;
 }

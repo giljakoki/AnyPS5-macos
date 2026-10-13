@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuFreeTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <atomic>
 #include <cstdio>
@@ -154,6 +155,7 @@ void QueueSubmitter::run() {
             std::fprintf(stderr, "[gpu] vkQueueSubmit on the submit thread failed (%d)\n", static_cast<int>(result));
             ReportImportRetirements("vkQueueSubmit failed on the submit thread");
             ReportGpuFrees("vkQueueSubmit failed on the submit thread");
+            StaleHandleDump("vkQueueSubmit failed on the submit thread");
         }
         drained.notify_all();
     }

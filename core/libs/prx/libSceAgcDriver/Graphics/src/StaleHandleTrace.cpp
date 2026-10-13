@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,8 +40,23 @@ struct CommandRefs {
     std::chrono::steady_clock::time_point begun;
 };
 
+struct AddressRange {
+    std::uint64_t end = 0;
+    std::uint64_t buffer = 0;
+    std::uint64_t memory = 0;
+    Freed freed;
+};
+
 struct Tracker {
     std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> bufferSize;
+    std::unordered_map<std::uint64_t, std::uint64_t> memorySize;
+    std::unordered_map<std::uint64_t, std::pair<const std::byte*, std::uint64_t>> memoryMapping;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> bufferAddress;
+    std::map<std::uint64_t, AddressRange> freedRanges;
+    std::array<std::pair<std::uint64_t, AddressRange>, 64> freedRing{};
+    std::uint64_t freedRingCount = 0;
+    std::atomic<bool> dumped{false};
     std::unordered_map<std::uint64_t, std::uint64_t> bufferMemory;
     std::unordered_map<std::uint64_t, std::uint64_t> imageMemory;
     std::unordered_map<std::uint64_t, std::uint64_t> viewImage;
@@ -204,6 +221,83 @@ STALE_REAL(vkCmdDrawMeshTasksIndirectEXT);
 STALE_REAL(vkCmdBeginRenderPass);
 STALE_REAL(vkCmdBeginRenderingKHR);
 STALE_REAL(vkCmdCopyQueryPoolResults);
+STALE_REAL(vkGetBufferDeviceAddressKHR);
+STALE_REAL(vkCmdPushConstants);
+STALE_REAL(vkMapMemory);
+STALE_REAL(vkUnmapMemory);
+
+VKAPI_ATTR VkResult VKAPI_CALL staleMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** data) {
+    const auto result = real_vkMapMemory(device, memory, offset, size, flags, data);
+    if (result == VK_SUCCESS) {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        const auto total = tracker.memorySize.contains(key(memory)) ? tracker.memorySize[key(memory)] : 0u;
+        const auto bytes = size == VK_WHOLE_SIZE ? (total > offset ? total - offset : 0u) : size;
+        tracker.memoryMapping[key(memory)] = {static_cast<const std::byte*>(*data), bytes};
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL staleUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        tracker.memoryMapping.erase(key(memory));
+    }
+    real_vkUnmapMemory(device, memory);
+}
+
+const AddressRange* freedRangeAt(Tracker& tracker, std::uint64_t value, std::uint64_t& start) {
+    auto found = tracker.freedRanges.upper_bound(value);
+    if (found == tracker.freedRanges.begin()) return nullptr;
+    --found;
+    if (value >= found->second.end) return nullptr;
+    start = found->first;
+    return &found->second;
+}
+
+void scanAddresses(Tracker& tracker, VkCommandBuffer commands, const char* command, const void* data, std::size_t bytes, std::size_t step = 4) {
+    if (tracker.freedRanges.empty() || data == nullptr) return;
+    const auto* words = static_cast<const std::byte*>(data);
+    for (std::size_t offset = 0; offset + 8 <= bytes; offset += step) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, words + offset, sizeof(value));
+        if (value == 0) continue;
+        std::uint64_t start = 0;
+        const auto* range = freedRangeAt(tracker, value, start);
+        if (range == nullptr || !reportAllowed()) continue;
+        std::array<void*, 8> frames{};
+        int depth = 0;
+        capture(frames, depth);
+        std::fprintf(stderr, "[stale] %s passes device address 0x%llx (byte %zu) inside [0x%llx, 0x%llx) of buffer 0x%llx, whose memory 0x%llx was freed %.1f ms earlier, to command buffer %p; recorded from", command, static_cast<unsigned long long>(value), offset, static_cast<unsigned long long>(start), static_cast<unsigned long long>(range->end), static_cast<unsigned long long>(range->buffer), static_cast<unsigned long long>(range->memory), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - range->freed.at).count(), static_cast<void*>(commands));
+        printFrames(frames, depth);
+        std::fprintf(stderr, "; freed from");
+        printFrames(range->freed.frames, range->freed.depth);
+        std::fprintf(stderr, "\n");
+    }
+}
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL staleGetBufferDeviceAddress(VkDevice device, const VkBufferDeviceAddressInfo* info) {
+    const auto address = real_vkGetBufferDeviceAddressKHR(device, info);
+    if (address != 0) {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        const auto size = tracker.bufferSize.contains(key(info->buffer)) ? tracker.bufferSize[key(info->buffer)] : 1u;
+        tracker.bufferAddress[key(info->buffer)] = {address, address + size};
+        for (auto it = tracker.freedRanges.lower_bound(address); it != tracker.freedRanges.end() && it->first < address + size;) it = tracker.freedRanges.erase(it);
+        if (auto it = tracker.freedRanges.lower_bound(address); it != tracker.freedRanges.begin() && std::prev(it)->second.end > address) tracker.freedRanges.erase(std::prev(it));
+    }
+    return address;
+}
+
+VKAPI_ATTR void VKAPI_CALL staleCmdPushConstants(VkCommandBuffer commands, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values) {
+    {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        scanAddresses(tracker, commands, "vkCmdPushConstants", values, size);
+    }
+    real_vkCmdPushConstants(commands, layout, stages, offset, size, values);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL staleAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
     const auto result = real_vkAllocateMemory(device, info, allocator, memory);
@@ -211,6 +305,8 @@ VKAPI_ATTR VkResult VKAPI_CALL staleAllocateMemory(VkDevice device, const VkMemo
         auto& tracker = Track();
         std::lock_guard lock(tracker.mutex);
         tracker.freedMemory.erase(key(*memory));
+        tracker.memorySize[key(*memory)] = info->allocationSize;
+        tracker.memoryMapping.erase(key(*memory));
     }
     return result;
 }
@@ -240,6 +336,8 @@ VKAPI_ATTR VkResult VKAPI_CALL staleCreateBuffer(VkDevice device, const VkBuffer
         std::lock_guard lock(tracker.mutex);
         tracker.deadObjects.erase(key(*buffer));
         tracker.bufferMemory.erase(key(*buffer));
+        tracker.bufferAddress.erase(key(*buffer));
+        tracker.bufferSize[key(*buffer)] = info->size;
     }
     return result;
 }
@@ -369,6 +467,13 @@ VKAPI_ATTR VkResult VKAPI_CALL staleQueueSubmit(VkQueue queue, std::uint32_t cou
                 auto& refs = tracker.commands[key(submits[s].pCommandBuffers[c])];
                 refs.submitted = true;
                 refs.fence = key(fence);
+                if (!tracker.freedRanges.empty()) {
+                    for (const auto& [memory, handle] : refs.memories) {
+                        const auto mapping = tracker.memoryMapping.find(memory);
+                        if (mapping == tracker.memoryMapping.end() || mapping->second.second > (1u << 20u)) continue;
+                        scanAddresses(tracker, submits[s].pCommandBuffers[c], "vkQueueSubmit (mapped memory of a used object)", mapping->second.first, static_cast<std::size_t>(mapping->second.second), 8);
+                    }
+                }
                 for (const auto& [memory, handle] : refs.memories) {
                     const auto freed = tracker.freedMemory.find(memory);
                     if (freed == tracker.freedMemory.end() || !reportAllowed()) continue;
@@ -516,6 +621,7 @@ VKAPI_ATTR void VKAPI_CALL staleCmdUpdateBuffer(VkCommandBuffer commands, VkBuff
     {
         STALE_LOCK;
         reference(tracker, commands, "vkCmdUpdateBuffer", StaleObject::Buffer, key(buffer));
+        scanAddresses(tracker, commands, "vkCmdUpdateBuffer", data, static_cast<std::size_t>(size));
     }
     real_vkCmdUpdateBuffer(commands, buffer, offset, size, data);
 }
@@ -654,6 +760,33 @@ void StaleHandleRelease(StaleObject kind, std::uint64_t handle) {
         std::fprintf(stderr, "\n");
     }
     tracker.freedMemory[handle] = freed;
+    tracker.memoryMapping.erase(handle);
+    for (const auto& [buffer, memory] : tracker.bufferMemory) {
+        if (memory != handle) continue;
+        const auto address = tracker.bufferAddress.find(buffer);
+        if (address == tracker.bufferAddress.end()) continue;
+        AddressRange range{address->second.second, buffer, handle, freed};
+        tracker.freedRanges[address->second.first] = range;
+        tracker.freedRing[tracker.freedRingCount++ % tracker.freedRing.size()] = {address->second.first, range};
+    }
+}
+
+void StaleHandleDump(const char* why) {
+    if (!StaleHandlesTraced()) return;
+    auto& tracker = Track();
+    if (tracker.dumped.exchange(true)) return;
+    std::unique_lock lock(tracker.mutex, std::defer_lock);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (!lock.try_lock() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const auto now = std::chrono::steady_clock::now();
+    const auto shown = std::min<std::uint64_t>(tracker.freedRingCount, tracker.freedRing.size());
+    std::fprintf(stderr, "[stale] %s: %llu frees of memory behind a queried device address, the last %llu oldest first\n", why, static_cast<unsigned long long>(tracker.freedRingCount), static_cast<unsigned long long>(shown));
+    for (std::uint64_t n = tracker.freedRingCount - shown; n < tracker.freedRingCount; ++n) {
+        const auto& [start, range] = tracker.freedRing[n % tracker.freedRing.size()];
+        std::fprintf(stderr, "[stale]   -%.1f ms [0x%llx, 0x%llx) buffer 0x%llx memory 0x%llx freed from", std::chrono::duration<double, std::milli>(now - range.freed.at).count(), static_cast<unsigned long long>(start), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.buffer), static_cast<unsigned long long>(range.memory));
+        printFrames(range.freed.frames, range.freed.depth);
+        std::fprintf(stderr, "\n");
+    }
 }
 
 PFN_vkVoidFunction StaleHandleWrapper(const char* name, PFN_vkVoidFunction real) {
@@ -705,6 +838,10 @@ PFN_vkVoidFunction StaleHandleWrapper(const char* name, PFN_vkVoidFunction real)
     STALE_WRAP(vkCmdBeginRenderPass, staleCmdBeginRenderPass)
     STALE_WRAP(vkCmdBeginRenderingKHR, staleCmdBeginRendering)
     STALE_WRAP(vkCmdCopyQueryPoolResults, staleCmdCopyQueryPoolResults)
+    STALE_WRAP(vkGetBufferDeviceAddressKHR, staleGetBufferDeviceAddress)
+    STALE_WRAP(vkCmdPushConstants, staleCmdPushConstants)
+    STALE_WRAP(vkMapMemory, staleMapMemory)
+    STALE_WRAP(vkUnmapMemory, staleUnmapMemory)
 #undef STALE_WRAP
     return nullptr;
 }
