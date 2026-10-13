@@ -5952,7 +5952,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fakeDeviceProc(VkDevice, const char* na
 int gpuFreeDeferTests() {
     const auto guarded = GuardDeviceProc(&fakeDeviceProc);
     if (std::getenv("APS5_DEFER_GPU_FREES") == nullptr) {
-        Require(guarded == &fakeDeviceProc, "the device resolver was wrapped without a free knob");
+        Require(guarded == &fakeDeviceProc || FreeGateEnabled(), "the device resolver was wrapped without a free knob");
         std::cout << "skipped, APS5_DEFER_GPU_FREES is not set\n";
         return 77;
     }

@@ -10,6 +10,8 @@ namespace AgcDriver::Graphics {
 
 PFN_vkGetDeviceProcAddr GuardDeviceProc(PFN_vkGetDeviceProcAddr real);
 void ReportGpuFrees(const char* why);
+// Whether frees of memory and query pools wait for every earlier queue submission (APS5_FREE_GATE).
+bool FreeGateEnabled();
 
 }
 

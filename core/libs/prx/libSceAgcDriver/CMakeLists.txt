@@ -919,6 +919,21 @@ target_link_libraries(agc_driver_pm4_tests PRIVATE
 set_target_properties(agc_driver_pm4_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_pm4_tests)
 
+add_test_executable(agc_free_gate_tests EXCLUDE_FROM_ALL tests/FreeGate.cpp)
+target_include_directories(agc_free_gate_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_free_gate_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_free_gate_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_free_gate_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_free_gate_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_free_gate COMMAND agc_free_gate_tests)
+    set_tests_properties(agc_free_gate PROPERTIES ENVIRONMENT "APS5_FREE_GATE=1")
+    if(WIN32)
+        set_tests_properties(agc_free_gate PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/Graphics.cpp
         tests/ColorTargetLayout.cpp
