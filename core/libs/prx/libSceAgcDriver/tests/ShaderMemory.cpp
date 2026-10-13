@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/RequestMemoryView.hpp"
@@ -517,8 +518,17 @@ void verifyOutOfRangeConstantReads() {
     require(plan->info.images.size() == 2u && plan->info.samplers.size() == 1u, "out-of-range s_buffer_load: the two T#s were not planned as one image each");
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
+    static std::uint64_t flushedAddress = 0;
+    static int flushesOverSrt = 0;
+    flushedAddress = srtAddress;
+    flushesOverSrt = 0;
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t address, std::size_t bytes) {
+        if (address <= flushedAddress && flushedAddress < address + bytes) ++flushesOverSrt;
+    });
     AgcDriver::ShaderMemory direct({}, [](std::uint64_t, std::size_t, std::span<std::byte>) { return AgcDriver::ShaderMemory::PendingWrite::None; });
     const auto directCapture = direct.Capture(request);
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    require(flushesOverSrt > 0, "word-by-word capture reads: the descriptor table's page was read without the flush hook that stores deferred GPU results");
     require(directCapture->snapshot.images.size() == capture->snapshot.images.size() && std::ranges::equal(directCapture->snapshot.images, capture->snapshot.images, [](const auto& left, const auto& right) { return left.dwords == right.dwords; }), "word-by-word capture reads: the T#s differ from a capture that copies whole pages");
     const auto pageRegions = memory.Regions();
     const auto wordRegions = direct.Regions();

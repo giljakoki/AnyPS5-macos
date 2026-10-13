@@ -113,6 +113,7 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             return page;
         }
         if (DirectWords() && WordwisePages() && pendingWrite != nullptr) {
+            GuestMemory::FlushGpuWrites(base, PageBytes);
             page.direct = true;
             return page;
         }
