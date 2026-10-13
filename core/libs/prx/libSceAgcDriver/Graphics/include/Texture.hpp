@@ -24,6 +24,8 @@ namespace AgcDriver::Graphics {
 
 class ResidentColor;
 class CommandBatch;
+class Buffer;
+class Recorder;
 class StorageTexture;
 struct HostImport;
 
@@ -342,6 +344,8 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    bool recordBaseline(const HostImport& import, const std::vector<bool>* layers);
+    bool landBaseline();
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -549,6 +553,15 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    struct PendingBaseline {
+        std::shared_ptr<Buffer> bytes;
+        const Recorder* recorder = nullptr;
+        std::uint64_t serial = 0;
+        std::uint64_t stores = 0;
+        std::vector<bool> layers;
+        bool wasValid = false;
+    };
+    std::optional<PendingBaseline> pendingBaseline;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

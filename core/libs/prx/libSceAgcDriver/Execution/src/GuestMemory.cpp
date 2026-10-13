@@ -1178,7 +1178,7 @@ namespace {
 struct DriverWriteLog {
     std::mutex mutex;
     std::uint64_t serial = 0;
-    std::array<std::array<std::uint64_t, 2>, 8192> entries{};
+    std::array<std::array<std::uint64_t, 3>, 8192> entries{};
 };
 
 DriverWriteLog& driverWriteLog() {
@@ -1188,12 +1188,12 @@ DriverWriteLog& driverWriteLog() {
 
 }
 
-void NoteDriverWrite(std::uint64_t address, std::size_t bytes) {
+void NoteDriverWrite(std::uint64_t address, std::size_t bytes, bool recorded) {
     if (bytes == 0) return;
     auto& log = driverWriteLog();
     const std::lock_guard lock(log.mutex);
     ++log.serial;
-    log.entries[log.serial % log.entries.size()] = {address, address + bytes};
+    log.entries[log.serial % log.entries.size()] = {address, address + bytes, recorded ? 1u : 0u};
 }
 
 std::uint64_t DriverWriteSerial() {
@@ -1202,14 +1202,14 @@ std::uint64_t DriverWriteSerial() {
     return log.serial;
 }
 
-bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t since) {
+bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool storesOnly) {
     auto& log = driverWriteLog();
     const std::lock_guard lock(log.mutex);
     if (since > log.serial || log.serial - since >= log.entries.size()) return true;
     const auto end = address + bytes;
     for (auto serial = since + 1; serial <= log.serial; ++serial) {
         const auto& entry = log.entries[serial % log.entries.size()];
-        if (entry[0] < end && address < entry[1]) return true;
+        if (entry[0] < end && address < entry[1] && !(storesOnly && entry[2] != 0)) return true;
     }
     return false;
 }
