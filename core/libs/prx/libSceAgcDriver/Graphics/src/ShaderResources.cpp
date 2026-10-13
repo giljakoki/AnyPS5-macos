@@ -2005,6 +2005,16 @@ void ShaderResources::noteReusable() {
     reusable = true;
 }
 
+bool ShaderResources::DirectImportsCurrent() const {
+    if (directRegions.empty() || HostImportsUnchanged(context, importsProof)) return true;
+    return std::all_of(directRegions.begin(), directRegions.end(), [&](const DirectRegion& region) {
+        const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+        auto serial = HostImportSerial(context, region.begin, bytes, false);
+        if (serial == 0) serial = ImageMirrorSerial(context, region.begin, bytes);
+        return serial == region.serial;
+    });
+}
+
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
     return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {

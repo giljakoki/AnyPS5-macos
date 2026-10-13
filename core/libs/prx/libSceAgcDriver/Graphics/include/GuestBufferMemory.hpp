@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -101,6 +102,15 @@ struct HostImportsProof {
 };
 // Whether the table still matches `proof` (one lock); false for an empty or stale proof.
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof);
+std::uint64_t HostImportsEpoch();
+struct ImportBinding {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t alignment = 1;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+};
+bool RetakeImportBindings(const Context& context, std::uint64_t& epoch, std::span<ImportBinding> bindings);
 // The table's identity when it is reconciled with the live registry (one lock), else empty.
 HostImportsProof HostImportsIdentity(const Context& context);
 
@@ -174,6 +184,7 @@ void ClearImageMirrors(VkDevice device);
 void ClearHostImports(VkDevice device);
 void ReportImportRetirements(const char* why);
 std::size_t RetiredImportsAlive();
+void NoteImportRetake(const char* user, std::size_t bindings, std::size_t copied);
 
 struct AddressCopy {
     std::uint64_t begin;

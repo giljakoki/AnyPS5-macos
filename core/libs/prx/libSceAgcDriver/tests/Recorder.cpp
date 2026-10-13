@@ -1094,6 +1094,43 @@ int importLifetimeTests(const Device& device, Recorder& recorder) {
         recorder.FlushDeferredReleases();
         releaseImportBlock(block);
     }
+    {
+        void* block = allocateImportBlock(alignment, alignment);
+        Require(block != nullptr, "cannot allocate the retake block");
+        std::memset(block, 0, alignment);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, alignment, true, true, true);
+        }
+        const auto* import = HostImportFor(context, address, alignment);
+        Require(import != nullptr, "the retake block was not imported");
+        const auto first = HostImportSerial(context, address, alignment, false);
+        auto epoch = HostImportsEpoch();
+        std::array<ImportBinding, 1> bindings{ImportBinding{address + 256, 1024, 4, import->buffer, 256}};
+        Require(!RetakeImportBindings(context, epoch, bindings) && bindings[0].buffer == import->buffer, "an unchanged import table changed a binding");
+        const std::array<std::byte, 4> value{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+        recorder.RecordStore(import->buffer, 512, value, address + 512);
+        recorder.Submit();
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+            mutation.Add(block, alignment, true, true, true);
+        }
+        Require(RetakeImportBindings(context, epoch, bindings), "a binding validated before its import was retired was not taken again");
+        const auto* current = HostImportFor(context, address, alignment);
+        Require(current != nullptr && HostImportSerial(context, address, alignment, false) != first, "the remapped range has no new import");
+        Require(bindings[0].buffer == current->buffer && bindings[0].offset == 256, "the binding taken again does not name the current import");
+        Require(!RetakeImportBindings(context, epoch, bindings), "a binding was taken again although no import was retired since");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        Require(RetakeImportBindings(context, epoch, bindings) && bindings[0].buffer == VK_NULL_HANDLE, "a binding whose range lost its import still names a buffer");
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        releaseImportBlock(block);
+    }
     std::cout << "Host import lifetime tests passed\n";
     return 0;
 }

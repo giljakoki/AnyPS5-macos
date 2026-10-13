@@ -4024,6 +4024,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    Graphics::Require(resources.DirectImportsCurrent(), "a host import the dispatch's descriptor set reads in place was retired after the set was proved");
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {

@@ -1861,6 +1861,10 @@ void ClearImageMirrors(VkDevice device) {
     Spaces().current.store(nullptr);
 }
 
+void NoteImportRetake(const char* user, std::size_t bindings, std::size_t copied) {
+    if (TraceImportRetire()) std::fprintf(stderr, "[import-retire] a %s's %zu in-place bindings were taken again before it was recorded (%zu copied: their range has no usable import now)\n", user, bindings, copied);
+}
+
 std::size_t RetiredImportsAlive() {
     return retiredImportsAlive.load(std::memory_order_relaxed);
 }
@@ -3846,6 +3850,29 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     static std::uint64_t serials = 0;
     if (entry.serial == 0) entry.serial = ++serials;
     return entry.serial;
+}
+
+std::uint64_t HostImportsEpoch() {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.epoch;
+}
+
+bool RetakeImportBindings(const Context& context, std::uint64_t& epoch, std::span<ImportBinding> bindings) {
+    bool retaken = false;
+    for (int round = 0; round < 4; ++round) {
+        const auto current = HostImportsEpoch();
+        if (current == epoch) return retaken;
+        for (auto& binding : bindings) {
+            const auto* import = HostImportFor(context, binding.address, binding.bytes);
+            const bool usable = import != nullptr && (binding.address - import->base) % binding.alignment == 0;
+            binding.buffer = usable ? import->buffer : VK_NULL_HANDLE;
+            binding.offset = usable ? binding.address - import->base : 0;
+        }
+        epoch = current;
+        retaken = true;
+    }
+    throw std::runtime_error("AGC graphics: the host imports kept changing while in-place bindings were taken again");
 }
 
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof) {
