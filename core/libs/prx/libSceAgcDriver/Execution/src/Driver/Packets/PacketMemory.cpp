@@ -266,12 +266,21 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         const auto address = store->address;
         std::vector<std::byte> bytes(store->Bytes().begin(), store->Bytes().end());
         const auto size = bytes.size();
-        DrawPipeline::Queue0().Enqueue([this, queue, address, bytes = std::move(bytes)] {
+        const bool metadataFill = Pm4::DmaDestination(packet) != 1;
+        const auto fillAddress = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        const auto fillBytes = packet[6] & 0x3ffffffu;
+        const auto pattern = packet[2];
+        DrawPipeline::Queue0().Enqueue([this, queue, address, bytes = std::move(bytes), metadataFill, fillAddress, fillBytes, pattern] {
             GuestMemory::SetCurrentPacket(0x50, queue);
+            if (metadataFill) {
+                Graphics::NoteDepthMetadataFill(fillAddress, fillBytes, pattern);
+                Graphics::NoteColorMetadataFill(fillAddress, fillBytes, pattern);
+            }
             commitDmaStore(queue, address, bytes);
         }, {{address, address + size}}, 0, {}, DrawPipeline::Kind::Dma);
         return true;
     }
+    if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
     const auto copy = Pm4::DecodeMemoryCopy(packet);
     if (!copy.has_value() || copy->destination % 4 != 0 || copy->bytes % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
     DrawPipeline::Queue0().Enqueue([this, queue, copy = *copy] {
