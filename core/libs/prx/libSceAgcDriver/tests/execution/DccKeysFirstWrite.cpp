@@ -662,6 +662,11 @@ void RunGpuFillLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Dispatch(device, WriteCode, userData, false);
     const auto image = StorageTexture::FindPending(address, BlockBytes);
     Require(image != nullptr, "the filled target has no pending results");
+    device.WaitIdle();
+    std::memset(block + SurfaceBytes, 0x44, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    AgcDriver::Graphics::Recorder::CountPresent();
+    Require(!image->Refresh(), "a CPU store into the filled target was missed");
     const std::array<std::uint32_t, 4> pattern{0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u};
     auto uploads = StorageTexture::Uploads();
     for (int frame = 0; frame < 8; ++frame) {
@@ -676,7 +681,10 @@ void RunGpuFillLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         StorageTexture::FlushAllPending("idle");
         AgcDriver::GuestMemory::BumpCollectEpoch();
         AgcDriver::Graphics::Recorder::CountPresent();
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        const auto submissions = recorder != nullptr ? recorder->Submissions() : 0;
         if (!image->Refresh() || StorageTexture::Uploads() != uploads) throw std::runtime_error("a target filled on the GPU and drawn again was uploaded (frame " + std::to_string(frame) + ")");
+        if (recorder != nullptr && recorder->Submissions() != submissions) throw std::runtime_error("the refresh of a target behind its GPU fill and write-back waited for the GPU (frame " + std::to_string(frame) + ")");
     }
     device.WaitIdle();
     Require(Count(block, BlockBytes, 0xff) == Threads * 4u && Count(block, BlockBytes, 0x22) == BlockBytes - Threads * 4u, "the filled and drawn target did not reach guest memory");
