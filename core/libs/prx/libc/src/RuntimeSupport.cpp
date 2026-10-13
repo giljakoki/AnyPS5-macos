@@ -22,7 +22,7 @@
 
 namespace {
 
-std::recursive_mutex g_sysLock;
+std::recursive_mutex& g_sysLock = *new std::recursive_mutex();
 
 struct ExitDestructor {
     void (APS5_VABI *func)(void*);
@@ -30,8 +30,8 @@ struct ExitDestructor {
     void* dsoHandle;
 };
 
-std::mutex g_exitMutex;
-std::vector<ExitDestructor> g_exitDestructors;
+std::mutex& g_exitMutex = *new std::mutex();
+std::vector<ExitDestructor>& g_exitDestructors = *new std::vector<ExitDestructor>();
 bool g_exitRunnerRegistered = false;
 
 #ifdef _WIN32
@@ -112,8 +112,8 @@ unsigned int APS5_VABI _Atomic_load_4_nid_postfix(volatile unsigned int* target,
 }
 
 unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix() {
-    static std::random_device device;
-    static std::mutex mutex;
+    static std::random_device& device = *new std::random_device();
+    static std::mutex& mutex = *new std::mutex();
     std::lock_guard lock(mutex);
     return device();
 }

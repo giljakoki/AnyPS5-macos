@@ -61,7 +61,7 @@ static DWORD WinProtFromPosix(int prot) {
 // Guest mappings share libc's guest address space arena so they stay inside the PS5 map area.
 struct KernelArena {
     static KernelArena& Get() {
-        static KernelArena arena;
+        static KernelArena& arena = *new KernelArena();
         return arena;
     }
     bool Contains(const void* pointer, size_t len) const { return GuestArena::GuestArenaContains_nid_postfix(pointer, len); }
@@ -385,8 +385,8 @@ struct PhysicalPage {
     std::uint64_t offset;
 };
 
-std::mutex g_directLock;
-std::map<std::uint64_t, PhysicalPage> g_physPages;
+std::mutex& g_directLock = *new std::mutex();
+std::map<std::uint64_t, PhysicalPage>& g_physPages = *new std::map<std::uint64_t, PhysicalPage>();
 
 struct DirectMapping {
     std::uintptr_t end;
@@ -395,7 +395,7 @@ struct DirectMapping {
     std::shared_ptr<PhysicalBacking> backing;
 };
 
-std::map<std::uintptr_t, DirectMapping> g_directMappings;
+std::map<std::uintptr_t, DirectMapping>& g_directMappings = *new std::map<std::uintptr_t, DirectMapping>();
 
 void EraseMappings(std::uintptr_t start, std::uintptr_t end) {
     auto it = g_directMappings.lower_bound(start);
@@ -713,8 +713,8 @@ struct ProtectedRange {
     std::uintptr_t end;
     int prot;
 };
-std::mutex g_protectionLock;
-std::map<std::uintptr_t, ProtectedRange> g_protections;
+std::mutex& g_protectionLock = *new std::mutex();
+std::map<std::uintptr_t, ProtectedRange>& g_protections = *new std::map<std::uintptr_t, ProtectedRange>();
 
 void EraseProtections(std::uintptr_t start, std::uintptr_t end) {
     auto it = g_protections.lower_bound(start);
@@ -728,8 +728,8 @@ void EraseProtections(std::uintptr_t start, std::uintptr_t end) {
     }
 }
 
-std::mutex g_reservationLock;
-std::map<std::uintptr_t, std::uintptr_t> g_reservations;
+std::mutex& g_reservationLock = *new std::mutex();
+std::map<std::uintptr_t, std::uintptr_t>& g_reservations = *new std::map<std::uintptr_t, std::uintptr_t>();
 
 void EraseReservations(const void* addr, size_t len) {
     const auto start = reinterpret_cast<std::uintptr_t>(addr);

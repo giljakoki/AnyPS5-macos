@@ -44,7 +44,7 @@ struct Registry {
 };
 
 Registry& registry() {
-    static Registry value;
+    static Registry& value = *new Registry();
     return value;
 }
 

@@ -39,7 +39,7 @@ struct PathAliases {
 };
 
 PathAliases& Aliases() {
-    static PathAliases aliases;
+    static PathAliases& aliases = *new PathAliases();
     return aliases;
 }
 

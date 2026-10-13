@@ -75,11 +75,11 @@ void Driver::fillClearCount(const Graphics::StorageTexture::FillCoverage& covera
     if (!profile) return;
     using FillCover = Graphics::StorageTexture::FillCover;
     static constexpr std::array<const char*, 8> names{"none", "exact", "inside", "around", "straddle", "several", "keys", "layer"};
-    static std::mutex countsMutex;
+    static std::mutex& countsMutex = *new std::mutex();
     static std::array<std::uint64_t, 8> counts{}, coverBytes{};
-    static std::map<std::uint32_t, std::uint64_t> coveredFormats;
-    static std::map<std::string, std::uint64_t> refusals;
-    static std::map<std::uint32_t, std::uint64_t> keyCodes;
+    static std::map<std::uint32_t, std::uint64_t>& coveredFormats = *new std::map<std::uint32_t, std::uint64_t>();
+    static std::map<std::string, std::uint64_t>& refusals = *new std::map<std::string, std::uint64_t>();
+    static std::map<std::uint32_t, std::uint64_t>& keyCodes = *new std::map<std::uint32_t, std::uint64_t>();
     static std::uint64_t clears = 0, clearedBytes = 0, layerClears = 0, withOthers = 0, othersInside = 0, discards = 0;
     static auto lastReport = std::chrono::steady_clock::now();
     std::lock_guard lock(countsMutex);

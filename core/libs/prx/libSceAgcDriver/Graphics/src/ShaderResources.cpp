@@ -369,7 +369,7 @@ struct TextureCache {
 };
 
 TextureCache& Textures() {
-    static TextureCache cache;
+    static TextureCache& cache = *new TextureCache();
     return cache;
 }
 
@@ -380,7 +380,7 @@ struct UncachedImages {
 };
 
 UncachedImages& Uncached() {
-    static UncachedImages uncached;
+    static UncachedImages& uncached = *new UncachedImages();
     return uncached;
 }
 
@@ -563,7 +563,7 @@ struct TextureCounters {
 };
 
 TextureCounters& TextureCounts() {
-    static TextureCounters counters;
+    static TextureCounters& counters = *new TextureCounters();
     return counters;
 }
 
@@ -660,7 +660,7 @@ struct StorageFailures {
 };
 
 StorageFailures& StorageFailed() {
-    static StorageFailures failures;
+    static StorageFailures& failures = *new StorageFailures();
     return failures;
 }
 
@@ -998,7 +998,7 @@ struct StorageTextureCache {
 };
 
 StorageTextureCache& StorageTextures() {
-    static StorageTextureCache cache;
+    static StorageTextureCache& cache = *new StorageTextureCache();
     return cache;
 }
 
@@ -1055,7 +1055,7 @@ struct ExtendedSurfaces {
 };
 
 ExtendedSurfaces& ExtendedChains() {
-    static ExtendedSurfaces surfaces;
+    static ExtendedSurfaces& surfaces = *new ExtendedSurfaces();
     return surfaces;
 }
 
@@ -1452,7 +1452,7 @@ struct BuildProfile {
 };
 
 BuildProfile& Builds() {
-    static BuildProfile profile;
+    static BuildProfile& profile = *new BuildProfile();
     return profile;
 }
 
@@ -1500,7 +1500,7 @@ struct BufferWriteCounters {
 };
 
 BufferWriteCounters& BufferWrites() {
-    static BufferWriteCounters counters;
+    static BufferWriteCounters& counters = *new BufferWriteCounters();
     return counters;
 }
 
@@ -1913,7 +1913,7 @@ bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
 void ShaderResources::reportDescriptorCaches() const {
-    static std::mutex reportMutex;
+    static std::mutex& reportMutex = *new std::mutex();
     static auto lastReport = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(reportMutex);
@@ -2043,7 +2043,7 @@ struct RevalidateProfile {
 };
 
 RevalidateProfile& Revalidations() {
-    static RevalidateProfile profile;
+    static RevalidateProfile& profile = *new RevalidateProfile();
     return profile;
 }
 
@@ -2667,7 +2667,7 @@ struct ChurnProfile {
 };
 
 ChurnProfile& Churn() {
-    static ChurnProfile profile;
+    static ChurnProfile& profile = *new ChurnProfile();
     return profile;
 }
 

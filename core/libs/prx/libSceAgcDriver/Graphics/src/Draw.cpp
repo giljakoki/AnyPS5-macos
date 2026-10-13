@@ -194,12 +194,12 @@ struct CmaskProof {
 };
 
 std::mutex& cmaskProofMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 
 std::unordered_map<std::uint64_t, CmaskProof>& cmaskProofs() {
-    static std::unordered_map<std::uint64_t, CmaskProof> proofs;
+    static std::unordered_map<std::uint64_t, CmaskProof>& proofs = *new std::unordered_map<std::uint64_t, CmaskProof>();
     return proofs;
 }
 
@@ -234,8 +234,8 @@ CmaskState multisampleCmask(const ColorTarget& color, std::span<const std::byte>
 }
 
 void reportMultisampleTarget(std::uint64_t address, const char* what, std::uint32_t samples) {
-    static std::mutex mutex;
-    static std::set<std::uint64_t> reported;
+    static std::mutex& mutex = *new std::mutex();
+    static std::set<std::uint64_t>& reported = *new std::set<std::uint64_t>();
     std::lock_guard lock(mutex);
     if (reported.size() >= 64 || !reported.insert(address).second) return;
     std::fprintf(stderr, "[gpu] %ux multisampled %s 0x%llx is rendered with one sample (APS5_MSAA_SINGLE_SAMPLE)\n", samples, what, static_cast<unsigned long long>(address));
@@ -519,7 +519,7 @@ struct DrawProfile {
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
 
 DrawProfile& Profile() {
-    static DrawProfile profile;
+    static DrawProfile& profile = *new DrawProfile();
     return profile;
 }
 
@@ -727,12 +727,12 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
 }
 
 std::mutex& validationMutex() {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     return mutex;
 }
 
 std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
-    static std::map<std::vector<std::uint64_t>, std::string> failures;
+    static std::map<std::vector<std::uint64_t>, std::string>& failures = *new std::map<std::vector<std::uint64_t>, std::string>();
     return failures;
 }
 
@@ -741,7 +741,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     hit = false;
     std::vector<std::uint64_t> key;
     const bool keyed = ValidationKey(context, shaders, state, key);
-    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
+    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>>& memo = *new std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>>();
     if (keyed) {
         memoized = true;
         std::lock_guard lock(validationMutex());
@@ -1233,8 +1233,8 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
-        static std::mutex reportMutex;
-        static std::set<std::uint64_t> reported;
+        static std::mutex& reportMutex = *new std::mutex();
+        static std::set<std::uint64_t>& reported = *new std::set<std::uint64_t>();
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
@@ -1929,8 +1929,8 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
         std::unique_ptr<Buffer> dump;
     };
     const int dumpLimit = DumpTargetLimit();
-    static std::mutex dumpMutex;
-    static std::map<std::uint64_t, int> dumped;
+    static std::mutex& dumpMutex = *new std::mutex();
+    static std::map<std::uint64_t, int>& dumped = *new std::map<std::uint64_t, int>();
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
@@ -2007,7 +2007,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
                     const auto texel = clearTexel(color, keys);
                     for (std::size_t offset = 0; offset + color.elementBytes <= pixels.size(); offset += color.elementBytes) std::memcpy(pixels.data() + offset, texel.data(), color.elementBytes);
                 } else if (!FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
-                    static std::set<std::pair<std::uint64_t, int>> reported;
+                    static std::set<std::pair<std::uint64_t, int>>& reported = *new std::set<std::pair<std::uint64_t, int>>();
                     if (reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
                     if (binding.gpuTiling) std::memcpy(pixels.data(), binding.original.data(), binding.original.size());
                     else ReadColorTarget(color, pixels);

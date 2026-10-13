@@ -11,7 +11,7 @@
 namespace AgcDriver::DriverDetail {
 
 Driver& Driver::Get() {
-    static Driver driver;
+    static Driver& driver = *new Driver();
     return driver;
 }
 

@@ -45,10 +45,10 @@ struct Module {
         }
     }
 };
-std::mutex modulesMutex;
-std::map<std::uintptr_t, std::shared_ptr<Module>> modules;
+std::mutex& modulesMutex = *new std::mutex();
+std::map<std::uintptr_t, std::shared_ptr<Module>>& modules = *new std::map<std::uintptr_t, std::shared_ptr<Module>>();
 std::uintptr_t nextHandle = 0x20000000;
-std::map<const void*, std::uintptr_t> imageIds;
+std::map<const void*, std::uintptr_t>& imageIds = *new std::map<const void*, std::uintptr_t>();
 void* Symbol(Module& module, const char* name) {
 #ifdef _WIN32
     return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module.native), name));
@@ -117,8 +117,8 @@ char* APS5_VABI dlerror_nid_postfix() {
 static void InitializeDeferredModule(HMODULE native) {
     using Entry = int (APS5_VABI *)(std::size_t, const void*, void*);
     using Initializer = void (APS5_VABI *)(int, char**, char**);
-    static std::mutex initializedLock;
-    static std::set<HMODULE> initialized;
+    static std::mutex& initializedLock = *new std::mutex();
+    static std::set<HMODULE>& initialized = *new std::set<HMODULE>();
     const auto* table = reinterpret_cast<const std::uint32_t*>(GetProcAddress(native, "__aps5_guest_initialize"));
     if (!table) return;
     {

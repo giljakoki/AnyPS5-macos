@@ -166,8 +166,8 @@ using FrameIndex = std::vector<std::pair<Word, const Byte*>>;
 using ImageKey = std::array<Word, 6>;
 
 const FrameIndex& IndexFrames(const ImageKey& key, const Byte* begin, const Byte* end) {
-    static std::mutex mutex;
-    static std::map<ImageKey, FrameIndex> indexes;
+    static std::mutex& mutex = *new std::mutex();
+    static std::map<ImageKey, FrameIndex>& indexes = *new std::map<ImageKey, FrameIndex>();
     std::lock_guard lock(mutex);
     const auto [entry, inserted] = indexes.try_emplace(key);
     auto& index = entry->second;

@@ -39,8 +39,8 @@ int EnvInt(const char* name, int fallback) {
 }
 
 void LogOnce(const char* role, const std::string& text) {
-    static std::mutex mutex;
-    static std::set<std::string> seen;
+    static std::mutex& mutex = *new std::mutex();
+    static std::set<std::string>& seen = *new std::set<std::string>();
     std::lock_guard lock(mutex);
     if (!seen.insert(std::string(role) + "|" + text).second) return;
     std::fprintf(stderr, "[thread-priority] %s: %s\n", role, text.c_str());
@@ -152,7 +152,7 @@ bool RtkitCall(const char* method, std::uint64_t tid, int type, const void* valu
         failure = dbus.failure;
         return false;
     }
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     std::lock_guard lock(mutex);
     auto* message = dbus.messageNewMethodCall("org.freedesktop.RealtimeKit1", "/org/freedesktop/RealtimeKit1", "org.freedesktop.RealtimeKit1", method);
     if (message == nullptr) {
@@ -222,7 +222,7 @@ bool PrepareRealtime(std::uint32_t priority, const char* role, std::string& fail
     std::string rtkitFailure;
     std::optional<RtkitLimits> rtkit;
     if (RtkitProperty("MaxRealtimePriority", maxPriority, rtkitFailure) && RtkitProperty("RTTimeUSecMax", maxRttime, rtkitFailure)) rtkit = RtkitLimits{maxPriority, maxRttime};
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     std::lock_guard lock(mutex);
     rlimit limit{};
     if (getrlimit(RLIMIT_RTTIME, &limit) != 0) {

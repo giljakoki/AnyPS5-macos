@@ -52,8 +52,8 @@ struct NamedRange {
  std::string name;
 };
 
-std::mutex g_rangeNameLock;
-std::map<uintptr_t, NamedRange> g_rangeNames;
+std::mutex& g_rangeNameLock = *new std::mutex();
+std::map<uintptr_t, NamedRange>& g_rangeNames = *new std::map<uintptr_t, NamedRange>();
 
 void EraseRangeNames(uintptr_t start, uintptr_t end) {
  auto it = g_rangeNames.lower_bound(start);
@@ -83,11 +83,11 @@ void ApplyRangeName(uintptr_t address, VirtualQueryInfo* info) {
  if (next != g_rangeNames.end()) info->end = std::min<uintptr_t>(info->end, next->first);
 }
 
-std::mutex g_prtLock;
+std::mutex& g_prtLock = *new std::mutex();
 PrtAperture g_prtApertures[PRT_APERTURE_COUNT] = {};
 
-std::mutex g_flexibleLock;
-std::map<uintptr_t, size_t> g_flexibleRanges;
+std::mutex& g_flexibleLock = *new std::mutex();
+std::map<uintptr_t, size_t>& g_flexibleRanges = *new std::map<uintptr_t, size_t>();
 
 size_t _flexibleUsedLocked() {
     size_t used = 0;
@@ -491,7 +491,7 @@ bool PageRange(void* address, std::uint64_t length, std::uintptr_t& start, std::
 }
 
 #ifdef _WIN32
-std::mutex g_workingSetLock;
+std::mutex& g_workingSetLock = *new std::mutex();
 
 bool HostRangeAccessible(std::uintptr_t start, std::uintptr_t end) {
     for (auto cursor = start; cursor < end;) {

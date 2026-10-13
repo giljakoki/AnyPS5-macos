@@ -116,7 +116,7 @@ int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::si
             return -1;
         }
         if (oldValue == nullptr || oldLength == nullptr) throw std::runtime_error(std::string(__func__) + ": kern.rng_pseudo without an output buffer");
-        static std::random_device device;
+        static std::random_device& device = *new std::random_device();
         auto* bytes = static_cast<std::uint8_t*>(oldValue);
         for (std::size_t i = 0; i < *oldLength; ++i) bytes[i] = static_cast<std::uint8_t>(device());
         return 0;

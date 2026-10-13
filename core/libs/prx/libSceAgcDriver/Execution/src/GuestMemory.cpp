@@ -433,7 +433,7 @@ struct PageStates {
 };
 
 PageStates& Pages() {
-    static PageStates pages;
+    static PageStates& pages = *new PageStates();
     return pages;
 }
 
@@ -949,7 +949,7 @@ struct WriteTracker {
 };
 
 WriteTracker& Tracker() {
-    static WriteTracker tracker;
+    static WriteTracker& tracker = *new WriteTracker();
     return tracker;
 }
 
@@ -1518,7 +1518,7 @@ struct HolderMatrix {
 };
 
 HolderMatrix& Holders() {
-    static HolderMatrix matrix;
+    static HolderMatrix& matrix = *new HolderMatrix();
     return matrix;
 }
 
@@ -1818,7 +1818,7 @@ std::uint32_t GpuLockThreadTag() {
 }
 
 GpuMutexType& GpuMutex() {
-    static GpuMutexType mutex;
+    static GpuMutexType& mutex = *new GpuMutexType();
     return mutex;
 }
 

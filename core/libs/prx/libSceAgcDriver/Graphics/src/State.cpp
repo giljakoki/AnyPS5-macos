@@ -1247,7 +1247,7 @@ constexpr std::size_t MultisampleTraceLines = 1024;
 
 void traceOnce(MultisampleTrace kind, const std::string& line) {
     static constexpr const char* names[] = {"state", "descriptor", "fill"};
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     static std::array<std::set<std::string>, static_cast<std::size_t>(MultisampleTrace::Count)> seen;
     std::lock_guard lock(mutex);
     auto& lines = seen[static_cast<std::size_t>(kind)];

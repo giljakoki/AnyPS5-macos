@@ -199,7 +199,7 @@ std::size_t ReadCode(std::uint64_t address, std::uint8_t* buffer, std::size_t si
 }
 
 void TraceSse4a(std::uint64_t rip, const sse4a::Instruction& instruction, const sse4a::Field& field, unsigned long long count) {
-    static std::mutex mutex;
+    static std::mutex& mutex = *new std::mutex();
     static std::uint64_t seen[128];
     static std::size_t seenCount = 0;
     {

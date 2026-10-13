@@ -30,9 +30,9 @@ void APS5_VABI _ZdlPv_nid_postfix(void* pointer);
 
 namespace {
 
-std::mutex g_localeInitMutex;
+std::mutex& g_localeInitMutex = *new std::mutex();
 bool g_localeInitialized = false;
-std::vector<GuestLocale::Facet*> g_registeredFacets;
+std::vector<GuestLocale::Facet*>& g_registeredFacets = *new std::vector<GuestLocale::Facet*>();
 
 void APS5_VABI DestroyClassicLocale(GuestLocale::Facet*) {
     throw std::runtime_error("Cannot destroy the classic locale");

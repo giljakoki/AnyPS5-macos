@@ -20,8 +20,8 @@ struct Registration {
     int id;
 };
 
-std::mutex g_mutex;
-std::vector<Registration> g_registrations;
+std::mutex& g_mutex = *new std::mutex();
+std::vector<Registration>& g_registrations = *new std::vector<Registration>();
 
 }
 
