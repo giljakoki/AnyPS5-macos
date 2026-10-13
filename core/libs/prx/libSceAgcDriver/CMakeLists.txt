@@ -196,6 +196,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/QueueSubmitter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -926,6 +927,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ColorTargetLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
+        Graphics/src/QueueSubmitter.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/ShaderResources.cpp
         Graphics/src/ShaderAddressResources.cpp
@@ -984,6 +986,7 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         tests/BdaContracts.cpp
         Execution/src/BdaFeatures.cpp
         Graphics/src/Resources.cpp
+        Graphics/src/QueueSubmitter.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/BufferAddress.cpp
 )
