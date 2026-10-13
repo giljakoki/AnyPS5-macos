@@ -35,6 +35,12 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+struct SharedCompareCounts {
+    std::uint64_t shared;
+    std::uint64_t assisted;
+    std::size_t helpers;
+};
+SharedCompareCounts SharedCompares();
 std::uint64_t ComparedBytes();
 std::uint64_t WalkedBytes();
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
@@ -163,6 +169,7 @@ void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
 void MarkPresenterThread();
+bool OnPresenterThread();
 // The queue tag of the calling thread (0xffffffff when untagged), for reports that name the thread.
 std::uint32_t GpuLockThreadTag();
 // Lock sites (APS5_PROFILE_DRAW): a caller names the site of its next lock() so the [lock] line

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BUFFERPOOL_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -11,6 +12,15 @@
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+struct BufferView {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
+    std::size_t bytes = 0;
+};
+
+constexpr std::size_t BufferAlternateCount = 3;
+using BufferAlternates = std::array<BufferView, BufferAlternateCount>;
 
 struct BufferAllocation {
     VkBuffer buffer;
@@ -24,7 +34,11 @@ struct BufferAllocation {
     VkDeviceSize offset = 0;
     bool slab = false;
     std::size_t bufferBytes = 0;
+    BufferAlternates alternates{};
 };
+
+BufferView KeepAlternate(BufferAlternates& alternates, BufferView previous);
+bool TakeAlternate(BufferAllocation& allocation, std::size_t bytes);
 
 struct SlabSlot {
     VkDeviceMemory memory;

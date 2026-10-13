@@ -131,7 +131,23 @@ struct ImportedHash {
     bool known = false;
     bool changedEver = false;
     std::uint64_t changedPresent = 0;
+    std::uint64_t stablePresent = Recorder::Presents();
+    std::uint64_t hashedPresent = 0;
 };
+
+std::uint64_t importedHashMaxInterval() {
+    static const std::uint64_t presents = [] {
+        const char* text = std::getenv("APS5_IMPORTED_HASH_MAX_INTERVAL");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull;
+        return value == 0 ? 1ull : value;
+    }();
+    return presents;
+}
+
+std::uint64_t importedHashInterval(const ImportedHash& hash) {
+    const auto doublings = std::min<std::uint64_t>((Recorder::Presents() - hash.stablePresent) / 60, 6);
+    return std::min<std::uint64_t>(importedHashMaxInterval(), std::uint64_t{1} << doublings);
+}
 
 std::uint64_t importedRefreshRecentPresents() {
     static const std::uint64_t presents = [] {
@@ -142,6 +158,7 @@ std::uint64_t importedRefreshRecentPresents() {
 }
 
 void noteImportedChange(ImportedHash& hash) {
+    hash.stablePresent = Recorder::Presents();
     hash.changedEver = true;
     hash.changedPresent = Recorder::Presents();
 }
@@ -159,6 +176,7 @@ struct SnapshotProofCounts {
     std::atomic<std::uint64_t> refreshedBytes{0};
     std::atomic<std::uint64_t> hashes{0};
     std::atomic<std::uint64_t> recentRefreshes{0};
+    std::atomic<std::uint64_t> backedOff{0};
     std::atomic<std::uint64_t> unchanged{0};
     std::atomic<std::uint64_t> hashedBytes{0};
     std::array<std::atomic<std::uint64_t>, 8> phaseCalls{};
@@ -233,7 +251,7 @@ void reportSnapshotProofs() {
         phases += text;
     }
     std::fprintf(stderr, "[resources] snapshot lookup CPU time since the last line:%s\n", phases.c_str());
-    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface), %llu imported refreshes on the GPU (%.1f MiB), %llu imported hash passes (%.1f MiB, %llu unchanged), %llu refreshed without a hash after a recent change; since the last line %.1f MiB compared at %.2f GB/s, %ld minor and %ld major page faults\n", count(counts.hits), count(counts.compares), static_cast<double>(compared) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written), count(counts.refreshes), static_cast<double>(counts.refreshedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.hashes), static_cast<double>(counts.hashedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unchanged), count(counts.recentRefreshes), static_cast<double>(comparedSince) / 1048576.0, nanosecondsSince != 0 ? static_cast<double>(comparedSince) / static_cast<double>(nanosecondsSince) : 0.0, minorFaults, majorFaults);
+    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface), %llu imported refreshes on the GPU (%.1f MiB), %llu imported hash passes (%.1f MiB, %llu unchanged), %llu refreshed without a hash after a recent change, %llu hash passes skipped for surfaces unchanged for a long time; since the last line %.1f MiB compared at %.2f GB/s, %ld minor and %ld major page faults\n", count(counts.hits), count(counts.compares), static_cast<double>(compared) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written), count(counts.refreshes), static_cast<double>(counts.refreshedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.hashes), static_cast<double>(counts.hashedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unchanged), count(counts.recentRefreshes), count(counts.backedOff), static_cast<double>(comparedSince) / 1048576.0, nanosecondsSince != 0 ? static_cast<double>(comparedSince) / static_cast<double>(nanosecondsSince) : 0.0, minorFaults, majorFaults);
 }
 
 std::chrono::milliseconds snapshotProofLifetime() {
@@ -362,12 +380,12 @@ void hashThenRefresh(const Context& context, CachedTexture& entry, const HostImp
     counts.refreshedBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
-void consumeImportedHash(const Context& context, CachedTexture& entry, const HostImport& import, std::uint64_t address, std::size_t bytes) {
+bool consumeImportedHash(const Context& context, CachedTexture& entry, const HostImport& import, std::uint64_t address, std::size_t bytes) {
     auto& hash = *entry.hash;
     bool changed = false;
     {
         PhaseTimer timer(LookupPhase::DigestRead);
-        if (!hash.inFlight || !hash.recorder->BatchFinished(hash.serial)) return;
+        if (!hash.inFlight || !hash.recorder->BatchFinished(hash.serial)) return false;
         hash.inFlight = false;
         std::array<std::uint32_t, 4> digest{};
         hash.digest->Invalidate();
@@ -376,33 +394,39 @@ void consumeImportedHash(const Context& context, CachedTexture& entry, const Hos
             if (hash.known && digest != hash.stored) noteImportedChange(hash);
             hash.stored = digest;
             hash.known = true;
-            return;
+            return false;
         }
         if (hash.known && digest == hash.stored) {
             snapshotProofCounts().unchanged.fetch_add(1, std::memory_order_relaxed);
-            return;
+            return false;
         }
         noteImportedChange(hash);
         changed = true;
     }
     if (changed) hashThenRefresh(context, entry, import, address, bytes);
+    return changed;
 }
 
 void refreshImportedSnapshot(const Context& context, CachedTexture& entry, const HostImport& import, std::uint64_t address, std::size_t bytes) {
     if (entry.hash == nullptr) entry.hash = std::make_shared<ImportedHash>();
-    consumeImportedHash(context, entry, import, address, bytes);
+    const bool refreshedNow = consumeImportedHash(context, entry, import, address, bytes);
     std::optional<PhaseTimer> proofTimer(std::in_place, LookupPhase::Proof);
     const auto proof = currentSnapshotProof();
     const auto state = proofState(entry, proof, address, bytes);
     proofTimer.reset();
-    if (state != ProofState::Holds) {
+    if (refreshedNow && state != ProofState::Holds) {
+        recordProof(entry, proof);
+    } else if (state != ProofState::Holds) {
         const auto& hash = *entry.hash;
         const bool recent = hash.changedEver && Recorder::Presents() - hash.changedPresent <= importedRefreshRecentPresents();
         if (state == ProofState::Written || !importedSnapshotHash() || recent) {
             if (recent && state != ProofState::Written) snapshotProofCounts().recentRefreshes.fetch_add(1, std::memory_order_relaxed);
             hashThenRefresh(context, entry, import, address, bytes);
-        } else if (!entry.hash->inFlight && !recordImportedHash(context, *entry.hash, import, address, bytes, false)) {
-            hashThenRefresh(context, entry, import, address, bytes);
+        } else if (entry.hash->known && Recorder::Presents() - entry.hash->hashedPresent < importedHashInterval(*entry.hash)) {
+            snapshotProofCounts().backedOff.fetch_add(1, std::memory_order_relaxed);
+        } else if (!entry.hash->inFlight) {
+            entry.hash->hashedPresent = Recorder::Presents();
+            if (!recordImportedHash(context, *entry.hash, import, address, bytes, false)) hashThenRefresh(context, entry, import, address, bytes);
         }
         recordProof(entry, proof);
     }

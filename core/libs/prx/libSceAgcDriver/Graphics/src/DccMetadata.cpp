@@ -470,8 +470,9 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoi
                 memoized = true;
                 return *keys;
             }
+            static const bool lockedPresentWait = std::getenv("APS5_PRESENT_KEYS_LOCKED") != nullptr;
             Recorder::CountSync(2);
-            recorder->SyncThrough(metaAddress, count);
+            recorder->SyncThrough(metaAddress, count, !lockedPresentWait && GuestMemory::OnPresenterThread());
         }
     }
     return readDccKeys(metaAddress, count, memoized);

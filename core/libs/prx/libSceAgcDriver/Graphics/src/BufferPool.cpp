@@ -175,7 +175,28 @@ VkDeviceSize BufferPool::DeviceBudget(const VkPhysicalDeviceMemoryProperties& me
     return std::max<VkDeviceSize>(VkDeviceSize{512} << 20u, largest / 8u);
 }
 
+BufferView KeepAlternate(BufferAlternates& alternates, BufferView previous) {
+    const auto dropped = alternates.back();
+    std::move_backward(alternates.begin(), alternates.end() - 1, alternates.end());
+    alternates.front() = previous;
+    return dropped;
+}
+
+bool TakeAlternate(BufferAllocation& allocation, std::size_t bytes) {
+    for (auto& alternate : allocation.alternates) {
+        if (alternate.buffer == VK_NULL_HANDLE || alternate.bytes != bytes) continue;
+        std::swap(alternate.buffer, allocation.buffer);
+        std::swap(alternate.address, allocation.address);
+        std::swap(alternate.bytes, allocation.bufferBytes);
+        return true;
+    }
+    return false;
+}
+
 VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
+    for (const auto& alternate : allocation.alternates) {
+        if (alternate.buffer != VK_NULL_HANDLE) destroyBuffer(device, alternate.buffer, nullptr);
+    }
     if (allocation.slab) {
         destroyBuffer(device, allocation.buffer, nullptr);
         return PutSlot(allocation.memory, allocation.offset);
@@ -236,14 +257,15 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     }
     auto& slots = found->second;
     auto chosen = std::prev(slots.end());
+    const auto holds = [&](const BufferAllocation& allocation) { return allocation.bufferBytes == bytes || std::any_of(allocation.alternates.begin(), allocation.alternates.end(), [&](const BufferView& alternate) { return alternate.buffer != VK_NULL_HANDLE && alternate.bytes == bytes; }); };
     for (auto it = slots.rbegin(); it != slots.rend() && it - slots.rbegin() < 16; ++it) {
-        if (it->allocation.bufferBytes == bytes) {
+        if (holds(it->allocation)) {
             chosen = std::prev(it.base());
             break;
         }
     }
-    if (chosen->allocation.bufferBytes == bytes) ++exactTakes;
     auto result = chosen->allocation;
+    if (result.bufferBytes == bytes || TakeAlternate(result, bytes)) ++exactTakes;
     slots.erase(chosen);
     if (slots.empty()) tier.free.erase(found);
     --tier.slots;
