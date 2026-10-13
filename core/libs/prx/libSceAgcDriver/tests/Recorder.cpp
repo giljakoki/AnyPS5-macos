@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -180,6 +181,8 @@ public:
             function<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(context.physical, &supported);
             enabled.occlusionQueryPrecise = supported.occlusionQueryPrecise;
             context.occlusionQueryPrecise = supported.occlusionQueryPrecise == VK_TRUE;
+            enabled.textureCompressionBC = supported.textureCompressionBC;
+            context.textureCompressionBC = supported.textureCompressionBC == VK_TRUE;
             enabled.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
             enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
             context.singlePassStorage = supported.shaderStorageImageReadWithoutFormat == VK_TRUE && supported.shaderStorageImageWriteWithoutFormat == VK_TRUE;
@@ -4420,6 +4423,126 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t width = 4096;
+    constexpr std::uint32_t height = 4096;
+    constexpr std::uint32_t bc7 = 181;
+    constexpr std::size_t bytes = std::size_t{width} * height;
+    void* block = base.hostImportAlignment != 0 && base.textureCompressionBC ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports, BC textures or write watching unavailable: imported snapshot proofs not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x5a, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{base, block};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the surface refused: imported snapshot proofs not tested\n";
+        return;
+    }
+    const bool watched = AgcDriver::GuestMemory::Watched(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    TextureCache textureCache(context);
+    context.textureCache = &textureCache;
+    context.nullDescriptors = device.NullDescriptors();
+    std::optional<PlaceholderImages> placeholders;
+    if (!context.nullDescriptors) {
+        placeholders.emplace(context);
+        context.placeholderImages = &*placeholders;
+    }
+    struct Settle {
+        Recorder& recorder;
+        VkDevice device;
+        ~Settle() {
+            try {
+                recorder.Sync();
+            } catch (...) {
+            }
+            ClearCachedTextures(device);
+        }
+    } settle{recorder, context.device};
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = 1;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageSamplers = {0u};
+    const auto words = linearTextureWords(address, width, height, bc7);
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    program.bindings.push_back(binding);
+    const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const auto draw = [&] {
+        ShaderResources resources(context, compiled);
+        Require(resources.SampledTextures().size() == 1, "the build has no sampled texture");
+        return resources.SampledTextures().front();
+    };
+    const auto order = [] {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Recorder::CountPresent();
+    };
+    order();
+    const auto made = draw();
+    const auto compared = AgcDriver::GuestMemory::ComparedBytes();
+    const auto walked = AgcDriver::GuestMemory::WalkedBytes();
+    constexpr int epochs = 10;
+    constexpr int drawsPerEpoch = 10;
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        order();
+        for (int i = 0; i < drawsPerEpoch; ++i) {
+            recorder.Sync();
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            Require(draw() == made, "an unchanged imported snapshot was made again");
+        }
+    }
+    const auto comparedNow = AgcDriver::GuestMemory::ComparedBytes() - compared;
+    const auto walkedNow = AgcDriver::GuestMemory::WalkedBytes() - walked;
+    std::cout << "imported snapshot proofs (" << (watched ? "watched" : "compared") << "): " << epochs * drawsPerEpoch << " draws of a " << (bytes >> 20u) << " MiB surface compared " << (comparedNow >> 20u) << " MiB, walked " << (walkedNow >> 20u) << " MiB\n";
+    Require(comparedNow <= epochs * bytes, "an unchanged imported snapshot was compared more than once per epoch");
+    Require(!watched || comparedNow < bytes, "a watched imported snapshot was compared");
+    Require(walkedNow <= epochs * bytes, "an imported snapshot's pages were walked more than once per epoch");
+    std::uint64_t elsewhere = 0;
+    order();
+    Require(draw() == made, "an unchanged imported snapshot was made again");
+    const auto beforeWrites = AgcDriver::GuestMemory::ComparedBytes();
+    for (int i = 0; i < drawsPerEpoch; ++i) {
+        AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uint64_t>(&elsewhere), sizeof(elsewhere));
+        Require(draw() == made, "an unchanged imported snapshot was made again");
+    }
+    Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites, "a driver write elsewhere made an imported snapshot compare again");
+    AgcDriver::GuestMemory::MarkWritten(address + bytes / 2, 4);
+    Require(draw() == made, "an unchanged imported snapshot was made again");
+    Require(AgcDriver::GuestMemory::ComparedBytes() - beforeWrites == bytes, "a driver write over an imported snapshot was not compared");
+    static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x77;
+    order();
+    const auto stored = draw();
+    Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
+    Require(draw() == stored, "the remade imported snapshot is not the cache's");
+}
+
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)
 // and back: DataWordsHash() follows the buffers exactly, so a later recipe hit's hash compare
 // (RecordedDispatch::DataRefresh::Hash) decides correctly in both directions.
@@ -5446,6 +5569,7 @@ int main(int argc, char** argv) {
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
         imageMemoTests(device, recorder);
+        importedSnapshotProofTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         singleCubeTests(device, recorder);

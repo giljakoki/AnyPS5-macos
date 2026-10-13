@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <unistd.h>
 
 namespace {
 
@@ -15,7 +16,20 @@ void check(bool condition, const char* what) {
 
 }
 
+void readDuringExit() {
+    try {
+        ReadThrottle::After(1024u * 1024u);
+        std::printf("PASS a read during process exit is throttled without touching destroyed state\n");
+    } catch (const std::exception& error) {
+        std::printf("FAIL a read during process exit threw: %s\n", error.what());
+        std::fflush(stdout);
+        _exit(1);
+    }
+    std::fflush(stdout);
+}
+
 int main() {
+    std::atexit(readDuringExit);
     try {
         const ReadThrottle::Settings settings{1000, 5.0};
         double carry = 0.0;

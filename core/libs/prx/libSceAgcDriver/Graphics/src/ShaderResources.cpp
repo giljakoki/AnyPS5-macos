@@ -108,7 +108,82 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    std::uint64_t provenPresent = 0;
+    std::chrono::steady_clock::time_point provenAt{};
+    std::uint64_t provenForget = 0;
+    std::uint64_t provenWrites = 0;
+    bool proven = false;
 };
+
+struct SnapshotProofCounts {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> compares{0};
+    std::atomic<std::uint64_t> unproven{0};
+    std::atomic<std::uint64_t> newEpoch{0};
+    std::atomic<std::uint64_t> forgotten{0};
+    std::atomic<std::uint64_t> written{0};
+    std::atomic<std::uint64_t> comparedBytes{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SnapshotProofCounts& snapshotProofCounts() {
+    static auto& counts = *new SnapshotProofCounts;
+    return counts;
+}
+
+void reportSnapshotProofs() {
+    auto& counts = snapshotProofCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface)\n", count(counts.hits), count(counts.compares), static_cast<double>(counts.comparedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written));
+}
+
+std::chrono::milliseconds snapshotProofLifetime() {
+    static const auto lifetime = [] {
+        const char* text = std::getenv("APS5_SNAPSHOT_PROOF_MS");
+        return std::chrono::milliseconds(text != nullptr ? std::strtoull(text, nullptr, 10) : 500ull);
+    }();
+    return lifetime;
+}
+
+bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
+    auto& counts = snapshotProofCounts();
+    const auto present = Recorder::Presents();
+    const auto now = std::chrono::steady_clock::now();
+    const auto forget = GuestMemory::ForgetSerial();
+    const auto writes = GuestMemory::DriverWriteSerial();
+    const bool usable = !disabled && (forget & 1u) == 0;
+    if (usable && entry.proven) {
+        if (entry.provenPresent != present || now - entry.provenAt >= snapshotProofLifetime()) {
+            counts.newEpoch.fetch_add(1, std::memory_order_relaxed);
+        } else if (entry.provenForget != forget) {
+            counts.forgotten.fetch_add(1, std::memory_order_relaxed);
+        } else if (GuestMemory::DriverWroteOver(address, bytes, entry.provenWrites)) {
+            counts.written.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            entry.provenWrites = writes;
+            counts.hits.fetch_add(1, std::memory_order_relaxed);
+            reportSnapshotProofs();
+            return true;
+        }
+    } else {
+        counts.unproven.fetch_add(1, std::memory_order_relaxed);
+    }
+    counts.compares.fetch_add(1, std::memory_order_relaxed);
+    counts.comparedBytes.fetch_add(entry.bytes.size(), std::memory_order_relaxed);
+    reportSnapshotProofs();
+    entry.proven = false;
+    if (!GuestMemory::EqualsCommittedUnsynced(address, entry.bytes)) return false;
+    entry.proven = usable;
+    entry.provenPresent = present;
+    entry.provenAt = now;
+    entry.provenForget = forget;
+    entry.provenWrites = writes;
+    return true;
+}
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
@@ -652,7 +727,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                GuestMemory::FlushGpuWrites(address, it->bytes.size());
+                return snapshotProven(*it, address, bytes);
             };
             if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
