@@ -6120,6 +6120,20 @@ int staleHandleTests(const Device& device) {
         freeMemory(context.device, tableMemory, nullptr);
         destroyBuffer(context.device, addressed, nullptr);
     }
+    {
+        const auto beforePool = StaleHandleReports();
+        VkQueryPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        poolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        poolInfo.queryCount = 2;
+        VkQueryPool queries = VK_NULL_HANDLE;
+        Check(reinterpret_cast<PFN_vkCreateQueryPool>(resolve("vkCreateQueryPool"))(context.device, &poolInfo, nullptr, &queries), "vkCreateQueryPool stale test");
+        Check(begin(commands, &beginInfo), "vkBeginCommandBuffer stale query test");
+        reinterpret_cast<PFN_vkCmdResetQueryPool>(resolve("vkCmdResetQueryPool"))(commands, queries, 0, 2);
+        Check(end(commands), "vkEndCommandBuffer stale query test");
+        reinterpret_cast<PFN_vkDestroyQueryPool>(resolve("vkDestroyQueryPool"))(context.device, queries, nullptr);
+        Require(StaleHandleReports() == beforePool + 1, "destroying a query pool a command buffer uses was not reported");
+        Check(reinterpret_cast<PFN_vkResetCommandBuffer>(resolve("vkResetCommandBuffer"))(commands, 0), "vkResetCommandBuffer stale query test");
+    }
     const auto counted = StaleHandleReports();
     freeCommands(context.device, context.pool, 1, &commands);
     freeMemory(context.device, clean, nullptr);

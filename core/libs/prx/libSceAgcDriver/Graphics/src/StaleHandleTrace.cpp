@@ -36,6 +36,7 @@ struct Freed {
 struct CommandRefs {
     std::unordered_map<std::uint64_t, std::uint64_t> memories;
     std::unordered_set<std::uint64_t> buffers;
+    std::unordered_set<std::uint64_t> queryPools;
     std::uint64_t fence = 0;
     bool submitted = false;
     std::chrono::steady_clock::time_point begun;
@@ -70,6 +71,7 @@ struct Tracker {
     std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, std::pair<StaleObject, std::uint64_t>>> setRefs;
     std::unordered_map<std::uint64_t, Freed> freedMemory;
     std::unordered_set<std::uint64_t> deadObjects;
+    std::unordered_set<std::uint64_t> deadQueryPools;
     std::unordered_map<std::uint64_t, CommandRefs> commands;
     std::atomic<std::uint64_t> reports{0};
 };
@@ -181,6 +183,7 @@ void completeFence(Tracker& tracker, std::uint64_t fence) {
         if (refs.submitted && refs.fence == fence) {
             refs.memories.clear();
             refs.buffers.clear();
+            refs.queryPools.clear();
             refs.submitted = false;
         }
     }
@@ -232,6 +235,89 @@ STALE_REAL(vkCmdCopyQueryPoolResults);
 STALE_REAL(vkGetBufferDeviceAddressKHR);
 STALE_REAL(vkCmdPushConstants);
 STALE_REAL(vkMapMemory);
+STALE_REAL(vkCreateQueryPool);
+STALE_REAL(vkDestroyQueryPool);
+STALE_REAL(vkCmdResetQueryPool);
+STALE_REAL(vkCmdBeginQuery);
+STALE_REAL(vkCmdEndQuery);
+STALE_REAL(vkCmdWriteTimestamp);
+
+void referencePool(Tracker& tracker, VkCommandBuffer commands, const char* command, VkQueryPool pool) {
+    if (pool == VK_NULL_HANDLE) return;
+    if (tracker.deadQueryPools.contains(key(pool)) && reportAllowed()) {
+        std::array<void*, 8> frames{};
+        int depth = 0;
+        capture(frames, depth);
+        std::fprintf(stderr, "[stale] %s records destroyed query pool %p into command buffer %p from", command, static_cast<void*>(pool), static_cast<void*>(commands));
+        printFrames(frames, depth);
+        std::fprintf(stderr, "\n");
+    }
+    tracker.commands[key(commands)].queryPools.insert(key(pool));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL staleCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo* info, const VkAllocationCallbacks* allocator, VkQueryPool* pool) {
+    const auto result = real_vkCreateQueryPool(device, info, allocator, pool);
+    if (result == VK_SUCCESS) {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        tracker.deadQueryPools.erase(key(*pool));
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL staleDestroyQueryPool(VkDevice device, VkQueryPool pool, const VkAllocationCallbacks* allocator) {
+    if (pool != VK_NULL_HANDLE) {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        for (const auto& [commands, refs] : tracker.commands) {
+            if (!refs.queryPools.contains(key(pool)) || !reportAllowed()) continue;
+            std::array<void*, 8> frames{};
+            int depth = 0;
+            capture(frames, depth);
+            std::fprintf(stderr, "[stale] query pool %p is destroyed while command buffer %p (%s, begun %.1f ms earlier) still uses it; destroyed from", static_cast<void*>(pool), reinterpret_cast<void*>(commands), refs.submitted ? "submitted" : "recording", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - refs.begun).count());
+            printFrames(frames, depth);
+            std::fprintf(stderr, "\n");
+        }
+        tracker.deadQueryPools.insert(key(pool));
+    }
+    real_vkDestroyQueryPool(device, pool, allocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL staleCmdResetQueryPool(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t first, std::uint32_t count) {
+    {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        referencePool(tracker, commands, "vkCmdResetQueryPool", pool);
+    }
+    real_vkCmdResetQueryPool(commands, pool, first, count);
+}
+
+VKAPI_ATTR void VKAPI_CALL staleCmdBeginQuery(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t query, VkQueryControlFlags flags) {
+    {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        referencePool(tracker, commands, "vkCmdBeginQuery", pool);
+    }
+    real_vkCmdBeginQuery(commands, pool, query, flags);
+}
+
+VKAPI_ATTR void VKAPI_CALL staleCmdEndQuery(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t query) {
+    {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        referencePool(tracker, commands, "vkCmdEndQuery", pool);
+    }
+    real_vkCmdEndQuery(commands, pool, query);
+}
+
+VKAPI_ATTR void VKAPI_CALL staleCmdWriteTimestamp(VkCommandBuffer commands, VkPipelineStageFlagBits stage, VkQueryPool pool, std::uint32_t query) {
+    {
+        auto& tracker = Track();
+        std::lock_guard lock(tracker.mutex);
+        referencePool(tracker, commands, "vkCmdWriteTimestamp", pool);
+    }
+    real_vkCmdWriteTimestamp(commands, stage, pool, query);
+}
 STALE_REAL(vkUnmapMemory);
 
 VKAPI_ATTR VkResult VKAPI_CALL staleMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** data) {
@@ -447,6 +533,7 @@ VKAPI_ATTR VkResult VKAPI_CALL staleBeginCommandBuffer(VkCommandBuffer commands,
         auto& refs = tracker.commands[key(commands)];
         refs.memories.clear();
         refs.buffers.clear();
+        refs.queryPools.clear();
         refs.submitted = false;
         refs.fence = 0;
         refs.begun = std::chrono::steady_clock::now();
@@ -547,6 +634,7 @@ void completeAll() {
         if (!refs.submitted) continue;
         refs.memories.clear();
         refs.buffers.clear();
+        refs.queryPools.clear();
         refs.submitted = false;
     }
 }
@@ -751,6 +839,7 @@ VKAPI_ATTR void VKAPI_CALL staleCmdCopyQueryPoolResults(VkCommandBuffer commands
     {
         STALE_LOCK;
         reference(tracker, commands, "vkCmdCopyQueryPoolResults", StaleObject::Buffer, key(destination));
+        referencePool(tracker, commands, "vkCmdCopyQueryPoolResults", pool);
     }
     real_vkCmdCopyQueryPoolResults(commands, pool, first, count, destination, offset, stride, flags);
 }
@@ -883,6 +972,12 @@ PFN_vkVoidFunction StaleHandleWrapper(const char* name, PFN_vkVoidFunction real)
     STALE_WRAP(vkGetBufferDeviceAddressKHR, staleGetBufferDeviceAddress)
     STALE_WRAP(vkCmdPushConstants, staleCmdPushConstants)
     STALE_WRAP(vkMapMemory, staleMapMemory)
+    STALE_WRAP(vkCreateQueryPool, staleCreateQueryPool)
+    STALE_WRAP(vkDestroyQueryPool, staleDestroyQueryPool)
+    STALE_WRAP(vkCmdResetQueryPool, staleCmdResetQueryPool)
+    STALE_WRAP(vkCmdBeginQuery, staleCmdBeginQuery)
+    STALE_WRAP(vkCmdEndQuery, staleCmdEndQuery)
+    STALE_WRAP(vkCmdWriteTimestamp, staleCmdWriteTimestamp)
     STALE_WRAP(vkUnmapMemory, staleUnmapMemory)
 #undef STALE_WRAP
     return nullptr;
