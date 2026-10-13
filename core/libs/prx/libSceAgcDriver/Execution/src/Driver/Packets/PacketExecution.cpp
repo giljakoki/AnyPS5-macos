@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -82,6 +83,7 @@ void Driver::execute(const Submission& submission) {
     auto& queue = *state;
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
+    if (Graphics::UploadTraceEnabled()) Graphics::UploadTrace("execute serial=%llu queue=0x%x", static_cast<unsigned long long>(submission.serial), submission.queue);
 
     static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
     if (static_cast<long>(submission.queue) == dumpQueue) {

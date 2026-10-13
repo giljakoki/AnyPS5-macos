@@ -535,6 +535,7 @@ private:
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
+        std::uint32_t tracedLabels = 0;
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
         std::shared_ptr<void> samplePool;

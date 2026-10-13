@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -2865,6 +2866,7 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     ensureOpen();
+    ++open->tracedLabels;
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
     const bool tabled = bytes.size() <= LabelTableBytes;
@@ -3121,6 +3123,7 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
+    if (UploadTraceEnabled()) UploadTrace("batch %llu submitted with %u labels", static_cast<unsigned long long>(batch->serial), batch->tracedLabels);
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
         ++submitCount;
@@ -3511,6 +3514,7 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    if (UploadTraceEnabled() && batch != nullptr && batch->submitted) UploadTrace("batch %llu retired %.1f ms after its submit (%u labels, %s)", static_cast<unsigned long long>(batch->serial), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch->submittedAt).count(), batch->tracedLabels, wait ? "waited" : "reaped");
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
