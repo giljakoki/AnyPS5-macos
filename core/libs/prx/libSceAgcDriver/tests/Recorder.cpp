@@ -4504,10 +4504,44 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
         AgcDriver::GuestMemory::BumpCollectEpoch();
         Recorder::CountPresent();
     };
+    const auto readBlock = [&](const std::shared_ptr<Texture>& texture, std::uint64_t offset) {
+        recorder.Sync();
+        Buffer readback(context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toSource.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSource.oldLayout = texture->Layout();
+        toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSource.image = texture->Image();
+        toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        const auto block = offset / 16;
+        const auto blocksPerRow = std::uint64_t{width} / 4;
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = {static_cast<std::int32_t>(block % blocksPerRow * 4), static_cast<std::int32_t>(block / blocksPerRow * 4), 0};
+        region.imageExtent = {4, 4, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, texture->Image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
+        VkImageMemoryBarrier back = toSource;
+        back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        back.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        back.newLayout = texture->Layout();
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &back);
+        batch.SubmitAndWait();
+        return static_cast<std::uint8_t>(readback.Bytes()[0]);
+    };
+    const auto totalsBefore = SampledSnapshotTotals();
     order();
     const auto made = draw();
+    const bool refreshed = SampledSnapshotTotals().refreshes > totalsBefore.refreshes;
     const auto compared = AgcDriver::GuestMemory::ComparedBytes();
     const auto walked = AgcDriver::GuestMemory::WalkedBytes();
+    const auto refreshes = SampledSnapshotTotals().refreshes;
     constexpr int epochs = 10;
     constexpr int drawsPerEpoch = 10;
     for (int epoch = 0; epoch < epochs; ++epoch) {
@@ -4520,27 +4554,36 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     }
     const auto comparedNow = AgcDriver::GuestMemory::ComparedBytes() - compared;
     const auto walkedNow = AgcDriver::GuestMemory::WalkedBytes() - walked;
-    std::cout << "imported snapshot proofs (" << (watched ? "watched" : "compared") << "): " << epochs * drawsPerEpoch << " draws of a " << (bytes >> 20u) << " MiB surface compared " << (comparedNow >> 20u) << " MiB, walked " << (walkedNow >> 20u) << " MiB\n";
+    const auto refreshesNow = SampledSnapshotTotals().refreshes - refreshes;
+    std::cout << "imported snapshot proofs (" << (refreshed ? "refreshed on the GPU" : watched ? "watched" : "compared") << "): " << epochs * drawsPerEpoch << " draws of a " << (bytes >> 20u) << " MiB surface compared " << (comparedNow >> 20u) << " MiB, walked " << (walkedNow >> 20u) << " MiB, refreshed " << refreshesNow << " times\n";
     Require(comparedNow <= epochs * bytes, "an unchanged imported snapshot was compared more than once per epoch");
     Require(!watched || comparedNow < bytes, "a watched imported snapshot was compared");
     Require(walkedNow <= epochs * bytes, "an imported snapshot's pages were walked more than once per epoch");
+    Require(!refreshed || (comparedNow == 0 && refreshesNow == epochs), "an imported snapshot refreshed on the GPU was compared, or refreshed other than once per present");
     std::uint64_t elsewhere = 0;
     order();
     Require(draw() == made, "an unchanged imported snapshot was made again");
     const auto beforeWrites = AgcDriver::GuestMemory::ComparedBytes();
+    const auto refreshesBeforeWrites = SampledSnapshotTotals().refreshes;
     for (int i = 0; i < drawsPerEpoch; ++i) {
         AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uint64_t>(&elsewhere), sizeof(elsewhere));
         Require(draw() == made, "an unchanged imported snapshot was made again");
     }
-    Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites, "a driver write elsewhere made an imported snapshot compare again");
+    Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites && SampledSnapshotTotals().refreshes == refreshesBeforeWrites, "a driver write elsewhere made an imported snapshot compare or refresh again");
     AgcDriver::GuestMemory::MarkWritten(address + bytes / 2, 4);
     Require(draw() == made, "an unchanged imported snapshot was made again");
-    Require(AgcDriver::GuestMemory::ComparedBytes() - beforeWrites == bytes, "a driver write over an imported snapshot was not compared");
+    if (refreshed) Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites && SampledSnapshotTotals().refreshes == refreshesBeforeWrites + 1, "a driver write over an imported snapshot was not refreshed");
+    else Require(AgcDriver::GuestMemory::ComparedBytes() - beforeWrites == bytes, "a driver write over an imported snapshot was not compared");
     static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x77;
     order();
     const auto stored = draw();
-    Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
-    Require(draw() == stored, "the remade imported snapshot is not the cache's");
+    if (refreshed) {
+        Require(stored == made, "an imported snapshot refreshed on the GPU was made again");
+        Require(readBlock(stored, bytes / 2) == 0x77, "a CPU store into an imported snapshot was not visible after the next present");
+    } else {
+        Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
+        Require(draw() == stored, "the remade imported snapshot is not the cache's");
+    }
 }
 
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)

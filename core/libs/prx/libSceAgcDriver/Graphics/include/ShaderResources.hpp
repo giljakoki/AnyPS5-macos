@@ -26,6 +26,13 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+struct SampledSnapshotCounts {
+    std::uint64_t hits;
+    std::uint64_t compares;
+    std::uint64_t refreshes;
+    std::uint64_t comparedBytes;
+};
+SampledSnapshotCounts SampledSnapshotTotals();
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
