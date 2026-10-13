@@ -56,6 +56,8 @@ public:
     // by the driver: the [capture] line charges the waits made inside a capture to it.
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
+    using PageStateProvider = std::uint64_t (*)();
+    static void SetPageStateProvider(PageStateProvider provider);
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr);
     // Returns what the capture resolved (plan, snapshot, specialization) for
     // ShaderRecompiler::Recompile(request, capture), which then skips its own materialization. One
@@ -78,7 +80,8 @@ private:
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
     struct Page {
-        std::array<std::uint32_t, PageWords> words{};
+        Page() {}
+        std::array<std::uint32_t, PageWords> words;
         std::bitset<PageWords> valid;
         std::bitset<PageWords> read;
         std::bitset<PageWords> recent;

@@ -534,6 +534,34 @@ void verifyCaptureMemo() {
     const auto holdsSecond = std::ranges::any_of(changedCapture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(second.begin(), second.end(), value.dwords.begin()); });
     require(holdsSecond, "capture memo: the walk after the change did not read the new T#");
     std::copy(first.begin(), first.end(), srt.begin());
+    if (std::getenv("APS5_NO_CAPTURE_PAGE_MEMO") == nullptr) {
+        static std::uint64_t state = 1;
+        static int queries = 0;
+        static bool pending = false;
+        AgcDriver::ShaderMemory::SetPageStateProvider([] { return state; });
+        const auto query = [](std::uint64_t, std::size_t, std::span<std::byte>) {
+            ++queries;
+            return pending ? AgcDriver::ShaderMemory::PendingWrite::Sync : AgcDriver::ShaderMemory::PendingWrite::None;
+        };
+        const auto plain = [&] {
+            AgcDriver::ShaderMemory memory({}, query);
+            return memory.Capture(request);
+        };
+        queries = 0;
+        static_cast<void>(plain());
+        require(queries > 0, "page memo: the first capture did not classify its pages");
+        queries = 0;
+        const auto reused = plain();
+        require(queries == 0, "page memo: a page classified under the same memory map and pending writes was classified again");
+        pending = true;
+        ++state;
+        queries = 0;
+        const auto reclassified = plain();
+        require(queries > 0, "page memo: a page was not classified again after the pending writes changed");
+        require(std::ranges::equal(reused->snapshot.images, reclassified->snapshot.images, [](const auto& left, const auto& right) { return left.dwords == right.dwords; }), "page memo: a word-wise capture read other T#s");
+        pending = false;
+        AgcDriver::ShaderMemory::SetPageStateProvider(nullptr);
+    }
 }
 
 void verifyOutOfRangeConstantReads() {
