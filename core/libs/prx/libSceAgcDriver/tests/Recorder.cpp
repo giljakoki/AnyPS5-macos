@@ -4634,6 +4634,33 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
         Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
         Require(readBlock(made, bytes / 8) == 0x5d, "an atlas unchanged for 200 presents sampled stale bytes at the first draw after it changed");
     }
+    if (refreshed && hashed && std::getenv("APS5_IMPORTED_HASH_MAX_INTERVAL") == nullptr) {
+        for (int present = 0; present < 200; ++present) {
+            order();
+            Require(draw() == made, "an unchanged imported snapshot was made again");
+            recorder.Sync();
+        }
+        const auto hashesBeforeTail = SampledSnapshotTotals().hashes;
+        const auto refreshesBeforeTail = SampledSnapshotTotals().refreshes;
+        const auto unchangedBeforeTail = SampledSnapshotTotals().unchanged;
+        for (int present = 0; present < 64; ++present) {
+            order();
+            Require(draw() == made, "an unchanged imported snapshot was made again");
+            recorder.Sync();
+        }
+        const auto tailHashes = SampledSnapshotTotals().hashes - hashesBeforeTail;
+        if (tailHashes < 64 / 8 || tailHashes > 64 / 4) throw std::runtime_error("an atlas unchanged for 200 presents was hashed " + std::to_string(tailHashes) + " times in 64 presents, not every 8 (refreshed " + std::to_string(SampledSnapshotTotals().refreshes - refreshesBeforeTail) + ", unchanged " + std::to_string(SampledSnapshotTotals().unchanged - unchangedBeforeTail) + ")");
+        static_cast<volatile std::uint8_t*>(block)[bytes / 8] = 0x5e;
+        bool seen = false;
+        for (int present = 0; present < 10 && !seen; ++present) {
+            order();
+            Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+            recorder.Sync();
+            Require(draw() == made, "an imported snapshot refreshed on the GPU was made again");
+            seen = readBlock(made, bytes / 8) == 0x5e;
+        }
+        Require(seen, "a change of an atlas unchanged for a long time was not seen within 10 presents");
+    }
     const auto refreshesBeforeStore = SampledSnapshotTotals().refreshes;
     static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x77;
     order();
