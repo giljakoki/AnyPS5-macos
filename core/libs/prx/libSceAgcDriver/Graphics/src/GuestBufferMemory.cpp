@@ -3194,6 +3194,22 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
     }
+    if (context.hostImportAlignment != 0) {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        const bool spaceStale = space != nullptr && state.epoch != space->importsEpoch;
+        if (spaceStale || (space == nullptr && state.epoch != importsEpoch)) {
+            if (spaceStale) dissolveSpace(false);
+            for (auto& region : regions) {
+                if (region.direct == nullptr) continue;
+                const auto* live = findImport(state, region.begin, region.end);
+                Require(live != nullptr && bindableInPlace(region.begin - live->base, addressable), "a host import a region of this build was bound to was retired during the upload, and no import serves the region in place now");
+                region.direct = live;
+            }
+            importsEpoch = state.epoch;
+            Spaces().dissolvedImports.fetch_add(spaceStale ? 1u : 0u, std::memory_order_relaxed);
+        }
+    }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     if (!profile) return;
@@ -3520,13 +3536,33 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
     result.reserve(regions.size() + (space != nullptr ? space->ranges.size() : 0));
-    for (const auto& region : regions) result.push_back(addressRange(region));
+    auto& state = Imports();
+    std::unique_lock importsLock(state.mutex);
+    const bool regionsStale = state.epoch != importsEpoch;
+    const bool spaceStale = space != nullptr && state.epoch != space->importsEpoch;
+    const auto rangeOf = [&](const Region& region, bool stale) {
+        if (!stale || region.direct == nullptr) return addressRange(region);
+        const auto* live = findImport(state, region.begin, region.end);
+        Require(live != nullptr, "a host import a region of this build was bound to was retired before its BDA table was built, and no import serves the region now");
+        auto current = region;
+        current.direct = live;
+        return addressRange(current);
+    };
+    for (const auto& region : regions) result.push_back(rangeOf(region, regionsStale));
     if (space != nullptr) {
+        std::vector<ShaderRecompiler::BdaAbi::Range> spaceRanges;
+        if (spaceStale) {
+            for (const auto& region : space->base) {
+                if (region.direct != nullptr || region.mirror != nullptr) spaceRanges.push_back(rangeOf(region, true));
+            }
+        }
+        const auto& served = spaceStale ? spaceRanges : space->ranges;
         std::vector<ShaderRecompiler::BdaAbi::Range> combined;
-        combined.reserve(result.size() + space->ranges.size());
-        std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        combined.reserve(result.size() + served.size());
+        std::merge(served.begin(), served.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
         result = std::move(combined);
     }
+    importsLock.unlock();
     if (writes.empty()) return result;
     auto sortedWrites = writes;
     std::sort(sortedWrites.begin(), sortedWrites.end());
@@ -3570,6 +3606,11 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr || !regions.empty()) return std::nullopt;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (state.epoch != space->importsEpoch) return std::nullopt;
+    }
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (writes.empty()) return CachedTable{space->serial, &space->ranges};
     if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
