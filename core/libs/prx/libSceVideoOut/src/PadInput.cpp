@@ -244,6 +244,10 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     if (ignoreInput) return;
     if (keyboard && event.key.repeat != 0) return;
     const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
+    // APS5_TRACE_PAD=1: how long a key event waited in SDL's queue before the presenter pumped it.
+    static const bool trace = std::getenv("APS5_TRACE_PAD") != nullptr;
+    if (trace && keyboard)
+        std::fprintf(stderr, "[pad] key %s %s, pumped %u ms after the event\n", SDL_GetScancodeName(event.key.keysym.scancode), down ? "down" : "up", SDL_GetTicks() - event.key.timestamp);
     for (std::size_t index = 0; index < bindings.size(); ++index) {
         const auto& binding = bindings[index];
         const bool matches = keyboard
