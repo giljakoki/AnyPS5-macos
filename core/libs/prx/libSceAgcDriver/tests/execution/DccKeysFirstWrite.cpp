@@ -391,7 +391,12 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     }
     std::memset(block + SurfaceBytes, 0x33, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
-    Require(!image->Refresh(), "an untracked CPU edit was missed");
+    if (std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") == nullptr) {
+        const auto beforeEdit = image->Version();
+        Require(image->Refresh() && image->Version() == beforeEdit, "an untracked image was compared again before the next present");
+    }
+    AgcDriver::Graphics::Recorder::CountPresent();
+    Require(!image->Refresh(), "an untracked CPU edit was missed after the next present");
     const auto editedVersion = image->Version();
     Require(image->Refresh() && image->Version() == editedVersion, "the CPU-edited image was uploaded twice");
     StorageTexture::FlushPending(address, BlockBytes, nullptr, "test untracked reuse");

@@ -487,6 +487,14 @@ private:
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    struct UntrackedProof {
+        std::uint64_t present = 0;
+        std::uint64_t forget = 0;
+        std::uint64_t writes = 0;
+        std::chrono::steady_clock::time_point at{};
+    };
+    mutable std::optional<UntrackedProof> untrackedProof;
+    void originalChanged() const;
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;

@@ -78,6 +78,8 @@ thread_local const char* uploadReason = "first";
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
 std::atomic<std::uint64_t> singlePassMoves{0};
+std::atomic<std::uint64_t> untrackedProofHits{0};
+std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -129,7 +131,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; untracked compares %llu, answered by a proof %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(untrackedCompares), take(untrackedProofHits));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1993,7 +1995,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
-    comparedGuestBytes = {};
+    originalChanged();
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
@@ -2001,6 +2003,11 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
         GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
     }
     originalValid = originalValid || complete;
+}
+
+void StorageTexture::originalChanged() const {
+    comparedGuestBytes = {};
+    untrackedProof.reset();
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
@@ -2025,13 +2032,27 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
     }
+    static const bool exact = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
+    const bool whole = memoize && !exact && address == descriptor.baseAddress && bytes == guestBytes;
+    const auto present = Recorder::Presents();
+    const auto now = std::chrono::steady_clock::now();
+    const auto forget = GuestMemory::ForgetSerial();
+    const auto writes = GuestMemory::DriverWriteSerial();
+    if (whole && untrackedProof.has_value() && untrackedProof->present == present && now - untrackedProof->at < std::chrono::milliseconds(500) && untrackedProof->forget == forget && (forget & 1u) == 0 && !GuestMemory::DriverWroteOver(address, bytes, untrackedProof->writes, true)) {
+        untrackedProof->writes = writes;
+        untrackedProofHits.fetch_add(1, std::memory_order_relaxed);
+        std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
+        return true;
+    }
+    untrackedCompares.fetch_add(1, std::memory_order_relaxed);
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         if (cacheable) comparedGuestBytes = stamp;
+        if (whole && (forget & 1u) == 0) untrackedProof = UntrackedProof{present, forget, writes, now};
         return true;
     }
-    comparedGuestBytes = {};
+    originalChanged();
     for (std::size_t index = 0; index < changed.size(); ++index) {
         const auto begin = std::max(address, (first + index) * blockBytes);
         const auto stop = std::min(end, (first + index + 1) * blockBytes);
@@ -2050,6 +2071,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     original.resize(static_cast<std::size_t>(guestBytes));
+    originalChanged();
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -2256,6 +2278,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    originalChanged();
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(staging.Bytes().data(), original.data(), original.size());
@@ -4351,7 +4374,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
     const bool wasValid = originalValid;
-    if (!wasValid) GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    if (!wasValid) {
+        GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+        originalChanged();
+    }
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer host(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4428,6 +4454,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
         std::memcpy(original.data() + offset, current.data() + offset, length);
     }
+    originalChanged();
     // The texels now hold the whole image, so later reads must see them rather than a fast clear
     // (the keys may be host-imported although the texels were not: then a recorded fill, else a CPU store).
     traceKeyStore("cpu write-back", descriptor, guestBytes);
