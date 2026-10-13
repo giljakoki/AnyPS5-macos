@@ -40,7 +40,7 @@ struct PreparedGraphicsStage {
     PreparedShaders::Entry entry;
 };
 
-std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target);
+std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target, bool meshEmulation = false);
 
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;

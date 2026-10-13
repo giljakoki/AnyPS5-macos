@@ -648,7 +648,9 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
             auto stageState = state;
             stageState.context[0x1b6] = 0;
             const auto stages = Graphics::DecodeShaderStages(stageState);
-            graphics = ShaderRecompiler::GraphicsCompileContext{0, {}, stages.mesh, stages.tessellation, {}, stages.positionExportControl};
+            auto mesh = stages.mesh;
+            if (mesh && device.MeshEmulation()) mesh->compute = true;
+            graphics = ShaderRecompiler::GraphicsCompileContext{0, {}, mesh, stages.tessellation, {}, stages.positionExportControl};
             if (stages.mesh) { stage = Stage::Mesh; firstUser = 0; }
             if (stages.tessellation && snapshot.type == 2) stage = Stage::TessellationEvaluation;
         }
@@ -808,7 +810,7 @@ void CloseRegistrationPreparation() {
     RegistrationPreparePool::Instance().Close();
 }
 
-std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target) {
+std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target, bool meshEmulation) {
     ShaderPreparationTransaction transaction;
     require(decoded.programs.size() == decoded.roles.size(), "graphics ABI program roles are incomplete");
     for (const auto& program : decoded.programs) require(program.snapshot != nullptr, "graphics ABI has no registered shader snapshot");
@@ -836,6 +838,8 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     std::uint32_t pushOffset = 0;
     const bool fixedSlots = target.fixedPushSlots;
     const auto capacity = decoded.state.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushSlotBytes;
+    auto mesh = decoded.state.stages.mesh;
+    if (mesh && meshEmulation) mesh->compute = true;
     for (std::size_t index = 0; index < decoded.programs.size(); ++index) {
         if (decoded.roles[index] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
         const auto& program = decoded.programs[index];
@@ -846,7 +850,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         pushOffset = Graphics::StagePushOffset(pushOffset, program.binary.stage, fixedSlots);
         const auto offset = pushOffset;
         const auto room = (fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity) - pushOffset % Graphics::PipelinePushSlotBytes;
-        ShaderRecompiler::RecompileRequest request{program.binary, {wave, program.firstUserSgpr, program.userData, {}, fragment ? std::optional(decoded.pixel) : std::nullopt, vertex, memory, RegisteredFloatMode(*program.snapshot)}, target, {0, 0, offset, room}, ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, decoded.state.stages.mesh, decoded.state.stages.tessellation, {}, decoded.state.stages.positionExportControl}};
+        ShaderRecompiler::RecompileRequest request{program.binary, {wave, program.firstUserSgpr, program.userData, {}, fragment ? std::optional(decoded.pixel) : std::nullopt, vertex, memory, RegisteredFloatMode(*program.snapshot)}, target, {0, 0, offset, room}, ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, mesh, decoded.state.stages.tessellation, {}, decoded.state.stages.positionExportControl}};
         std::vector<std::uint64_t> key;
         ShaderRecompiler::BuildPreparedShaderKey(request, key);
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
@@ -922,7 +926,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     DrawDecode decoded{};
     decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
     DecodeGraphicsPrograms(decoded, state, *registry, true, false);
-    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target());
+    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target(), localDevice->MeshEmulation());
     for (auto& stage : prepared) {
         const auto& entries = transaction.Read(*stage.snapshot).entries;
         const auto duplicate = std::ranges::any_of(entries, [&](const auto& existing) { return existing.codeOffset == stage.entry.codeOffset && existing.handle->artifact == stage.entry.handle->artifact; });

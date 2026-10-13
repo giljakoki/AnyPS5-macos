@@ -334,6 +334,8 @@ struct VulkanDevice::State {
     std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
+    std::mutex meshPassThroughMutex;
+    std::map<std::uint64_t, std::shared_ptr<const ShaderRecompiler::RecompileResult>> meshPassThrough;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::PlaceholderImages> placeholderImages;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -3702,6 +3704,71 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
 
 void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe) {
     static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe));
+}
+
+bool VulkanDevice::MeshEmulation() const {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_MESH_EMULATION");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return requested && !state->meshShader;
+}
+
+void VulkanDevice::DrawMeshEmulated(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
+    require(graphics.stages.mesh.has_value(), "an emulated mesh draw needs mesh state");
+    require(shaders.size() == 2 && shaders[0].stage == ShaderRecompiler::ShaderStage::Mesh && shaders[1].stage == ShaderRecompiler::ShaderStage::Fragment && shaders[0].program != nullptr && shaders[1].program != nullptr, "an emulated mesh draw needs a mesh and a pixel shader");
+    if (draw.indirect) throw std::runtime_error("AGC driver: mesh emulation does not run indirect mesh draws whose arguments are only on the GPU (APS5_MESH_EMULATION)");
+    const auto& mesh = *graphics.stages.mesh;
+    if (graphics.primitiveRestart && draw.indexed && (mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6)) throw std::runtime_error("AGC driver: mesh emulation does not run indexed strips or fans with primitive restart (APS5_MESH_EMULATION)");
+    const auto& prepassProgram = *shaders[0].program;
+    require(prepassProgram.meshRecordDwords != 0, "the mesh program was not compiled as a compute pre-pass");
+    const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
+    const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
+    if (draw.indexCount < inputSize || draw.instanceCount == 0 || mesh.primitivesPerGroup == 0) return;
+    const auto primitives = (draw.indexCount - inputSize) / step + 1u;
+    const auto groups = (primitives - 1u) / mesh.primitivesPerGroup + 1u;
+    const auto slots = static_cast<std::size_t>(groups) * draw.instanceCount;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> passThrough;
+    {
+        std::lock_guard lock(state->meshPassThroughMutex);
+        auto& cached = state->meshPassThrough[prepassProgram.PipelineVariantId()];
+        if (cached == nullptr || prepassProgram.PipelineVariantId() == 0) cached = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshPassThroughVertexShader(prepassProgram, Target()));
+        passThrough = cached;
+    }
+    const auto context = graphicsContext();
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    const auto recordBytes = slots * mesh.maxVertices * prepassProgram.meshRecordDwords * sizeof(std::uint32_t);
+    const auto indexBytes = slots * mesh.maxPrimitives * 3u * sizeof(std::uint32_t);
+    auto arguments = std::make_shared<Graphics::Buffer>(context, ShaderRecompiler::MeshComputeArgumentBytes, usage);
+    auto records = std::make_shared<Graphics::Buffer>(context, recordBytes, usage);
+    auto indices = std::make_shared<Graphics::Buffer>(context, indexBytes, usage);
+    const auto split = [](VkDeviceAddress address) { return std::array<std::uint32_t, 2>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)}; };
+    const auto recordAddress = split(records->DeviceAddress());
+    const auto indexAddress = split(indices->DeviceAddress());
+    const std::array<std::uint32_t, ShaderRecompiler::MeshComputeArgumentBytes / 4u> words{groups, draw.instanceCount, 1u, draw.indexCount, 0u, recordAddress[0], recordAddress[1], indexAddress[0], indexAddress[1]};
+    std::memcpy(arguments->Bytes().data(), words.data(), sizeof(words));
+    const auto argumentAddress = split(arguments->DeviceAddress());
+    const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4u> drawWords{draw.indexCount, draw.firstVertex, draw.firstInstance, draw.indexed ? draw.indexSize : 0u, argumentAddress[0], argumentAddress[1]};
+    auto prepass = prepassProgram;
+    require(prepass.pushConstants.size() <= ShaderRecompiler::MeshDrawPushOffsetBytes, "the mesh pre-pass push data overlaps the mesh draw words");
+    prepass.pushConstants.resize(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes);
+    std::memcpy(prepass.pushConstants.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, drawWords.data(), sizeof(drawWords));
+    Dispatch(prepass, groups, draw.instanceCount, 1, snapshots);
+
+    auto vertex = *passThrough;
+    vertex.pushConstants.assign(ShaderRecompiler::MeshDrawPushBytes, std::byte{0});
+    std::memcpy(vertex.pushConstants.data(), drawWords.data(), sizeof(drawWords));
+    auto vertexState = graphics;
+    vertexState.stages.path = Graphics::ShaderPath::Vertex;
+    vertexState.stages.mesh.reset();
+    vertexState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vertexState.primitiveRestart = false;
+    const std::array<Graphics::CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, ShaderRecompiler::MeshDrawPushOffsetBytes}, shaders[1]}};
+    const Pm4::DrawParameters corners{0, static_cast<std::uint32_t>(slots * mesh.maxPrimitives * 3u), 0, 1, draw.flags, false};
+    Draw(vertexState, corners, stages, snapshots);
+    state->recorder->Keep(arguments, arguments->Bytes().size());
+    state->recorder->Keep(records, records->Bytes().size());
+    state->recorder->Keep(indices, indices->Bytes().size());
 }
 
 VulkanDevice::MeshPrepassOutput VulkanDevice::DispatchMeshPrepass(const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t recordDwords, const Pm4::DrawParameters& draw, std::uint32_t groups, std::span<const Graphics::GuestMemorySnapshot> snapshots, const MeshEmulationDraw* emulated) {
