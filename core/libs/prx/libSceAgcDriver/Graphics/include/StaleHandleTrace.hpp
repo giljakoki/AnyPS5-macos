@@ -16,6 +16,7 @@ PFN_vkVoidFunction StaleHandleWrapper(const char* name, PFN_vkVoidFunction real)
 void StaleHandleRelease(StaleObject kind, std::uint64_t handle);
 std::uint64_t StaleHandleReports();
 void StaleHandleDump(const char* why);
+double StaleAddressFreedMs(std::uint64_t address);
 
 }
 

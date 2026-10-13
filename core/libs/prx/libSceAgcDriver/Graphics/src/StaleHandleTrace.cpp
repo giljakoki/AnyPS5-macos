@@ -55,6 +55,7 @@ struct Tracker {
     std::unordered_map<std::uint64_t, std::pair<const std::byte*, std::uint64_t>> memoryMapping;
     std::unordered_map<std::uint64_t, std::uint64_t> mappingOffset;
     std::unordered_map<std::uint64_t, std::uint64_t> bufferOffset;
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> bufferBound;
     std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> bufferAddress;
     std::map<std::uint64_t, AddressRange> freedRanges;
     std::array<std::pair<std::uint64_t, AddressRange>, 64> freedRing{};
@@ -324,6 +325,7 @@ VKAPI_ATTR VkResult VKAPI_CALL staleBindBufferMemory(VkDevice device, VkBuffer b
         std::lock_guard lock(tracker.mutex);
         tracker.bufferMemory[key(buffer)] = key(memory);
         tracker.bufferOffset[key(buffer)] = offset;
+        tracker.bufferBound[key(buffer)] = std::chrono::steady_clock::now();
     }
     return real_vkBindBufferMemory(device, buffer, memory, offset);
 }
@@ -487,7 +489,10 @@ VKAPI_ATTR VkResult VKAPI_CALL staleQueueSubmit(VkQueue queue, std::uint32_t cou
                         const auto size = tracker.bufferSize.contains(buffer) ? tracker.bufferSize[buffer] : 0u;
                         if (offset < mapOffset || offset - mapOffset >= mapping->second.second || size == 0) continue;
                         const auto bytes = std::min<std::uint64_t>({size, mapping->second.second - (offset - mapOffset), 4u << 20u});
-                        scanAddresses(tracker, submits[s].pCommandBuffers[c], "vkQueueSubmit (mapped contents of a used buffer)", mapping->second.first + (offset - mapOffset), static_cast<std::size_t>(bytes), 8);
+                        char label[160];
+                        const auto bound = tracker.bufferBound.find(buffer);
+                        std::snprintf(label, sizeof(label), "vkQueueSubmit (mapped contents of used buffer 0x%llx, %llu bytes, bound to memory %.1f ms earlier)", static_cast<unsigned long long>(buffer), static_cast<unsigned long long>(size), bound != tracker.bufferBound.end() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bound->second).count() : -1.0);
+                        scanAddresses(tracker, submits[s].pCommandBuffers[c], label, mapping->second.first + (offset - mapOffset), static_cast<std::size_t>(bytes), 8);
                     }
                 }
                 for (const auto& [memory, handle] : refs.memories) {
@@ -786,6 +791,15 @@ void StaleHandleRelease(StaleObject kind, std::uint64_t handle) {
         tracker.freedRanges[address->second.first] = range;
         tracker.freedRing[tracker.freedRingCount++ % tracker.freedRing.size()] = {address->second.first, range};
     }
+}
+
+double StaleAddressFreedMs(std::uint64_t address) {
+    if (!StaleHandlesTraced() || address == 0) return -1.0;
+    auto& tracker = Track();
+    std::lock_guard lock(tracker.mutex);
+    std::uint64_t start = 0;
+    const auto* range = freedRangeAt(tracker, address, start);
+    return range != nullptr ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - range->freed.at).count() : -1.0;
 }
 
 void StaleHandleDump(const char* why) {
