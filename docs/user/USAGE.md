@@ -165,6 +165,10 @@ A device whose `Selected GPU` log line lacks the vertex bit in `stages=` (Molten
 
 Titles draw geometry-shader and other NGG programs through the mesh path, which needs `VK_EXT_mesh_shader`. MoltenVK has no mesh shaders, so such a draw stops the title with `device does not support mesh shaders`, or earlier with `needs subgroup operations` when the program uses wave-wide operations. `APS5_MESH_EMULATION=1` runs these programs as a compute pre-pass instead: each draw records the program as a compute dispatch that writes its vertices and triangles into scratch buffers, then draws them with a generated vertex shader and the title's pixel shader under the draw's own render state ([GeometryEmulation](../dev/GeometryEmulation.md)). It is ignored on devices with mesh shaders. Every emulated draw ends the open render pass and starts a new one, which costs a store and reload of the color and depth targets on tile-based GPUs. Indirect mesh draws whose arguments are only on the GPU and indexed strips or fans with primitive restart still stop the title with a message naming `APS5_MESH_EMULATION`. Any other value leaves the emulation off.
 
+### Mixed-precision arithmetic on devices without 64-bit floats
+
+Programs that use v_fma_mixlo_f16, v_fma_mixhi_f16 or the 16-bit interpolation instructions round their exact product-sum through 64-bit floats, so on a device without `shaderFloat64` (MoltenVK) they stop with `64-bit float instructions need the Float64 capability, which the device lacks`. `APS5_F64_AS_F32=1` computes them in 32-bit floats with error-free transformations instead; the result matches the hardware in round to nearest even except near the ends of the f32 range ([TechnicalDebt](../dev/TechnicalDebt.md)). Programs with real 64-bit arithmetic still stop. It is ignored on devices with `shaderFloat64`; any other value leaves it off.
+
 ## Exit codes
 
 `0`: conversion succeeded. `1`: invalid arguments. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.

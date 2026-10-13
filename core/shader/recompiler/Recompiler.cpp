@@ -491,6 +491,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
+    targetOptions.float64AsFloat32 = request.target.float64AsFloat32;
     targetOptions.stageSubgroups = StageHasSubgroups(request.target, HostStage(request));
 
     constexpr SpirvEmitter spirvEmitter;

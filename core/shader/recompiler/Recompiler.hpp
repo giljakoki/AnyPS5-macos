@@ -229,6 +229,7 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    bool float64AsFloat32 = false;
     std::uint32_t subgroupStages = 0xffffffffu;
 };
 

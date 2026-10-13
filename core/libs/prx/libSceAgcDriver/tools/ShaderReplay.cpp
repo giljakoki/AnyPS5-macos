@@ -46,6 +46,7 @@ bool g_maintenance8 = false;
 bool g_code = false;
 bool g_meshLayout = false;
 bool g_meshCompute = false;
+bool g_float64AsFloat32 = false;
 unsigned long g_subgroupStages = 0xffffffffu;
 
 bool Replay(const char* path) {
@@ -132,6 +133,7 @@ bool Replay(const char* path) {
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         request.request.target.subgroupStages &= static_cast<std::uint32_t>(g_subgroupStages);
+        if (g_float64AsFloat32) request.request.target.float64AsFloat32 = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
@@ -169,7 +171,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--mesh-layout] [--mesh-compute] [--maintenance8] [--subgroup-stages=<hex>] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n  --subgroup-stages limits the target's subgroup stages, as MoltenVK does with 0x32\n  --mesh-layout describes a mesh-stage program for emulation without mesh shaders\n  --mesh-compute compiles a mesh-stage program as the compute pre-pass of that emulation\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--mesh-layout] [--mesh-compute] [--f64-as-f32] [--maintenance8] [--subgroup-stages=<hex>] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n  --subgroup-stages limits the target's subgroup stages, as MoltenVK does with 0x32\n  --mesh-layout describes a mesh-stage program for emulation without mesh shaders\n  --mesh-compute compiles a mesh-stage program as the compute pre-pass of that emulation\n  --f64-as-f32 lowers the Float64-based exact paths to f32, as APS5_F64_AS_F32=1 does\n");
         return 2;
     }
     int failures = 0;
@@ -206,6 +208,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--code") {
             g_code = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f64-as-f32") {
+            g_float64AsFloat32 = true;
             continue;
         }
         if (std::string(argv[i]) == "--mesh-compute") {
