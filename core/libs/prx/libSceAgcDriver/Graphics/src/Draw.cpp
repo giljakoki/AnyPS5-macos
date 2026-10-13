@@ -584,6 +584,12 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhaseReadTarget && room()) {
+            static std::uint64_t reportedRepeats = 0;
+            const auto repeats = ResidentTargetRepeats();
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu draws repeated their resident target without a lookup)", static_cast<unsigned long long>(repeats - reportedRepeats));
+            reportedRepeats = repeats;
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -1225,6 +1231,48 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+struct ResidentRepeat {
+    std::array<std::uint64_t, 15> key{};
+    std::weak_ptr<StorageTexture> image;
+    std::uint64_t epoch = 0;
+    std::uint64_t present = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t writes = 0;
+};
+
+thread_local ResidentRepeat lastResident;
+std::atomic<std::uint64_t> residentRepeats{0};
+
+std::array<std::uint64_t, 15> residentRepeatKey(const ColorTarget& color) {
+    return {color.address, color.bytes, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode), color.elementBytes, color.dccAddress, color.dccAlphaOnMsb ? 1u : 0u, color.cmaskAddress, color.surfaceAddress, (static_cast<std::uint64_t>(color.extent.width) << 32u) | color.extent.height, (static_cast<std::uint64_t>(color.surfaceExtent.width) << 32u) | color.surfaceExtent.height, color.mipCount, color.mip, color.depth, color.depthSlice};
+}
+
+bool residentRepeatEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_RESIDENT_TARGET_REPEAT") != nullptr;
+    return !disabled;
+}
+
+std::shared_ptr<StorageTexture> repeatedResidentTarget(const Context& context, const ColorTarget& color) {
+    if (!residentRepeatEnabled()) return nullptr;
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto forget = GuestMemory::ForgetSerial();
+    auto& last = lastResident;
+    if (epoch == 0 || (forget & 1u) != 0 || last.epoch != epoch || last.present != Recorder::Presents() || last.forget != forget || last.key != residentRepeatKey(color)) return nullptr;
+    auto image = last.image.lock();
+    if (image == nullptr || !StorageImageCached(context, image.get()) || !StorageImageServesKeys(*image, color.dccAddress)) return nullptr;
+    if (GuestMemory::DriverWroteOver(color.address, color.bytes, last.writes, false)) return nullptr;
+    const auto pending = StorageTexture::FindPending(color.address, color.bytes);
+    if (pending != nullptr && pending != image) return nullptr;
+    last.writes = GuestMemory::DriverWriteSerial();
+    residentRepeats.fetch_add(1, std::memory_order_relaxed);
+    return image;
+}
+
+void noteResidentTarget(const ColorTarget& color, const std::shared_ptr<StorageTexture>& image, std::uint64_t writes, std::uint64_t epoch, std::uint64_t present, std::uint64_t forget) {
+    if (!residentRepeatEnabled()) return;
+    lastResident = {residentRepeatKey(color), image, epoch, present, forget, writes};
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
@@ -1970,9 +2018,15 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
                     return resident;
                 }
+                if (auto repeated = repeatedResidentTarget(context, color)) return repeated;
+                const auto writes = GuestMemory::DriverWriteSerial();
+                const auto epoch = GuestMemory::CollectEpoch();
+                const auto present = Recorder::Presents();
+                const auto forget = GuestMemory::ForgetSerial();
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+                noteResidentTarget(color, resident, writes, epoch, present, forget);
                 return resident;
             });
         }
@@ -2587,6 +2641,10 @@ void resolveColorTarget(const Context& context, const ColorMetadataPass& pass) {
     if (!to->CopyFrom(*from, refusal, true)) Require(false, what + " as an image copy was refused (" + (refusal != nullptr ? refusal : "unknown") + ")");
 }
 
+}
+
+std::uint64_t ResidentTargetRepeats() {
+    return residentRepeats.load(std::memory_order_relaxed);
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {

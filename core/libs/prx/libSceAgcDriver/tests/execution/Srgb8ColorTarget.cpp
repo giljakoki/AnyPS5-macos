@@ -59,7 +59,7 @@ constexpr std::array<std::array<float, 4>, 3> Triangle{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
 }};
 
-alignas(256) std::array<std::array<std::uint32_t, 64>, 8> Programs{};
+alignas(256) std::array<std::array<std::uint32_t, 64>, 16> Programs{};
 std::size_t programCount = 0;
 alignas(256) std::array<std::uint8_t, KeyBytes> Keys{};
 
@@ -301,6 +301,28 @@ void RecordedDrawTests(AgcDriver::VulkanDevice& device, Block& block) {
     ExpectSurface(device, block, before, [](std::uint8_t) { return 150; }, 1, "a destination-alpha blend after a write in one pass over an 8_SRGB target");
 }
 
+void RepeatedTargetTests(AgcDriver::VulkanDevice& device, Block& block) {
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto before = Fill(block);
+    const auto color = DecodeTarget(0, block, Srgb8Info, TiledAttrib3);
+    const auto written = static_cast<float>(Eotf(150));
+    const auto repeats = AgcDriver::Graphics::ResidentTargetRepeats();
+    Draw(device, {color}, {BlendOff}, Program({written, 0.25f, 0.5f, 0.75f}, false));
+    Draw(device, {color}, {Multiply}, Program({0.5f, 0.25f, 0.5f, 0.75f}, false));
+    const bool repeatsOn = std::getenv("APS5_NO_RESIDENT_TARGET_REPEAT") == nullptr;
+    Require(!repeatsOn || AgcDriver::Graphics::ResidentTargetRepeats() > repeats, "a second draw into the same resident target in one epoch looked the target up again");
+    ExpectSurface(device, block, before, [&](std::uint8_t) { return Oetf(static_cast<double>(written) * 0.5); }, 1, "a repeated resident target in one epoch");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Draw(device, {color}, {Keep}, Program({0.0f, 0.25f, 0.5f, 0.75f}, false));
+    AgcDriver::GuestMemory::StoreOwnBytes(block.Address(), SurfaceBytes, [&] { std::memset(block.data, 0x40, SurfaceBytes); });
+    const std::vector<std::uint8_t> stored(SurfaceBytes, 0x40);
+    const auto repeatsBeforeStore = AgcDriver::Graphics::ResidentTargetRepeats();
+    Draw(device, {color}, {Multiply}, Program({0.5f, 0.25f, 0.5f, 0.75f}, false));
+    Require(AgcDriver::Graphics::ResidentTargetRepeats() == repeatsBeforeStore, "a driver store over a resident target did not end its repeat");
+    ExpectSurface(device, block, stored, [](std::uint8_t code) { return Oetf(Eotf(code) * 0.5); }, 1, "a multiply blend after a driver store between draws");
+    std::puts("repeated resident targets: ok");
+}
+
 void ClearTests(AgcDriver::VulkanDevice& device, Block& block) {
     Fill(block);
     Keys.fill(0x20);
@@ -343,6 +365,8 @@ int main() {
         Block linear(LinearBytes);
         Block synchronous(SurfaceBytes);
         RecordedDrawTests(*device, recorded);
+        Block repeated(SurfaceBytes);
+        RepeatedTargetTests(*device, repeated);
         ClearTests(*device, cleared);
         SynchronousDrawTests(*device, linear, synchronous);
         std::puts("8_SRGB color target tests passed");
