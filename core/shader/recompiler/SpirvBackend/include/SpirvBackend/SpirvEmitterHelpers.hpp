@@ -10,6 +10,7 @@ namespace ShaderRecompiler {
 [[noreturn]] void FailEmit(const std::string& reason);
 IrShaderStage StageOf(const SpirvEmitterState& state);
 const ShaderVertexInputInfo& VertexInfo(const SpirvEmitterState& state);
+bool MeshCompute(const SpirvEmitterState& state);
 const ShaderPixelInputInfo& PixelInfo(const SpirvEmitterState& state);
 const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(const SpirvEmitterState& state);
 const RdnaImageDimensionInfo& RdnaImageDimensionInfoFor(RdnaImageDimension dimension);

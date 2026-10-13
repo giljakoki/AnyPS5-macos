@@ -89,8 +89,7 @@ MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request) {
 
     const auto scalars = (layout.layer ? 1u : 0u) + (layout.viewportIndex ? 1u : 0u) + (layout.pointSize ? 1u : 0u) + layout.clipCullDistances;
     layout.recordDwords = (4u + 4u * layout.ParameterCount() + scalars + 3u) & ~3u;
-    layout.perCornerRecords = layout.layer || layout.viewportIndex;
-    layout.recordsPerGroup = layout.perCornerRecords ? layout.configuration.maxPrimitives * 3u : layout.configuration.maxVertices;
+    layout.recordsPerGroup = layout.configuration.maxVertices;
     layout.vertexBytesPerGroup = static_cast<std::uint64_t>(layout.recordsPerGroup) * layout.recordDwords * 4u;
     layout.indexBytesPerGroup = static_cast<std::uint64_t>(layout.configuration.maxPrimitives) * 3u * 4u;
     return layout;

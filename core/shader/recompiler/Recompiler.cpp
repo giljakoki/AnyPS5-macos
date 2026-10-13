@@ -80,6 +80,11 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
 
 }
 
+ShaderStage HostStage(const RecompileRequest& request) {
+    const bool meshCompute = request.shader.stage == ShaderStage::Mesh && request.graphics.has_value() && request.graphics->mesh.has_value() && request.graphics->mesh->compute;
+    return meshCompute ? ShaderStage::Compute : request.shader.stage;
+}
+
 std::uint32_t PositionExportControl(const RecompileRequest& request) {
     if (!request.graphics.has_value() || request.shader.stage == ShaderStage::Fragment || request.shader.stage == ShaderStage::Compute) return 0u;
     const bool meshCompute = request.graphics->mesh.has_value() && request.graphics->mesh->compute;
@@ -486,7 +491,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
-    targetOptions.stageSubgroups = StageHasSubgroups(request.target, request.shader.stage);
+    targetOptions.stageSubgroups = StageHasSubgroups(request.target, HostStage(request));
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

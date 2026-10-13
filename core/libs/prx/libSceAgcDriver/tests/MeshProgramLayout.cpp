@@ -82,7 +82,7 @@ bool Run(const char* name, const std::function<bool()>& test) {
 
 bool SharedShape(const MeshProgramLayout& layout) {
     return layout.positionComponents == std::array<std::uint32_t, 4>{0xfu, 0u, 0u, 0u} && layout.parameterMask == 1u && layout.ParameterCount() == 1u && layout.primitiveExport && !layout.layer && !layout.viewportIndex && !layout.pointSize &&
-           layout.clipCullDistances == 0u && layout.allocations == 1u && layout.barriers >= 1u && layout.sharedMemory && !layout.VertexStageCandidate() && layout.recordDwords == 8u && !layout.perCornerRecords;
+           layout.clipCullDistances == 0u && layout.allocations == 1u && layout.barriers >= 1u && layout.sharedMemory && !layout.VertexStageCandidate() && layout.recordDwords == 8u;
 }
 
 }

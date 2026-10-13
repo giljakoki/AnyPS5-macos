@@ -305,6 +305,9 @@ inline constexpr std::uint32_t MeshIndexRestartTable = 0x100;
 inline constexpr std::uint32_t MeshRestartLengthDword = MeshArgumentBytes / 4;
 inline constexpr std::uint32_t MeshRestartTableDword = MeshRestartLengthDword + 1;
 inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;
+inline constexpr std::uint32_t MeshComputeVertexAddressDword = MeshArgumentBytes / 4;
+inline constexpr std::uint32_t MeshComputeIndexAddressDword = MeshComputeVertexAddressDword + 2;
+inline constexpr std::uint32_t MeshComputeArgumentBytes = MeshArgumentBytes + 16;
 inline constexpr std::uint32_t WorkgroupMemoryDescriptorSet = 1;
 
 struct GraphicsDrawParameters {
@@ -570,7 +573,6 @@ struct MeshProgramLayout {
     std::uint32_t barriers = 0;
     bool sharedMemory = false;
     bool subgroupOperations = false;
-    bool perCornerRecords = false;
     std::uint32_t recordDwords = 0;
     std::uint32_t recordsPerGroup = 0;
     std::uint64_t vertexBytesPerGroup = 0;
@@ -583,6 +585,7 @@ struct MeshProgramLayout {
 
 inline constexpr std::uint32_t PositionExportLayerViewportBits = (1u << 18u) | (1u << 19u);
 [[nodiscard]] std::uint32_t PositionExportControl(const RecompileRequest& request);
+[[nodiscard]] ShaderStage HostStage(const RecompileRequest& request);
 
 [[nodiscard]] MeshProgramLayout DescribeMeshProgram(const RecompileRequest& request);
 

@@ -29,6 +29,10 @@ const ShaderVertexInputInfo& VertexInfo(const SpirvEmitterState& state) {
     return *state.inputInfo.vertex;
 }
 
+bool MeshCompute(const SpirvEmitterState& state) {
+    return state.program.Resources().stage == IrShaderStage::Mesh && state.inputInfo.vertex != nullptr && state.inputInfo.vertex->mesh.compute;
+}
+
 const ShaderPixelInputInfo& PixelInfo(const SpirvEmitterState& state) {
     if (state.inputInfo.pixel == nullptr) {
         FailEmit("pixel input info is missing");
