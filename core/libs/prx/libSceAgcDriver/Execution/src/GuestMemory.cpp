@@ -82,7 +82,6 @@ std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> comparedBytes{0};
 std::atomic<std::uint64_t> walkedBytes{0};
-std::atomic<std::uint64_t> driverStoreSerial{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -1174,12 +1173,64 @@ std::uint64_t ComparedBytes() {
     return comparedBytes.load(std::memory_order_relaxed);
 }
 
-std::uint64_t DriverStoreSerial() {
-    return driverStoreSerial.load(std::memory_order_acquire);
+namespace {
+
+struct DriverWriteLog {
+    std::mutex mutex;
+    std::uint64_t serial = 0;
+    std::array<std::array<std::uint64_t, 2>, 8192> entries{};
+};
+
+DriverWriteLog& driverWriteLog() {
+    static auto& log = *new DriverWriteLog;
+    return log;
+}
+
+}
+
+void NoteDriverWrite(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return;
+    auto& log = driverWriteLog();
+    const std::lock_guard lock(log.mutex);
+    ++log.serial;
+    log.entries[log.serial % log.entries.size()] = {address, address + bytes};
+}
+
+std::uint64_t DriverWriteSerial() {
+    auto& log = driverWriteLog();
+    const std::lock_guard lock(log.mutex);
+    return log.serial;
+}
+
+bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t since) {
+    auto& log = driverWriteLog();
+    const std::lock_guard lock(log.mutex);
+    if (since > log.serial || log.serial - since >= log.entries.size()) return true;
+    const auto end = address + bytes;
+    for (auto serial = since + 1; serial <= log.serial; ++serial) {
+        const auto& entry = log.entries[serial % log.entries.size()];
+        if (entry[0] < end && address < entry[1]) return true;
+    }
+    return false;
 }
 
 std::uint64_t WalkedBytes() {
     return walkedBytes.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+std::atomic<std::uint64_t> nextOrderEpoch{0};
+thread_local std::uint64_t threadOrderEpoch = 0;
+
+}
+
+void BumpOrderEpoch() {
+    threadOrderEpoch = nextOrderEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+std::uint64_t OrderEpoch() {
+    return threadOrderEpoch;
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -1284,7 +1335,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
-        driverStoreSerial.fetch_add(1, std::memory_order_release);
+        NoteDriverWrite(stored.first, static_cast<std::size_t>(stored.second - stored.first));
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
@@ -1330,7 +1381,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
-    driverStoreSerial.fetch_add(1, std::memory_order_release);
+    NoteDriverWrite(address, bytes);
     if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
 #ifndef _WIN32
     {

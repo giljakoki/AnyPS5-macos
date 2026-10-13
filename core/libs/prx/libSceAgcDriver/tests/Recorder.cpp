@@ -4500,15 +4500,22 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
         Require(resources.SampledTextures().size() == 1, "the build has no sampled texture");
         return resources.SampledTextures().front();
     };
-    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto order = [] {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::GuestMemory::BumpOrderEpoch();
+    };
+    order();
     const auto made = draw();
     const auto compared = AgcDriver::GuestMemory::ComparedBytes();
     const auto walked = AgcDriver::GuestMemory::WalkedBytes();
     constexpr int epochs = 10;
     constexpr int drawsPerEpoch = 10;
     for (int epoch = 0; epoch < epochs; ++epoch) {
-        AgcDriver::GuestMemory::BumpCollectEpoch();
-        for (int i = 0; i < drawsPerEpoch; ++i) Require(draw() == made, "an unchanged imported snapshot was made again");
+        order();
+        for (int i = 0; i < drawsPerEpoch; ++i) {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            Require(draw() == made, "an unchanged imported snapshot was made again");
+        }
     }
     const auto comparedNow = AgcDriver::GuestMemory::ComparedBytes() - compared;
     const auto walkedNow = AgcDriver::GuestMemory::WalkedBytes() - walked;
@@ -4516,8 +4523,20 @@ void importedSnapshotProofTests(const Device& device, Recorder& recorder) {
     Require(comparedNow <= epochs * bytes, "an unchanged imported snapshot was compared more than once per epoch");
     Require(!watched || comparedNow < bytes, "a watched imported snapshot was compared");
     Require(walkedNow <= epochs * bytes, "an imported snapshot's pages were walked more than once per epoch");
+    std::uint64_t elsewhere = 0;
+    order();
+    Require(draw() == made, "an unchanged imported snapshot was made again");
+    const auto beforeWrites = AgcDriver::GuestMemory::ComparedBytes();
+    for (int i = 0; i < drawsPerEpoch; ++i) {
+        AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uint64_t>(&elsewhere), sizeof(elsewhere));
+        Require(draw() == made, "an unchanged imported snapshot was made again");
+    }
+    Require(AgcDriver::GuestMemory::ComparedBytes() == beforeWrites, "a driver write elsewhere made an imported snapshot compare again");
+    AgcDriver::GuestMemory::MarkWritten(address + bytes / 2, 4);
+    Require(draw() == made, "an unchanged imported snapshot was made again");
+    Require(AgcDriver::GuestMemory::ComparedBytes() - beforeWrites == bytes, "a driver write over an imported snapshot was not compared");
     static_cast<volatile std::uint8_t*>(block)[bytes / 2] = 0x77;
-    AgcDriver::GuestMemory::BumpCollectEpoch();
+    order();
     const auto stored = draw();
     Require(stored != made, "an imported snapshot outlived a CPU store to its surface");
     Require(draw() == stored, "the remade imported snapshot is not the cache's");

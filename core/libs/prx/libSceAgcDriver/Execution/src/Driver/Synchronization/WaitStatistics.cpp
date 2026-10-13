@@ -26,6 +26,7 @@ EpochBumps& Driver::epochBumps() {
 
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     GuestMemory::BumpCollectEpoch();
+    if (counter != &EpochBumps::drains) GuestMemory::BumpOrderEpoch();
     ++(epochBumps().*counter);
 }
 

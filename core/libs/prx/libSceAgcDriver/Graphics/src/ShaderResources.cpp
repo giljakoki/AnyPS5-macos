@@ -108,16 +108,70 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
-    std::array<std::uint64_t, 6> proven{};
+    std::uint64_t provenEpoch = 0;
+    std::uint64_t provenForget = 0;
+    std::uint64_t provenWrites = 0;
 };
 
-std::array<std::uint64_t, 6> snapshotProofStamp(std::uint64_t address, std::size_t bytes) {
+struct SnapshotProofCounts {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> compares{0};
+    std::atomic<std::uint64_t> unproven{0};
+    std::atomic<std::uint64_t> newEpoch{0};
+    std::atomic<std::uint64_t> forgotten{0};
+    std::atomic<std::uint64_t> written{0};
+    std::atomic<std::uint64_t> comparedBytes{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SnapshotProofCounts& snapshotProofCounts() {
+    static auto& counts = *new SnapshotProofCounts;
+    return counts;
+}
+
+void reportSnapshotProofs() {
+    auto& counts = snapshotProofCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new epoch, %llu forget, %llu driver write over the surface)\n", count(counts.hits), count(counts.compares), static_cast<double>(counts.comparedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written));
+}
+
+bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t bytes) {
     static const bool disabled = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
-    const auto epoch = GuestMemory::CollectEpoch();
+    auto& counts = snapshotProofCounts();
+    const auto epoch = GuestMemory::OrderEpoch();
     const auto forget = GuestMemory::ForgetSerial();
-    if (disabled || epoch == 0 || (forget & 1u) != 0) return {};
-    const auto* recorder = Recorder::Active();
-    return {epoch, GuestMemory::DriverStoreSerial(), forget, reinterpret_cast<std::uintptr_t>(recorder), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0, recorder != nullptr ? recorder->Submissions() : 0};
+    const auto writes = GuestMemory::DriverWriteSerial();
+    const bool usable = !disabled && epoch != 0 && (forget & 1u) == 0;
+    if (usable && entry.provenEpoch != 0) {
+        if (entry.provenEpoch != epoch) {
+            counts.newEpoch.fetch_add(1, std::memory_order_relaxed);
+        } else if (entry.provenForget != forget) {
+            counts.forgotten.fetch_add(1, std::memory_order_relaxed);
+        } else if (GuestMemory::DriverWroteOver(address, bytes, entry.provenWrites)) {
+            counts.written.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            entry.provenWrites = writes;
+            counts.hits.fetch_add(1, std::memory_order_relaxed);
+            reportSnapshotProofs();
+            return true;
+        }
+    } else {
+        counts.unproven.fetch_add(1, std::memory_order_relaxed);
+    }
+    counts.compares.fetch_add(1, std::memory_order_relaxed);
+    counts.comparedBytes.fetch_add(entry.bytes.size(), std::memory_order_relaxed);
+    reportSnapshotProofs();
+    if (!GuestMemory::EqualsCommittedUnsynced(address, entry.bytes)) {
+        entry.provenEpoch = 0;
+        return false;
+    }
+    entry.provenEpoch = usable ? epoch : 0;
+    entry.provenForget = forget;
+    entry.provenWrites = writes;
+    return true;
 }
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -663,11 +717,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 GuestMemory::FlushGpuWrites(address, it->bytes.size());
-                const auto stamp = snapshotProofStamp(address, bytes);
-                if (stamp[0] != 0 && stamp == it->proven) return true;
-                if (!GuestMemory::EqualsCommittedUnsynced(address, it->bytes)) return false;
-                it->proven = stamp;
-                return true;
+                return snapshotProven(*it, address, bytes);
             };
             if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
