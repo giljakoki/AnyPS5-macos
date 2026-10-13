@@ -583,6 +583,7 @@ private:
     void dropOriginal(const char* reason);
     bool clearFilled(Recorder& recorder, std::uint32_t word);
     bool inFlightOverlaps(std::uint64_t begin, std::uint64_t end) const;
+    bool staleOverlaps(std::uint64_t begin, std::uint64_t end) const;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

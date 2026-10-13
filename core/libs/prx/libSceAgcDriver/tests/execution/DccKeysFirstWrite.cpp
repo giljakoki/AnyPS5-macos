@@ -686,8 +686,24 @@ void RunGpuFillLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         if (!image->Refresh() || StorageTexture::Uploads() != uploads) throw std::runtime_error("a target filled on the GPU and drawn again was uploaded (frame " + std::to_string(frame) + ")");
         if (recorder != nullptr && recorder->Submissions() != submissions) throw std::runtime_error("the refresh of a target behind its GPU fill and write-back waited for the GPU (frame " + std::to_string(frame) + ")");
     }
+    const std::array<std::uint32_t, 4> mixed{0x01020304u, 0x05060708u, 0x090a0b0cu, 0x0d0e0f10u};
+    for (int frame = 0; frame < 4; ++frame) {
+        StorageTexture::DiscardPendingInside(address, BlockBytes);
+        StorageTexture::FlushPending(address, BlockBytes, nullptr, "test fill");
+        Require(device.FillBuffer(address, BlockBytes, mixed), "the mixed GPU fill was not recorded");
+        static_cast<void>(StorageTexture::ClearFilledInside(address, BlockBytes, mixed));
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        const auto submissions = recorder != nullptr ? recorder->Submissions() : 0;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::Graphics::Recorder::CountPresent();
+        if (image->Refresh()) throw std::runtime_error("a target under a fill that is no clear was not uploaded (frame " + std::to_string(frame) + ")");
+        if (recorder != nullptr && recorder->Submissions() != submissions) throw std::runtime_error("the refresh of a target under a fill that is no clear waited for the GPU (frame " + std::to_string(frame) + ")");
+        Dispatch(device, WriteCode, userData, false);
+    }
     device.WaitIdle();
-    Require(Count(block, BlockBytes, 0xff) == Threads * 4u && Count(block, BlockBytes, 0x22) == BlockBytes - Threads * 4u, "the filled and drawn target did not reach guest memory");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test fill");
+    device.WaitIdle();
+    Require(Count(block, BlockBytes, 0xff) == Threads * 4u && block[SurfaceBytes] == 0x04 && block[SurfaceBytes + 15] == 0x0d, "the target under a fill that is no clear did not reach guest memory");
     std::cout << "GPU fill over a target, draw, present, repeat: ok\n";
 }
 
