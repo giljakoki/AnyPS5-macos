@@ -582,6 +582,7 @@ void RunWriteBackLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         std::snprintf(message, sizeof(message), "%s (frame %d)", what, frame);
         throw std::runtime_error(message);
     };
+    auto uploads = StorageTexture::Uploads();
     for (int frame = 0; frame < 18; ++frame) {
         if (frame == 12) {
             device.WaitIdle();
@@ -606,11 +607,46 @@ void RunWriteBackLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         Dispatch(device, WriteCode, userData, false);
         AgcDriver::GuestMemory::BumpCollectEpoch();
         require(image->Refresh(), "a target drawn again after its idle write-back was uploaded again", frame);
+        if (frame == 6 || frame == 12) uploads = StorageTexture::Uploads();
+        require(StorageTexture::Uploads() == uploads, "a target drawn, written back and drawn again was uploaded inside a draw", frame);
     }
     StorageTexture::FlushPending(address, BlockBytes, nullptr, "test write-back loop");
     device.WaitIdle();
     Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u && Count(block + SurfaceBytes, SurfaceBytes, 0x67) == SurfaceBytes, "the looped GPU results were lost");
     std::cout << "draw, idle write-back, present, draw again: ok\n";
+}
+
+void RunClearDrawLoop(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, userData, false);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr, "the cleared target has no pending results");
+    const std::array<std::uint32_t, 4> pattern{0x11111111u, 0x11111111u, 0x11111111u, 0x11111111u};
+    const auto uploads = StorageTexture::Uploads();
+    for (int frame = 0; frame < 8; ++frame) {
+        StorageTexture::DiscardPendingInside(address, BlockBytes);
+        const char* refusal = nullptr;
+        if (!image->FillClear(pattern, StorageTexture::WholeImage, refusal)) throw std::runtime_error(std::string("the target clear was refused: ") + (refusal != nullptr ? refusal : "?"));
+        Dispatch(device, WriteCode, userData, false);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        if (!image->Refresh()) throw std::runtime_error("a target cleared and drawn again was uploaded (frame " + std::to_string(frame) + ")");
+        StorageTexture::FlushAllPending("idle");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::Graphics::Recorder::CountPresent();
+        if (!image->Refresh()) throw std::runtime_error("a cleared target was uploaded after its idle write-back (frame " + std::to_string(frame) + ")");
+        if (StorageTexture::Uploads() != uploads) throw std::runtime_error("a target cleared, drawn and written back was uploaded again (frame " + std::to_string(frame) + ")");
+    }
+    device.WaitIdle();
+    Require(Count(block, BlockBytes, 0xff) == Threads * 4u && Count(block, BlockBytes, 0x11) == BlockBytes - Threads * 4u, "the cleared and drawn target did not reach guest memory");
+    std::cout << "clear, draw, discard, present, repeat: ok\n";
 }
 
 int main() {
@@ -632,6 +668,9 @@ int main() {
         std::optional<GuestBlock> looped;
         looped.emplace(false);
         RunWriteBackLoop(*device, looped->Data());
+        std::optional<GuestBlock> cleared;
+        cleared.emplace(false);
+        RunClearDrawLoop(*device, cleared->Data());
         std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());
