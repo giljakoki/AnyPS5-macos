@@ -167,6 +167,24 @@ void SizeClassesAndDirections() {
     Expect(mock.sizes.at(writeBack.Handle()) == 10 * MiB + 512 * 1024, "a reused device buffer kept the VkBuffer of the earlier size");
 }
 
+void ExactSizeReuse() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    VkBuffer exact = VK_NULL_HANDLE;
+    {
+        auto first = std::make_unique<Buffer>(context, 1100, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        auto second = std::make_unique<Buffer>(context, 1200, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        exact = first->Handle();
+        first.reset();
+        second.reset();
+    }
+    const auto destroyed = mock.destroyedBuffers;
+    Buffer again(context, 1100, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    Expect(again.Handle() == exact && mock.destroyedBuffers == destroyed, "a retained buffer of the requested size was passed over for one that had to be rebound");
+    Buffer other(context, 1200, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    Expect(mock.sizes.at(other.Handle()) == 1200 && mock.destroyedBuffers == destroyed, "the remaining retained buffer of the other size was rebound");
+}
+
 void LargerClass() {
     mock = MockDevice{};
     auto context = mockContext();
@@ -490,6 +508,7 @@ void PartialSlabDoesNotRetry() {
 int main() {
     try {
         SizeClassesAndDirections();
+        ExactSizeReuse();
         LargerClass();
         KeptUntilFence();
         Budget();
