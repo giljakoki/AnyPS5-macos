@@ -1276,7 +1276,9 @@ void DepthStencilTests() {
     queue.context[0x31b] = 1u << 26u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");
     queue.context[0x31b] = 1u << 13u;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "several array slices");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "not an array");
+    queue.context[0x31b] = 1u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "precedes its first");
     const auto sliced = reinterpret_cast<std::uintptr_t>(sliceMemory.data());
     queue.context[0x318] = static_cast<std::uint32_t>(sliced >> 8u);
     queue.context[0x390] = static_cast<std::uint32_t>(sliced >> 40u);
@@ -1286,6 +1288,17 @@ void DepthStencilTests() {
     queue.context[0x3b8] = 0x09000001;
     const auto arraySlice = AgcDriver::Graphics::DecodeState(queue);
     Require(arraySlice.color.address == sliced + 1024u && arraySlice.color.bytes == 1024u && arraySlice.color.depth == 1u, "a color view of one slice of a 2D array target did not move the target by one slice");
+    Require(arraySlice.color.arraySliceCount == 1u && AgcDriver::Graphics::RenderLayers(arraySlice) == 1u, "a color view of one slice is layered");
+    queue.context[0x31b] = 1u << 13u;
+    const auto layered = AgcDriver::Graphics::DecodeState(queue);
+    Require(layered.color.address == sliced && layered.color.arraySlice == 0u && layered.color.arraySliceCount == 2u && layered.color.bytes == 2048u && layered.color.arrayLastSlice == 1u, "a color view of both slices of a 2D array target did not cover both");
+    Require(AgcDriver::Graphics::RenderLayers(layered) == 2u, "a color view of two slices does not render two layers");
+    auto withDepth = layered;
+    withDepth.depth = AgcDriver::Graphics::DepthTarget{};
+    expectFailure([&] { static_cast<void>(AgcDriver::Graphics::RenderLayers(withDepth)); }, "depth target with layered");
+    auto mixed = layered;
+    mixed.colors.push_back(arraySlice.color);
+    if (mixed.colors.size() > 1) expectFailure([&] { static_cast<void>(AgcDriver::Graphics::RenderLayers(mixed)); }, "different slice counts");
     queue.context[0x31b] = 2u | (2u << 13u);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "beyond the array surface");
     queue.context[0x3b8] = 0x0a000003;
@@ -1294,6 +1307,8 @@ void DepthStencilTests() {
     Require(volume.color.address == sliced && volume.color.depth == 4u && volume.color.depthSlice == 2u, "a color view of one 3D depth slice did not keep the surface address and select the slice");
     queue.context[0x31b] = 4u | (4u << 13u);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "beyond the 3D surface");
+    queue.context[0x31b] = 1u | (2u << 13u);
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "several 3D slices");
     queue.context[0x31b] = 0;
     queue.context[0x31c] |= 0x10000000;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DCC 3D color targets");

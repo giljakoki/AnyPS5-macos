@@ -60,6 +60,7 @@ struct ColorTarget {
     std::uint64_t arrayAddress = 0;
     std::uint32_t arrayLastSlice = 0;
     std::uint32_t arraySlice = 0;
+    std::uint32_t arraySliceCount = 1;
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
@@ -131,6 +132,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
+std::uint32_t RenderLayers(const State& state);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
 

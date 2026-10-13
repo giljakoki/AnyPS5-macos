@@ -350,7 +350,7 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::mutex meshPassThroughMutex;
-    std::map<std::uint64_t, std::shared_ptr<const ShaderRecompiler::RecompileResult>> meshPassThrough;
+    std::map<std::pair<std::uint64_t, bool>, std::shared_ptr<const ShaderRecompiler::RecompileResult>> meshPassThrough;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::PlaceholderImages> placeholderImages;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -1120,6 +1120,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // A device that advertises VK_KHR_portability_subset (MoltenVK) must have it enabled.
     if (hasExtension("VK_KHR_portability_subset")) deviceExtensions.push_back("VK_KHR_portability_subset");
     state->invertedDepthBounds = !hasExtension("VK_KHR_portability_subset");
+    if (hasExtension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
+    }
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -3776,8 +3781,9 @@ void VulkanDevice::DrawMeshEmulated(const Graphics::State& graphics, const Pm4::
     std::shared_ptr<const ShaderRecompiler::RecompileResult> passThrough;
     {
         std::lock_guard lock(state->meshPassThroughMutex);
-        auto& cached = state->meshPassThrough[prepassProgram.PipelineVariantId()];
-        if (cached == nullptr || prepassProgram.PipelineVariantId() == 0) cached = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshPassThroughVertexShader(prepassProgram, Target()));
+        const bool layered = Graphics::RenderLayers(graphics) > 1u;
+        auto& cached = state->meshPassThrough[{prepassProgram.PipelineVariantId(), layered}];
+        if (cached == nullptr || prepassProgram.PipelineVariantId() == 0) cached = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshPassThroughVertexShader(prepassProgram, Target(), layered));
         passThrough = cached;
     }
     const auto context = graphicsContext();

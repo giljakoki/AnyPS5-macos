@@ -617,7 +617,7 @@ struct MeshPrepassSummary {
 
 [[nodiscard]] MeshPrepassSummary SummarizeMeshPrepass(std::span<const std::uint32_t> records, std::span<const std::uint32_t> indices, std::uint64_t slots, std::uint32_t maxVertices, std::uint32_t maxPrimitives, std::uint32_t recordDwords);
 [[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const MeshProgramLayout& layout, const SpirvTarget& target, bool writeLayer);
-[[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target);
+[[nodiscard]] RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target, bool writeLayer = false);
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 

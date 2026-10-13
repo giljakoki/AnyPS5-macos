@@ -175,7 +175,7 @@ RecompileResult BuildMeshPassThroughVertexShader(const MeshProgramLayout& layout
     return result;
 }
 
-RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target) {
+RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass, const SpirvTarget& target, bool writeLayer) {
     require(prepass.meshRecordDwords != 0u, "the program was not compiled as a mesh pre-pass");
     MeshProgramLayout layout;
     for (const auto location : prepass.parameterExports) {
@@ -184,7 +184,7 @@ RecompileResult BuildMeshPassThroughVertexShader(const RecompileResult& prepass,
     }
     layout.recordDwords = prepass.meshRecordDwords;
     layout.layer = prepass.meshRecordDwords > 4u + 4u * layout.ParameterCount();
-    return BuildMeshPassThroughVertexShader(layout, target, false);
+    return BuildMeshPassThroughVertexShader(layout, target, writeLayer);
 }
 
 }

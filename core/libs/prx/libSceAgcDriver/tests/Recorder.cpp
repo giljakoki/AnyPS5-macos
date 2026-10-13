@@ -1136,6 +1136,65 @@ int importLifetimeTests(const Device& device, Recorder& recorder) {
     return 0;
 }
 
+void layeredAttachmentTests(const Device& device) {
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: layered attachments not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t sliceBytes = side * side * 4;
+    constexpr std::size_t bytes = 2 * sliceBytes;
+    void* block = allocateImportBlock(65536, bytes);
+    Require(block != nullptr, "cannot allocate the layered attachment block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    {
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = side;
+        resource.height = side;
+        resource.mipCount = 1;
+        resource.depthOrLastArray = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2DArray;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto array = CachedStorageSurface(context, resource);
+        const auto first = array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0);
+        const auto both = array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 2);
+        Require(first != VK_NULL_HANDLE && both != VK_NULL_HANDLE && first != both, "a view of both slices is not its own attachment view");
+        Require(array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 2) == both, "the view of both slices is not reused");
+        bool refused = false;
+        try {
+            static_cast<void>(array->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 1, 2));
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused, "a view past the array's last slice was made");
+        Framebuffer layered(context, VK_NULL_HANDLE, std::span(&both, 1), {side, side}, 2);
+        Require(layered.Layers() == 2, "a framebuffer of two layers does not report them");
+    }
+    ClearCachedTextures(context.device);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    releaseImportBlock(block);
+    std::cout << "Layered attachment tests passed\n";
+}
+
 void movedMetadataTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -6009,6 +6068,7 @@ int main(int argc, char** argv) {
         queuedWriteGroupTests();
         remappedImportTests(device);
         movedMetadataTests(device, recorder);
+        layeredAttachmentTests(device);
         viewPastLastMipTests(device, recorder);
         keysFillTests(device, recorder);
         denormalClearTests(device, recorder);
