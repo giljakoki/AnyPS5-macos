@@ -126,13 +126,15 @@ Context mockContext() {
 void OpenBatchUnderBudget() {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-    Recorder recorder(mockContext());
+    const auto context = mockContext();
+    Recorder recorder(context);
     recorder.Keep(std::make_shared<int>(0));
     recorder.Keep(std::make_shared<int>(1), Budget - 1);
     recorder.BoundKeptBytes();
     Expect(recorder.Recording() && recorder.Submissions() == 0 && mock.submits == 0, "a batch keeping one byte less than the budget was submitted");
     recorder.Keep(std::make_shared<int>(2), 1);
     recorder.BoundKeptBytes();
+    QueueSubmitter::Drain(context.queue);
     Expect(!recorder.Recording() && recorder.Submissions() == 1 && mock.submits == 1, "the open batch was not submitted once its kept bytes reached the budget");
     Expect(recorder.InFlightKeptBytes() == Budget, "the submitted batch counts " + std::to_string(recorder.InFlightKeptBytes()) + " kept bytes in flight, not the budget");
     Expect(mock.fenceWaits == 0, "the recorder waited for a batch with one budget in flight");

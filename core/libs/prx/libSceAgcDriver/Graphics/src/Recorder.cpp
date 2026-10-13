@@ -1076,6 +1076,122 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
+namespace {
+
+struct SubmitterRegistry {
+    std::mutex mutex;
+    std::map<VkQueue, std::weak_ptr<QueueSubmitter>> submitters;
+};
+
+SubmitterRegistry& submitterRegistry() {
+    static auto& registry = *new SubmitterRegistry;
+    return registry;
+}
+
+std::atomic<std::uint64_t> threadSubmissions{0};
+
+std::shared_ptr<QueueSubmitter> registeredSubmitter(VkQueue queue) {
+    auto& registry = submitterRegistry();
+    std::lock_guard lock(registry.mutex);
+    const auto found = registry.submitters.find(queue);
+    return found != registry.submitters.end() ? found->second.lock() : nullptr;
+}
+
+}
+
+bool QueueSubmitter::Enabled() {
+    static const bool disabled = std::getenv("APS5_NO_SUBMIT_THREAD") != nullptr;
+    return !disabled;
+}
+
+std::shared_ptr<QueueSubmitter> QueueSubmitter::Acquire(VkQueue queue, PFN_vkQueueSubmit submit) {
+    if (!Enabled() || queue == VK_NULL_HANDLE || submit == nullptr) return nullptr;
+    auto& registry = submitterRegistry();
+    std::lock_guard lock(registry.mutex);
+    auto& slot = registry.submitters[queue];
+    if (auto existing = slot.lock()) return existing;
+    auto made = std::make_shared<QueueSubmitter>(queue, submit);
+    slot = made;
+    return made;
+}
+
+void QueueSubmitter::Drain(VkQueue queue) {
+    if (const auto submitter = registeredSubmitter(queue)) submitter->Drain();
+}
+
+std::unique_lock<std::mutex> QueueSubmitter::Access(VkQueue queue) {
+    const auto submitter = registeredSubmitter(queue);
+    if (submitter == nullptr) return {};
+    submitter->Drain();
+    return std::unique_lock(submitter->queueMutex);
+}
+
+std::uint64_t QueueSubmitter::Submitted() {
+    return threadSubmissions.load(std::memory_order_relaxed);
+}
+
+QueueSubmitter::QueueSubmitter(VkQueue queue, PFN_vkQueueSubmit submit) : queue(queue), submit(submit) {
+    thread = std::thread([this] { run(); });
+}
+
+QueueSubmitter::~QueueSubmitter() {
+    {
+        std::lock_guard lock(mutex);
+        stopping = true;
+    }
+    work.notify_all();
+    if (thread.joinable()) thread.join();
+}
+
+void QueueSubmitter::Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphore timeline, std::uint64_t value) {
+    {
+        std::lock_guard lock(mutex);
+        Check(error, "vkQueueSubmit recorder (submit thread)");
+        jobs.push_back({commands, fence, timeline, value});
+    }
+    work.notify_one();
+}
+
+void QueueSubmitter::Drain() {
+    std::unique_lock lock(mutex);
+    drained.wait(lock, [&] { return jobs.empty(); });
+    Check(error, "vkQueueSubmit recorder (submit thread)");
+}
+
+void QueueSubmitter::run() {
+    std::unique_lock lock(mutex);
+    for (;;) {
+        work.wait(lock, [&] { return stopping || !jobs.empty(); });
+        if (jobs.empty()) return;
+        const auto job = jobs.front();
+        lock.unlock();
+        VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submission.commandBufferCount = 1;
+        submission.pCommandBuffers = &job.commands;
+        VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+        timelineInfo.signalSemaphoreValueCount = 1;
+        timelineInfo.pSignalSemaphoreValues = &job.value;
+        if (job.timeline != VK_NULL_HANDLE) {
+            submission.pNext = &timelineInfo;
+            submission.signalSemaphoreCount = 1;
+            submission.pSignalSemaphores = &job.timeline;
+        }
+        VkResult result = VK_SUCCESS;
+        {
+            std::lock_guard queueLock(queueMutex);
+            result = submit(queue, 1, &submission, job.fence);
+        }
+        threadSubmissions.fetch_add(1, std::memory_order_relaxed);
+        lock.lock();
+        jobs.pop_front();
+        if (result != VK_SUCCESS && error == VK_SUCCESS) {
+            error = result;
+            std::fprintf(stderr, "[gpu] vkQueueSubmit on the submit thread failed (%d)\n", static_cast<int>(result));
+        }
+        drained.notify_all();
+    }
+}
+
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
     {
         std::lock_guard lock(liveRecordersMutex);
@@ -3187,7 +3303,13 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = std::chrono::steady_clock::now();
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    if (submitter == nullptr && QueueSubmitter::Enabled()) submitter = QueueSubmitter::Acquire(context.queue, function(queueSubmit, "vkQueueSubmit"));
+    if (submitter != nullptr) {
+        submitter->Enqueue(batch->commands, batch->fence, timeline, serial);
+    } else {
+        const auto access = QueueSubmitter::Access(context.queue);
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3653,6 +3775,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+            QueueSubmitter::Drain(context.queue);
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
