@@ -9,6 +9,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <atomic>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <array>
@@ -113,17 +116,27 @@ struct CachedTexture {
     std::uint64_t provenForget = 0;
     std::uint64_t provenWrites = 0;
     bool proven = false;
+    VkBuffer importBuffer = VK_NULL_HANDLE;
+    std::uint64_t importBase = 0;
 };
 
 struct SnapshotProofCounts {
     std::atomic<std::uint64_t> hits{0};
     std::atomic<std::uint64_t> compares{0};
+    std::atomic<std::uint64_t> refreshes{0};
     std::atomic<std::uint64_t> unproven{0};
     std::atomic<std::uint64_t> newEpoch{0};
     std::atomic<std::uint64_t> forgotten{0};
     std::atomic<std::uint64_t> written{0};
     std::atomic<std::uint64_t> comparedBytes{0};
+    std::atomic<std::uint64_t> compareNanoseconds{0};
+    std::atomic<std::uint64_t> refreshedBytes{0};
     std::atomic<std::int64_t> lastReport{0};
+    std::mutex reportMutex;
+    std::uint64_t reportedCompared = 0;
+    std::uint64_t reportedNanoseconds = 0;
+    long reportedMinorFaults = 0;
+    long reportedMajorFaults = 0;
 };
 
 SnapshotProofCounts& snapshotProofCounts() {
@@ -137,7 +150,22 @@ void reportSnapshotProofs() {
     auto last = counts.lastReport.load(std::memory_order_relaxed);
     if (nowMs - last < 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface)\n", count(counts.hits), count(counts.compares), static_cast<double>(counts.comparedBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written));
+    long minorNow = 0;
+    long majorNow = 0;
+#ifndef _WIN32
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    minorNow = usage.ru_minflt;
+    majorNow = usage.ru_majflt;
+#endif
+    const std::lock_guard lock(counts.reportMutex);
+    const auto compared = counts.comparedBytes.load(std::memory_order_relaxed);
+    const auto nanoseconds = counts.compareNanoseconds.load(std::memory_order_relaxed);
+    const auto comparedSince = compared - std::exchange(counts.reportedCompared, compared);
+    const auto nanosecondsSince = nanoseconds - std::exchange(counts.reportedNanoseconds, nanoseconds);
+    const auto minorFaults = minorNow - std::exchange(counts.reportedMinorFaults, minorNow);
+    const auto majorFaults = majorNow - std::exchange(counts.reportedMajorFaults, majorNow);
+    std::fprintf(stderr, "[resources] snapshot proofs: %llu memo hits, %llu compares (%.1f MiB; %llu first, %llu new frame or expired, %llu forget, %llu driver write over the surface), %llu imported refreshes on the GPU (%.1f MiB); since the last line %.1f MiB compared at %.2f GB/s, %ld minor and %ld major page faults\n", count(counts.hits), count(counts.compares), static_cast<double>(compared) / 1048576.0, count(counts.unproven), count(counts.newEpoch), count(counts.forgotten), count(counts.written), count(counts.refreshes), static_cast<double>(counts.refreshedBytes.load(std::memory_order_relaxed)) / 1048576.0, static_cast<double>(comparedSince) / 1048576.0, nanosecondsSince != 0 ? static_cast<double>(comparedSince) / static_cast<double>(nanosecondsSince) : 0.0, minorFaults, majorFaults);
 }
 
 std::chrono::milliseconds snapshotProofLifetime() {
@@ -148,41 +176,89 @@ std::chrono::milliseconds snapshotProofLifetime() {
     return lifetime;
 }
 
-bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t bytes) {
+bool snapshotProofMemo() {
     static const bool disabled = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
-    auto& counts = snapshotProofCounts();
-    const auto present = Recorder::Presents();
-    const auto now = std::chrono::steady_clock::now();
+    return !disabled;
+}
+
+bool importedSnapshotRefresh() {
+    static const bool disabled = std::getenv("APS5_NO_IMPORTED_SNAPSHOT_REFRESH") != nullptr;
+    return !disabled && snapshotProofMemo();
+}
+
+struct SnapshotProof {
+    std::uint64_t present;
+    std::chrono::steady_clock::time_point now;
+    std::uint64_t forget;
+    std::uint64_t writes;
+    bool usable;
+};
+
+SnapshotProof currentSnapshotProof() {
     const auto forget = GuestMemory::ForgetSerial();
-    const auto writes = GuestMemory::DriverWriteSerial();
-    const bool usable = !disabled && (forget & 1u) == 0;
-    if (usable && entry.proven) {
-        if (entry.provenPresent != present || now - entry.provenAt >= snapshotProofLifetime()) {
-            counts.newEpoch.fetch_add(1, std::memory_order_relaxed);
-        } else if (entry.provenForget != forget) {
-            counts.forgotten.fetch_add(1, std::memory_order_relaxed);
-        } else if (GuestMemory::DriverWroteOver(address, bytes, entry.provenWrites)) {
-            counts.written.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            entry.provenWrites = writes;
-            counts.hits.fetch_add(1, std::memory_order_relaxed);
-            reportSnapshotProofs();
-            return true;
-        }
-    } else {
+    return {Recorder::Presents(), std::chrono::steady_clock::now(), forget, GuestMemory::DriverWriteSerial(), snapshotProofMemo() && (forget & 1u) == 0};
+}
+
+bool proofHolds(CachedTexture& entry, const SnapshotProof& proof, std::uint64_t address, std::size_t bytes) {
+    auto& counts = snapshotProofCounts();
+    if (!proof.usable || !entry.proven) {
         counts.unproven.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (entry.provenPresent != proof.present || proof.now - entry.provenAt >= snapshotProofLifetime()) {
+        counts.newEpoch.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (entry.provenForget != proof.forget) {
+        counts.forgotten.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (GuestMemory::DriverWroteOver(address, bytes, entry.provenWrites)) {
+        counts.written.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    entry.provenWrites = proof.writes;
+    counts.hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void recordProof(CachedTexture& entry, const SnapshotProof& proof) {
+    entry.proven = proof.usable;
+    entry.provenPresent = proof.present;
+    entry.provenAt = proof.now;
+    entry.provenForget = proof.forget;
+    entry.provenWrites = proof.writes;
+}
+
+bool snapshotProven(CachedTexture& entry, std::uint64_t address, std::size_t bytes) {
+    auto& counts = snapshotProofCounts();
+    const auto proof = currentSnapshotProof();
+    if (proofHolds(entry, proof, address, bytes)) {
+        reportSnapshotProofs();
+        return true;
     }
     counts.compares.fetch_add(1, std::memory_order_relaxed);
+    entry.proven = false;
+    const auto start = std::chrono::steady_clock::now();
+    const bool equal = GuestMemory::EqualsCommittedUnsynced(address, entry.bytes);
+    counts.compareNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     counts.comparedBytes.fetch_add(entry.bytes.size(), std::memory_order_relaxed);
     reportSnapshotProofs();
-    entry.proven = false;
-    if (!GuestMemory::EqualsCommittedUnsynced(address, entry.bytes)) return false;
-    entry.proven = usable;
-    entry.provenPresent = present;
-    entry.provenAt = now;
-    entry.provenForget = forget;
-    entry.provenWrites = writes;
+    if (!equal) return false;
+    recordProof(entry, proof);
     return true;
+}
+
+void refreshImportedSnapshot(const Context& context, CachedTexture& entry, const HostImport& import, std::uint64_t address, std::size_t bytes) {
+    auto& counts = snapshotProofCounts();
+    const auto proof = currentSnapshotProof();
+    if (!proofHolds(entry, proof, address, bytes)) {
+        entry.texture->RefreshFromImport(*context.detiler, import);
+        counts.refreshes.fetch_add(1, std::memory_order_relaxed);
+        counts.refreshedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        recordProof(entry, proof);
+    }
+    reportSnapshotProofs();
 }
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -701,12 +777,22 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
+    const bool importable = importedSnapshotRefresh() && source == nullptr && !clearThroughKeys && *keys == DccKeys::Uncompressed && !depthCompare && IsBlockCompressed(resource.format) && HostImportCovers(context, address, bytes);
+    const auto* import = importable ? HostImportFor(context, address, bytes) : nullptr;
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
-        if (it->source != nullptr) {
+        if (import != nullptr && it->importBuffer == import->buffer && it->importBase == import->base && it->keys == *keys) {
+            refreshImportedSnapshot(context, *it, *import, address, bytes);
+            it->generation = generation;
+            touchTexture(cache, it);
+            logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+            reportTextureCounters();
+            if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+            return it->texture;
+        } else if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
@@ -742,8 +828,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
-    if (source != nullptr) {
+    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr || import != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    if (import != nullptr) {
+        const auto proof = currentSnapshotProof();
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, *import);
+        entry.importBuffer = import->buffer;
+        entry.importBase = import->base;
+        recordProof(entry, proof);
+        auto& proofCounts = snapshotProofCounts();
+        proofCounts.refreshes.fetch_add(1, std::memory_order_relaxed);
+        proofCounts.refreshedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        entry.accounted = entry.texture->AllocationBytes();
+        counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+    } else if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
         if (depthCompare) {
@@ -1040,6 +1137,11 @@ void FlushCachedTextures(VkDevice device) {
     for (const auto& entry : cache.entries) {
         if (entry.key.device == device) entry.texture->Flush();
     }
+}
+
+SampledSnapshotCounts SampledSnapshotTotals() {
+    const auto& counts = snapshotProofCounts();
+    return {counts.hits.load(std::memory_order_relaxed), counts.compares.load(std::memory_order_relaxed), counts.refreshes.load(std::memory_order_relaxed), counts.comparedBytes.load(std::memory_order_relaxed)};
 }
 
 void ClearCachedTextures(VkDevice device) {
