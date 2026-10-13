@@ -865,12 +865,13 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     return failures;
 }
 
-std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+std::uint64_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
     memoized = false;
     hit = false;
-    std::vector<std::uint64_t> key;
+    thread_local std::vector<std::uint64_t> key;
+    key.clear();
     const bool keyed = ValidationKey(context, shaders, state, key);
-    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>>& memo = *new std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>>();
+    static std::map<std::vector<std::uint64_t>, std::uint64_t>& memo = *new std::map<std::vector<std::uint64_t>, std::uint64_t>();
     if (keyed) {
         memoized = true;
         std::lock_guard lock(validationMutex());
@@ -879,15 +880,15 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             return found->second;
         }
     }
-    std::set<std::uint32_t> outputs;
+    std::uint64_t outputs = 0;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics);
+        outputs = FragmentOutputMask(ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics));
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
-            failures.emplace(std::move(key), error.what());
+            failures.emplace(key, error.what());
         }
         throw;
     }
@@ -895,7 +896,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
         std::lock_guard lock(validationMutex());
         // A handful of configurations recur; a runaway key space is dropped wholesale.
         if (memo.size() >= 1024) memo.clear();
-        memo.emplace(std::move(key), outputs);
+        memo.emplace(key, outputs);
     }
     return outputs;
 }
@@ -1138,7 +1139,7 @@ struct DrawInputs {
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
-    std::set<std::uint32_t> fragmentOutputs;
+    std::uint64_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
     std::vector<std::uint32_t> restartTable;
@@ -1195,6 +1196,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
     Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+    static const bool recheckIndices = std::getenv("APS5_RECHECK_INDEX_RANGE") != nullptr;
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
@@ -1235,7 +1237,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
-        else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        else if (recheckIndices) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (!copy.reused) {
             const auto bytes = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
@@ -2083,10 +2085,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
 // The state with the outputs the pixel shader lacks masked: Vulkan leaves attachments a pixel
 // shader has no output for undefined, so their writes are masked (shaders that only store to
 // images or buffers keep their targets as they were). Empty when no mask must change.
-std::optional<State> maskedState(const State& state, const std::set<std::uint32_t>& fragmentOutputs) {
+std::optional<State> maskedState(const State& state, std::uint64_t fragmentOutputs) {
+    Require(state.blends.size() <= 64u, "a draw has more than 64 color blend attachments");
     std::optional<State> masked;
     for (std::size_t index = 0; index < state.blends.size(); ++index) {
-        if (fragmentOutputs.contains(static_cast<std::uint32_t>(index)) || state.blends[index].colorWriteMask == 0) continue;
+        if ((fragmentOutputs >> index & 1u) != 0 || state.blends[index].colorWriteMask == 0) continue;
         if (!masked.has_value()) masked = state;
         masked->blends[index].colorWriteMask = 0;
     }

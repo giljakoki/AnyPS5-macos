@@ -5370,6 +5370,7 @@ int main(int argc, char** argv) {
         HeaderlessVertexStageTests();
         HiddenUserWordVertexTablesTests();
         MultiSemanticVertexTablesTests();
+        Require(AgcDriver::Graphics::FragmentOutputMask({0u, 2u, 63u, 64u, 100u}) == ((std::uint64_t{1} << 63u) | 5u) && AgcDriver::Graphics::FragmentOutputMask({}) == 0u, "the fragment output mask lost an output below 64 or kept one above");
         ComputeScratchTests();
         shaderUserDataTailPaddingTests();
         InitialContextTests();

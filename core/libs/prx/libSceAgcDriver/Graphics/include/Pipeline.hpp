@@ -137,6 +137,13 @@ void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const S
 bool ShadersWriteMemory(std::span<const CompiledShader> shaders);
 // Returns the color attachment locations the pixel shader writes.
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing = false, bool imageInt64Atomics = false, bool geometryShader = false, bool sampleRateShading = false, bool bufferInt64Atomics = false);
+inline std::uint64_t FragmentOutputMask(const std::set<std::uint32_t>& outputs) {
+    std::uint64_t mask = 0;
+    for (const auto output : outputs) {
+        if (output < 64u) mask |= std::uint64_t{1} << output;
+    }
+    return mask;
+}
 
 }
 
