@@ -736,6 +736,47 @@ void RunPendingKeyValues(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     std::cout << "keys under pending GPU fills: ok\n";
 }
 
+void RunPresentCompare(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    if (std::getenv("APS5_NO_PRESENT_COMPARES") != nullptr || std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr) return;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, userData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr, "the compared image has no pending results");
+    device.WaitIdle();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    AgcDriver::Graphics::Recorder::CountPresent();
+    Require(image->Refresh(), "the compared image was uploaded before the test");
+    for (int frame = 0; frame < 3; ++frame) {
+        device.WaitIdle();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::Graphics::Recorder::CountPresent();
+        StorageTexture::StartPresentCompares();
+        StorageTexture::WaitPresentCompares();
+        const auto compared = AgcDriver::GuestMemory::ComparedBytes();
+        Require(image->Refresh(), "an unchanged image was uploaded after its present compare");
+        if (AgcDriver::GuestMemory::ComparedBytes() != compared) throw std::runtime_error("the refresh after a present compared the image again on the worker (frame " + std::to_string(frame) + ")");
+    }
+    device.WaitIdle();
+    std::memset(block + SurfaceBytes, 0x5a, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    AgcDriver::Graphics::Recorder::CountPresent();
+    StorageTexture::StartPresentCompares();
+    StorageTexture::WaitPresentCompares();
+    Require(!image->Refresh(), "a CPU store before the present was missed by the present compare");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test present compare");
+    device.WaitIdle();
+    Require(Count(block + SurfaceBytes, SurfaceBytes, 0x5a) == SurfaceBytes, "the CPU store did not survive the write-back");
+    std::cout << "present compares off the worker: ok\n";
+}
+
 int main() {
     try {
         std::optional<GuestBlock> block;
@@ -764,6 +805,9 @@ int main() {
         std::optional<GuestBlock> pendingKeys;
         pendingKeys.emplace(false);
         RunPendingKeyValues(*device, pendingKeys->Data());
+        std::optional<GuestBlock> presentCompared;
+        presentCompared.emplace(false);
+        RunPresentCompare(*device, presentCompared->Data());
         std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());

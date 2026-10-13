@@ -101,10 +101,27 @@ void SecondDrawHitsTheCache(bool libraries) {
     Require(counters.hits == 1, mode + ": the repeated draw did not reuse the cached draw (" + std::to_string(counters.hits) + " hits)");
 }
 
+void GovernorSkipsAPoorCache() {
+    using AgcDriver::DriverDetail::DrawCacheGovernor;
+    if (std::getenv("APS5_DRAW_CACHE_MIN_HITS") != nullptr || std::getenv("APS5_NO_DRAW_CACHE_GOVERNOR") != nullptr) return;
+    const auto window = [](DrawCacheGovernor& governor, std::uint32_t hits) {
+        for (std::uint32_t lookup = 0; lookup < DrawCacheGovernor::Window; ++lookup) governor.Note(lookup < hits);
+    };
+    DrawCacheGovernor poor;
+    poor.report = false;
+    window(poor, DrawCacheGovernor::Window / 50);
+    Require(!poor.Use(), "the draw cache governor kept the entries of a queue whose window hit 2% of its lookups");
+    DrawCacheGovernor good;
+    good.report = false;
+    window(good, DrawCacheGovernor::Window / 5);
+    Require(good.Use(), "the draw cache governor skipped the entries of a queue whose window hit 20% of its lookups");
+}
+
 }
 
 int main() {
     try {
+        GovernorSkipsAPoorCache();
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();

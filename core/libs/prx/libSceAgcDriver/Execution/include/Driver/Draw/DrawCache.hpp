@@ -6,6 +6,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -14,6 +17,46 @@
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::DriverDetail {
+
+struct DrawCacheGovernor {
+    static constexpr std::uint32_t Window = 4096;
+    static std::uint32_t MinimumHits() {
+        static const std::uint32_t hits = [] {
+            const char* text = std::getenv("APS5_DRAW_CACHE_MIN_HITS");
+            return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : Window / 10;
+        }();
+        return hits;
+    }
+    static constexpr std::uint32_t Pause = 16384;
+    std::uint32_t lookups = 0;
+    std::uint32_t hits = 0;
+    std::uint32_t paused = 0;
+    std::uint32_t streak = 0;
+    bool report = true;
+
+    bool Use() {
+        static const bool disabled = std::getenv("APS5_NO_DRAW_CACHE_GOVERNOR") != nullptr;
+        if (disabled || paused == 0) return true;
+        --paused;
+        return false;
+    }
+
+    void Note(bool hit) {
+        ++lookups;
+        if (hit) ++hits;
+        if (lookups < Window) return;
+        if (hits < MinimumHits()) {
+            paused = Pause << std::min<std::uint32_t>(streak, 6);
+            streak = std::min<std::uint32_t>(streak + 1, 6);
+            if (report) std::fprintf(stderr, "[draw-cache] %u of the last %u lookups hit: draw entries are skipped for the next %u draws of this queue\n", hits, Window, paused);
+        } else {
+            streak = 0;
+        }
+        lookups = 0;
+        hits = 0;
+    }
+};
+
 
 struct DrawProgram {
     ShaderRecompiler::ShaderBinary binary;
