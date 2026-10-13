@@ -24,7 +24,10 @@
 #include <stdexcept>
 #include <vector>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 #include <map>
 #include <limits>
 #include <exception>
@@ -89,6 +92,9 @@ std::atomic<std::uint64_t> writeBackWholeBaselines{0};
 std::atomic<std::uint64_t> filledImageClears{0};
 std::atomic<std::uint64_t> maskedFlushes{0};
 std::atomic<std::uint64_t> untrackedRefreshesProved{0};
+std::atomic<std::uint64_t> presentComparesStarted{0};
+std::atomic<std::uint64_t> presentComparesUsed{0};
+std::atomic<std::uint64_t> presentComparesWaited{0};
 std::atomic<std::uint64_t> filledImagesStale{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
@@ -1962,6 +1968,165 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
+struct StorageTexture::PresentCompare {
+    enum State : int { Queued, Running, Done, Canceled };
+    std::atomic<int> state{Queued};
+    const std::byte* guest = nullptr;
+    const std::byte* copy = nullptr;
+    std::size_t bytes = 0;
+    std::uint64_t present = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t writes = 0;
+    std::chrono::steady_clock::time_point at{};
+    GuestAllocations::Lease lease;
+    bool equal = false;
+};
+
+namespace {
+
+std::size_t presentCompareThreads() {
+    static const std::size_t threads = [] {
+        if (std::getenv("APS5_NO_PRESENT_COMPARES") != nullptr) return std::size_t{0};
+        if (const char* text = std::getenv("APS5_PRESENT_COMPARE_THREADS")) return std::min<std::size_t>(std::strtoull(text, nullptr, 10), 8);
+        return std::size_t{2};
+    }();
+    return threads;
+}
+
+class PresentCompareQueue {
+public:
+    static PresentCompareQueue& Get() {
+        static PresentCompareQueue& queue = *new PresentCompareQueue();
+        return queue;
+    }
+
+    void Push(std::vector<std::shared_ptr<StorageTexture::PresentCompare>> batch) {
+        {
+            std::lock_guard lock(mutex);
+            for (auto& job : batch) jobs.push_back(std::move(job));
+        }
+        wake.notify_all();
+    }
+
+    void WaitIdle() {
+        std::unique_lock lock(mutex);
+        idle.wait(lock, [&] { return jobs.empty() && running == 0; });
+    }
+
+private:
+    PresentCompareQueue() {
+        for (std::size_t index = 0; index < presentCompareThreads(); ++index) std::thread([this] { serve(); }).detach();
+    }
+
+    void serve() {
+        for (;;) {
+            std::shared_ptr<StorageTexture::PresentCompare> job;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return !jobs.empty(); });
+                job = std::move(jobs.front());
+                jobs.pop_front();
+                ++running;
+            }
+            int expected = StorageTexture::PresentCompare::Queued;
+            if (job->state.compare_exchange_strong(expected, StorageTexture::PresentCompare::Running, std::memory_order_acq_rel)) {
+                job->equal = std::memcmp(job->guest, job->copy, job->bytes) == 0;
+                job->lease.clear();
+                job->state.store(StorageTexture::PresentCompare::Done, std::memory_order_release);
+            }
+            {
+                std::lock_guard lock(mutex);
+                --running;
+                if (jobs.empty() && running == 0) idle.notify_all();
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable idle;
+    std::deque<std::shared_ptr<StorageTexture::PresentCompare>> jobs;
+    std::size_t running = 0;
+};
+
+}
+
+void StorageTexture::quiesceCompare() {
+    if (presentCompare == nullptr) return;
+    int expected = PresentCompare::Queued;
+    if (!presentCompare->state.compare_exchange_strong(expected, PresentCompare::Canceled, std::memory_order_acq_rel)) {
+        while (presentCompare->state.load(std::memory_order_acquire) == PresentCompare::Running) std::this_thread::yield();
+    }
+    presentCompare.reset();
+}
+
+bool StorageTexture::takePresentCompare(std::uint64_t present, std::uint64_t forget) {
+    if (presentCompare == nullptr) return false;
+    auto job = presentCompare;
+    if (job->present != present || job->forget != forget) {
+        quiesceCompare();
+        return false;
+    }
+    int state = job->state.load(std::memory_order_acquire);
+    if (state == PresentCompare::Queued || state == PresentCompare::Running) {
+        presentComparesWaited.fetch_add(1, std::memory_order_relaxed);
+        while ((state = job->state.load(std::memory_order_acquire)) == PresentCompare::Queued || state == PresentCompare::Running) std::this_thread::yield();
+    }
+    presentCompare.reset();
+    if (state != PresentCompare::Done || !job->equal || job->guest != reinterpret_cast<const std::byte*>(descriptor.baseAddress) || job->copy != original.data() || job->bytes != original.size()) return false;
+    if (GuestMemory::DriverWroteOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), job->writes, true)) return false;
+    untrackedProof = UntrackedProof{present, forget, GuestMemory::DriverWriteSerial(), GuestMemory::CollectEpoch(), job->at};
+    presentComparesUsed.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void StorageTexture::StartPresentCompares() {
+    if (presentCompareThreads() == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    auto* recorder = Recorder::Active();
+    const auto present = Recorder::Presents();
+    const auto forget = GuestMemory::ForgetSerial();
+    if ((forget & 1u) != 0) return;
+    const auto writes = GuestMemory::DriverWriteSerial();
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<PresentCompare>> batch;
+    std::vector<std::shared_ptr<StorageTexture>> candidates;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (texture->released || texture->generation != 0 || !texture->originalValid || texture->cpuWriter || !texture->pendingBaselines.empty() || texture->guestBytes < 65536 || texture->original.size() != texture->guestBytes) continue;
+            if (auto shared = texture->weak_from_this().lock()) candidates.push_back(std::move(shared));
+        }
+    }
+    for (const auto& candidate : candidates) {
+        auto* texture = candidate.get();
+        if (std::any_of(texture->imageStale.begin(), texture->imageStale.end(), [](bool stale) { return stale; })) continue;
+        if (recorder != nullptr && recorder->PendingWriteOverlaps(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes))) continue;
+        if (!RegisteredReadableCovers(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) || !GuestMemory::Accessible(reinterpret_cast<const void*>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) continue;
+        auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes));
+        if (lease.empty()) continue;
+        texture->quiesceCompare();
+        auto job = std::make_shared<PresentCompare>();
+        job->guest = reinterpret_cast<const std::byte*>(texture->descriptor.baseAddress);
+        job->copy = texture->original.data();
+        job->bytes = texture->original.size();
+        job->present = present;
+        job->forget = forget;
+        job->writes = writes;
+        job->at = now;
+        job->lease = std::move(lease);
+        texture->presentCompare = job;
+        batch.push_back(std::move(job));
+    }
+    if (batch.empty()) return;
+    presentComparesStarted.fetch_add(batch.size(), std::memory_order_relaxed);
+    PresentCompareQueue::Get().Push(std::move(batch));
+}
+
+void StorageTexture::WaitPresentCompares() {
+    if (presentCompareThreads() != 0) PresentCompareQueue::Get().WaitIdle();
+}
+
 bool StorageTexture::untrackedProofHolds() const {
     static const bool exact = std::getenv("APS5_NO_SNAPSHOT_PROOF_MEMO") != nullptr;
     if (exact || !untrackedProof.has_value()) return false;
@@ -2069,6 +2234,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+    quiesceCompare();
     originalChanged();
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -2161,6 +2327,7 @@ bool StorageTexture::landBaseline() {
         }
         pending.bytes->Invalidate();
         const auto source = pending.bytes->Bytes();
+        quiesceCompare();
         if (!pending.ranges.empty()) {
             for (const auto& [offset, length] : pending.ranges) std::memcpy(original.data() + offset, source.data() + offset, static_cast<std::size_t>(length));
         } else {
@@ -2215,6 +2382,11 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     const auto skipped = [&](std::uint64_t begin, std::uint64_t stop) { return inFlightOverlaps(begin, stop) || (anyStale && staleOverlaps(begin, stop)); };
     if (whole && !inFlight && epochHolds && untrackedProof.has_value() && untrackedProof->present == present && now - untrackedProof->at < std::chrono::milliseconds(500) && untrackedProof->forget == forget && (forget & 1u) == 0 && !GuestMemory::DriverWroteOver(address, bytes, untrackedProof->writes, true)) {
         untrackedProof->writes = writes;
+        untrackedProofHits.fetch_add(1, std::memory_order_relaxed);
+        std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
+        return true;
+    }
+    if (whole && !inFlight && epochHolds && (forget & 1u) == 0 && const_cast<StorageTexture*>(this)->takePresentCompare(present, forget)) {
         untrackedProofHits.fetch_add(1, std::memory_order_relaxed);
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
@@ -2276,6 +2448,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
+    quiesceCompare();
     original.resize(static_cast<std::size_t>(guestBytes));
     originalChanged();
     // A layer selection applies to the direct path alone (the others upload everything); it names
@@ -3689,6 +3862,7 @@ bool StorageTexture::clearFilled(Recorder& recorder, std::uint32_t word) {
     toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
     recorder.EndGpuTiming(timing, guestBytes);
+    quiesceCompare();
     original.resize(static_cast<std::size_t>(guestBytes));
     for (std::size_t offset = 0; offset + sizeof(word) <= original.size(); offset += sizeof(word)) std::memcpy(original.data() + offset, &word, sizeof(word));
     originalValid = true;
@@ -4720,6 +4894,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // the content again only where it did before, or once every unit is stored.
     const bool wasValid = originalValid;
     if (!wasValid) {
+        quiesceCompare();
         GuestMemory::ReadCommitted(descriptor.baseAddress, original);
         originalChanged();
     }
@@ -4793,6 +4968,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // Store only the kept ranges' blocks that changed, so concurrent CPU writes to untouched texels
     // survive; `original` follows for the stored layers (the others' guest bytes are unchanged).
     const auto current = host.Bytes();
+    quiesceCompare();
     for (const auto& [from, to] : keep) {
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
         const auto length = static_cast<std::size_t>(to - from);
@@ -4817,6 +4993,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
 }
 
 StorageTexture::~StorageTexture() {
+    quiesceCompare();
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);

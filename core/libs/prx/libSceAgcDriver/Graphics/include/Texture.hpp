@@ -336,6 +336,9 @@ public:
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     static std::uint64_t Uploads();
+    struct PresentCompare;
+    static void StartPresentCompares();
+    static void WaitPresentCompares();
     std::uint64_t GuestBytes() const;
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
@@ -494,6 +497,9 @@ private:
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
+    std::shared_ptr<PresentCompare> presentCompare;
+    void quiesceCompare();
+    bool takePresentCompare(std::uint64_t present, std::uint64_t forget);
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
     struct UntrackedProof {
         std::uint64_t present = 0;
