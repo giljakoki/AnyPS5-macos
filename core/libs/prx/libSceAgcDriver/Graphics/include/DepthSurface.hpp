@@ -23,10 +23,12 @@ struct DepthStoreClear {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint64_t value = 0;
+    std::uint32_t format = 0;
 };
 bool DepthStoreKernel(std::span<const std::uint32_t> code);
 std::optional<DepthStoreClear> MatchDepthStoreClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups, const std::array<std::uint32_t, 3>& partialThreads = {}, const char** refusal = nullptr);
 bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth, std::string* refusal = nullptr);
+bool ClearStencilSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint8_t stencil, std::string* refusal = nullptr);
 void RetireDepthSurfacesAt(const Context& context, std::uint64_t address);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 void NoteHtileDepthClear(std::uint64_t htileAddress);

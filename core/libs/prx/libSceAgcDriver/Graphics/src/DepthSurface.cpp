@@ -321,7 +321,7 @@ std::optional<DepthStoreClear> MatchDepthStoreClear(std::span<const std::uint32_
     if (width < image.width || height < image.height) return refuse("the dispatch's threads do not cover the image");
     const auto value = userData[8] | (static_cast<std::uint64_t>(userData[9] & 0xffffu) << 32u);
     if (value == 0 || (value & 3u) != 0 || userData[10] == 0) return refuse("its value buffer is null, unaligned or empty");
-    return DepthStoreClear{image.baseAddress, image.width, image.height, value};
+    return DepthStoreClear{image.baseAddress, image.width, image.height, value, image.format};
 }
 
 bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth, std::string* refusal) {
@@ -339,6 +339,22 @@ bool ClearDepthSurface(const Context& context, std::uint64_t address, std::uint3
         }
         surface->clearDepth = depth;
         surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        surface->ApplyFastClear();
+        return true;
+    }
+    return false;
+}
+
+bool ClearStencilSurface(const Context& context, std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint8_t stencil, std::string* refusal) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device || surface->target.stencilAddress != address || surface->target.address == address) continue;
+        if (width < surface->target.extent.width || height < surface->target.extent.height) {
+            if (refusal != nullptr) *refusal = "the store covers " + std::to_string(width) + "x" + std::to_string(height) + " but the stencil plane is " + std::to_string(surface->target.extent.width) + "x" + std::to_string(surface->target.extent.height);
+            return false;
+        }
+        surface->clearStencil = stencil;
+        surface->pendingClear |= VK_IMAGE_ASPECT_STENCIL_BIT;
         surface->ApplyFastClear();
         return true;
     }

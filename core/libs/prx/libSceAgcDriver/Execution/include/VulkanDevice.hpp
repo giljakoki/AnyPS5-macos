@@ -96,6 +96,7 @@ public:
     // every recorded store over the range.
     bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
     bool ClearDepthSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, float depth, std::string* refusal = nullptr);
+    bool ClearStencilSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint8_t stencil, std::string* refusal = nullptr);
     bool DumpSamplesOnGpu(std::uint64_t address);
     // Copies `bytes` of guest memory from `source` to `destination` (disjoint ranges) in place of the
     // engine's memcpy kernel (Driver.cpp copyBuffer). `path` 0: copied on the CPU at once, when

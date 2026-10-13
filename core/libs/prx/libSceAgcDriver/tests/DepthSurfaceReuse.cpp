@@ -93,10 +93,14 @@ VKAPI_ATTR void VKAPI_CALL destroyImage(VkDevice, VkImage, const VkAllocationCal
 VKAPI_ATTR void VKAPI_CALL freeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL cmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
 float lastClearDepth = -1.0f;
+std::uint32_t lastClearStencil = 0;
+VkImageAspectFlags lastClearAspects = 0;
 std::uint32_t clears = 0;
 
-VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue* value, std::uint32_t, const VkImageSubresourceRange*) {
+VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue* value, std::uint32_t, const VkImageSubresourceRange* ranges) {
     lastClearDepth = value->depth;
+    lastClearStencil = value->stencil;
+    lastClearAspects = ranges->aspectMask;
     ++clears;
 }
 
@@ -195,6 +199,13 @@ void RunDepthSurfaceReuseTests() {
     Require(lookup(context, {stencil, FormatR32Float, 320, 180}) == nullptr, "an R32F view of a stencil plane's own extent must be read as reused memory");
 
     Require(DepthSurfaceAt(depth32) && DepthSurfaceAt(depth16) && DepthSurfaceAt(depthStencil) && DepthSurfaceAt(stencil), "every bound depth and stencil plane must be known as a depth surface");
+    {
+        const auto before = clears;
+        std::string refusal;
+        Require(!ClearDepthSurface(context, stencil, 320, 180, 0.5f, &refusal) && refusal.find("stencil plane") != std::string::npos && clears == before, "a depth clear of a stencil plane must be refused as one");
+        Require(ClearStencilSurface(context, stencil, 320, 180, 0x5a) && clears == before + 1 && lastClearStencil == 0x5a && lastClearAspects == VK_IMAGE_ASPECT_STENCIL_BIT, "a stencil clear by store must clear only the stencil aspect with the stored value");
+        Require(!ClearStencilSurface(context, stencil, 160, 180, 1) && !ClearStencilSurface(context, depthStencil, 320, 180, 1) && clears == before + 1, "a narrower stencil clear, or one of the depth plane, must be refused");
+    }
     static int otherDeviceTag = 0;
     auto otherDevice = context;
     otherDevice.device = reinterpret_cast<VkDevice>(&otherDeviceTag);

@@ -56,6 +56,15 @@ bool Driver::clearDepthByStore(const QueueState& queue, std::span<const std::uin
     GuestMemory::Read(clear->value, std::as_writable_bytes(std::span(&bits, 1)), 4);
     std::string surfaceRefusal;
     if (localDevice->ClearDepthSurface(clear->image, clear->width, clear->height, std::bit_cast<float>(bits), &surfaceRefusal)) return true;
+    constexpr std::uint32_t FormatR8Uint = 5;
+    if (surfaceRefusal.find("stencil plane") != std::string::npos) {
+        if (clear->format != FormatR8Uint) {
+            reportDepthStoreRefusal(program, clear->image, "it stores into the stencil plane through format " + std::to_string(clear->format) + ", not R8_UINT");
+            return false;
+        }
+        surfaceRefusal.clear();
+        if (localDevice->ClearStencilSurface(clear->image, clear->width, clear->height, static_cast<std::uint8_t>(bits & 0xffu), &surfaceRefusal)) return true;
+    }
     reportDepthStoreRefusal(program, clear->image, surfaceRefusal.empty() ? "no depth plane starts at the image" : surfaceRefusal);
     return false;
 }

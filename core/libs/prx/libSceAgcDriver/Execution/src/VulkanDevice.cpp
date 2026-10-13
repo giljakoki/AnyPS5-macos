@@ -3037,6 +3037,10 @@ bool VulkanDevice::ClearDepthSurface(std::uint64_t address, std::uint32_t width,
     return Graphics::ClearDepthSurface(graphicsContext(), address, width, height, depth, refusal);
 }
 
+bool VulkanDevice::ClearStencilSurface(std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint8_t stencil, std::string* refusal) {
+    return Graphics::ClearStencilSurface(graphicsContext(), address, width, height, stencil, refusal);
+}
+
 Graphics::Context VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
