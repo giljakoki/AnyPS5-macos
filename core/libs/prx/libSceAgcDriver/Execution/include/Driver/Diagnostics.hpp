@@ -22,6 +22,8 @@ void NoteSkippedWork(const char* reason, const char* kind);
 
 bool RecentWorkTraced();
 
+bool SerializeWork();
+
 void NoteRecentWork(const char* kind, std::uint32_t queue, std::uint64_t serial, std::size_t offset, const QueueState& state, std::span<const std::uint32_t> packet);
 
 void DumpRecentWork(const char* why);

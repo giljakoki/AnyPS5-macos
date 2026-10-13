@@ -67,6 +67,14 @@ std::terminate_handler& PreviousTerminate() {
 
 }
 
+bool SerializeWork() {
+    static const bool serialize = [] {
+        const char* value = std::getenv("APS5_SERIALIZE_WORK");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return serialize;
+}
+
 bool RecentWorkTraced() {
     return RecentWorkCapacity() != 0;
 }

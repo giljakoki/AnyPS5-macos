@@ -183,6 +183,8 @@ Titles draw geometry-shader and other NGG programs through the mesh path, which 
 
 The driver prints `[env] APS5 settings in effect: ...` once its Vulkan device is ready, listing every `APS5_` variable the title process received, so a launcher that drops the environment shows up in the log.
 
+Debug aid: `APS5_SERIALIZE_WORK=1` waits for the GPU after every draw and dispatch packet, so a GPU fault surfaces right after the packet that caused it (combine it with `APS5_TRACE_RECENT_WORK`, whose last line is then that packet). It is very slow.
+
 Debug aid: `APS5_TRACE_RECENT_WORK=<n>` keeps the last `n` draw and dispatch packets (queue, submission, program addresses, colour target, index base and the first packet words) and prints them as `[recent-work]` lines when the process terminates on an uncaught error, such as a lost Vulkan device, so the work submitted just before a GPU fault is known.
 
 Debug aid: `APS5_VERIFY_MESH_PREPASS=<n>` checks what the pre-pass writes for the first `n` emulated draws. It fills the scratch buffers with a sentinel, waits for the pre-pass, and prints one `[mesh-verify]` line per draw: slots without a live triangle, live, degenerate and never-written triangles, indices outside their group slot, corners on records the program never wrote, non-finite positions or w <= 0, how many live triangles reach the view and the NDC range of the referenced positions. Each checked draw drains the GPU, so keep `n` small.
