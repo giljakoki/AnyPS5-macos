@@ -12,6 +12,7 @@
 #include <windows.h>
 #endif
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include "prx/libc/include/Shutdown.hpp"
 
@@ -54,10 +55,36 @@ extern "C" void LibcRequestShutdown_nid_postfix() {
     shutdownSource.request_stop();
 }
 
+// The host asks the process to end (its window closed). A console ends a closed application
+// without running its exit handlers, and the title's own threads are still running, so the
+// emulator's shutdown callbacks (GPU queues, presentation, pipeline cache) run, stdio is flushed,
+// and the process ends with _Exit: the title's atexit handlers and its modules' static destructors
+// do not run (a sound library's destructor spins forever waiting for threads that are still
+// working). A title calling exit() itself keeps the full exit sequence (LibcExit). When the
+// shutdown callbacks take longer than ExitShutdownMillis, the process ends anyway.
+constexpr auto ExitShutdownMillis = std::chrono::milliseconds(5000);
+
 extern "C" void LibcRequestExit_nid_postfix(int code) {
     if (exitRequested.exchange(true)) return;
     LibcRequestShutdown_nid_postfix();
-    std::thread([code] { LibcExit_nid_no_patch(code); }).detach();
+    std::thread([code] {
+        std::this_thread::sleep_for(ExitShutdownMillis);
+        std::fprintf(stderr, "[libc] shutdown took longer than %lld ms after the window closed; ending the process\n", static_cast<long long>(ExitShutdownMillis.count()));
+        std::fflush(nullptr);
+        LibcTerminate_nid_no_patch(code);
+    }).detach();
+    std::thread([code] {
+        if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
+        try {
+            LibcRunShutdown_nid_postfix();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[libc] shutdown after the window closed failed: %s\n", error.what());
+        } catch (...) {
+            std::fprintf(stderr, "[libc] shutdown after the window closed failed\n");
+        }
+        std::fflush(nullptr);
+        LibcTerminate_nid_no_patch(code);
+    }).detach();
 }
 
 extern "C" [[noreturn]] void LibcAwaitExit_nid_postfix() {
