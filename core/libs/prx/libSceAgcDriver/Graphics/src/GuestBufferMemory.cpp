@@ -31,6 +31,7 @@
 #include <bit>
 #include <condition_variable>
 #include <iterator>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
@@ -156,6 +157,12 @@ struct HostImports {
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
     std::map<VkDevice, std::vector<std::shared_ptr<RetiredImport>>> parked;
+    struct Grave {
+        const Recorder* recorder;
+        std::uint64_t serial;
+        std::shared_ptr<RetiredImport> holder;
+    };
+    std::deque<Grave> graveyard;
     std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
     std::set<std::uint64_t> unaliasedSpans;
@@ -212,13 +219,22 @@ struct RetiredImport {
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
+void sweepRetiredImports(HostImports& state) {
+    const auto* recorder = Recorder::Active();
+    std::erase_if(state.graveyard, [recorder](const HostImports::Grave& grave) { return grave.recorder == recorder && recorder->BatchFinished(grave.serial); });
+}
+
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, it->second);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    sweepRetiredImports(state);
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        state.graveyard.push_back({recorder, recorder->OpenSerial() + 1u, holder});
+        if (!recorder->Idle()) recorder->Keep(std::move(holder));
+    }
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
@@ -781,6 +797,8 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
             GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
         }
+        for (auto& grave : state.graveyard) state.parked[grave.holder->device].push_back(std::move(grave.holder));
+        state.graveyard.clear();
         state.imports.clear();
         state.liveBytes = 0;
         state.failed.clear();
@@ -1743,6 +1761,7 @@ void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);
+    std::erase_if(state.graveyard, [device](const HostImports::Grave& grave) { return grave.holder->device == device; });
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
         state.destroyBuffer(state.device, entry.buffer, nullptr);
