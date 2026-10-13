@@ -192,7 +192,7 @@ static void QueuePadGrain(AudioOut2Context& context) {
     const auto queuedBytes = SDL_GetQueuedAudioSize(context.padDevice);
     if (queuedBytes > mainQueuedBytes + PAD_SLACK_GRAINS * grainBytes) return;
     if (queuedBytes == 0) {
-        static const std::vector<float> silence(static_cast<std::size_t>(CUSHION_MS) * AUDIO_OUT2_SAMPLE_RATE / 1000 * AUDIO_OUT2_PAD_DEVICE_CHANNELS_MAX, 0.0f);
+        static const std::vector<float>& silence = *new std::vector<float>(static_cast<std::size_t>(CUSHION_MS) * AUDIO_OUT2_SAMPLE_RATE / 1000 * AUDIO_OUT2_PAD_DEVICE_CHANNELS_MAX, 0.0f);
         SDL_QueueAudio(context.padDevice, silence.data(), cushionBytes);
     }
     SDL_QueueAudio(context.padDevice, context.padFrames.data(), grainBytes);

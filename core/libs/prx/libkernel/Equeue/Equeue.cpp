@@ -10,8 +10,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
-static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
-static std::mutex g_equeueMutex;
+static std::unordered_map<KernelEqueue, KernelEqueueRef>& g_equeues = *new std::unordered_map<KernelEqueue, KernelEqueueRef>();
+static std::mutex& g_equeueMutex = *new std::mutex();
 static uint64_t g_nextEqueue = 1;
 
 extern "C" {

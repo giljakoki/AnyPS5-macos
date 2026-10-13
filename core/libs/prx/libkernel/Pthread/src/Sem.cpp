@@ -11,7 +11,7 @@ namespace {
 
 constexpr int sceBusy = static_cast<int>(0x80020010u);
 constexpr int sceTimedOut = static_cast<int>(0x8002003cu);
-std::mutex semInitializationMutex;
+std::mutex& semInitializationMutex = *new std::mutex();
 
 PthreadSem destroyedSem() {
     return reinterpret_cast<PthreadSem>(std::uintptr_t{2});

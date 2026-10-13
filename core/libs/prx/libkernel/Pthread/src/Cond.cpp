@@ -17,7 +17,7 @@
 namespace {
 
 constexpr int sceTimedOut = static_cast<int>(0x8002003cu);
-std::mutex condInitializationMutex;
+std::mutex& condInitializationMutex = *new std::mutex();
 
 PthreadCond destroyedCond() {
     return reinterpret_cast<PthreadCond>(std::uintptr_t{2});

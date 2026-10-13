@@ -51,8 +51,8 @@ struct AddressWaiter {
     bool woken = false;
 };
 
-std::mutex g_waitersLock;
-std::unordered_map<std::uintptr_t, std::list<AddressWaiter*>> g_waiters;
+std::mutex& g_waitersLock = *new std::mutex();
+std::unordered_map<std::uintptr_t, std::list<AddressWaiter*>>& g_waiters = *new std::unordered_map<std::uintptr_t, std::list<AddressWaiter*>>();
 
 template <class TValue>
 bool IsAlignedAddress(std::uintptr_t address) {

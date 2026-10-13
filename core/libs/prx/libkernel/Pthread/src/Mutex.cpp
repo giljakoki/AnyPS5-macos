@@ -15,7 +15,7 @@ constexpr int sceNotPermitted = static_cast<int>(0x80020001u);
 constexpr int sceDeadlock = static_cast<int>(0x8002000bu);
 constexpr int sceBusy = static_cast<int>(0x80020010u);
 constexpr int sceTimedOut = static_cast<int>(0x8002003cu);
-std::mutex initializationMutex;
+std::mutex& initializationMutex = *new std::mutex();
 
 PthreadMutex destroyedMutex() {
     return reinterpret_cast<PthreadMutex>(std::uintptr_t{2});

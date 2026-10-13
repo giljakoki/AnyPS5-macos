@@ -27,7 +27,7 @@ struct ThreadValue {
     std::uint64_t sequence = FREE_KEY;
 };
 
-static std::mutex g_keyLock;
+static std::mutex& g_keyLock = *new std::mutex();
 static std::array<KeySlot, MAX_KEYS> g_keys;
 static std::uint64_t g_lastSequence = FREE_KEY;
 

@@ -81,9 +81,9 @@ static GuestThreadState& CurrentGuestState() {
     return state;
 #endif
 }
-static std::mutex stackLock;
-static std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>> liveStacks;
-static std::map<std::uintptr_t, std::size_t> protectedStackPages;
+static std::mutex& stackLock = *new std::mutex();
+static std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>>& liveStacks = *new std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>>();
+static std::map<std::uintptr_t, std::size_t>& protectedStackPages = *new std::map<std::uintptr_t, std::size_t>();
 
 static bool HostStackLimits(std::uintptr_t* low, std::uintptr_t* high) {
 #ifdef _WIN32

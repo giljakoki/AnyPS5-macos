@@ -42,7 +42,7 @@ std::atomic<GuestHandler> handlers[MaxSignal + 1]{};
 static_assert(std::atomic<GuestHandler>::is_always_lock_free);
 std::atomic<std::uint32_t> blockedMask{0};
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
-std::mutex registration;
+std::mutex& registration = *new std::mutex();
 GuestSigaction dispositions[MaxSignal + 1]{};
 int NativeSignal(int guest) {
     switch (guest) {
