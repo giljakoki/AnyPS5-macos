@@ -543,6 +543,11 @@ struct Events {
         return std::any_of(received.begin(), received.end(), [&](const auto& event) { return event.first == id && event.second == warning; });
     }
 
+    int Count(std::int32_t id, std::int32_t warning = 0) {
+        std::lock_guard lock(mutex);
+        return static_cast<int>(std::count_if(received.begin(), received.end(), [&](const auto& event) { return event.first == id && event.second == warning; }));
+    }
+
     void Clear() {
         std::lock_guard lock(mutex);
         received.clear();
@@ -1154,6 +1159,48 @@ void TestEofStopLatency() {
     Check(median < std::chrono::milliseconds(10), "eof stop median " + std::to_string(medianMs) + " ms exceeds 10 ms");
 }
 
+void TestLoopingBackFollowsPresentation() {
+    Events events;
+    AvPlayerInitData init = InitData(&events);
+    auto* player = sceAvPlayerInit(&init);
+    Check(player != nullptr, "looping init failed");
+    AvPlayerPostInitData post{};
+    post.demux_video_buffer_size = 64 * 1024;
+    Check(sceAvPlayerPostInit(player, &post) == 0, "looping post init failed");
+    Check(sceAvPlayerAddSource(player, "/app0/avplayer.mp4") == 0, "looping add source failed");
+    Check(WaitFor([&] { return events.Seen(EventReady); }), "looping ready event missing");
+    Check(sceAvPlayerEnableStream(player, VideoStream) == 0, "looping enable video failed");
+    Check(sceAvPlayerSetLooping(player, 1) == 0, "looping rejected");
+    Check(sceAvPlayerStart(player) == 0, "looping start failed");
+    AvPlayerFrameInfoEx frame{};
+    Check(WaitFor([&] { return sceAvPlayerGetVideoDataEx(player, &frame) != 0; }), "looping first frame missing");
+    CheckVideoFrame(frame);
+    Check(sceAvPlayerPause(player) == 0, "looping pause failed");
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    Check(events.Count(EventWarning, LoopingBack) == 0, "looping reported " + std::to_string(events.Count(EventWarning, LoopingBack)) + " times before playback wrapped");
+    Check(sceAvPlayerResume(player) == 0, "looping resume failed");
+    std::uint64_t last = frame.timestamp;
+    bool wrapped = false;
+    Check(WaitFor([&] {
+        if (sceAvPlayerGetVideoDataEx(player, &frame)) {
+            CheckVideoFrame(frame);
+            if (frame.timestamp < last) {
+                wrapped = true;
+            } else {
+                Check(events.Count(EventWarning, LoopingBack) == 0, "looping reported before the frame at " + std::to_string(frame.timestamp) + " ms wrapped");
+            }
+            last = frame.timestamp;
+        }
+        return wrapped;
+    }), "looping never wrapped");
+    Check(WaitFor([&] { return events.Count(EventWarning, LoopingBack) >= 1; }, 500), "looping warning missing after the wrap");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Check(events.Count(EventWarning, LoopingBack) == 1, "one wrap reported " + std::to_string(events.Count(EventWarning, LoopingBack)) + " times");
+    Check(sceAvPlayerClose(player) == 0, "looping close failed");
+    std::lock_guard lock(allocations.mutex);
+    Check(allocations.blocks.empty(), "looping allocations leaked");
+}
+
 }
 
 int main() {
@@ -1170,6 +1217,7 @@ int main() {
         TestAutoStartKeepsStartedPlayback();
         TestUnsyncedVideoKeepsUpWithAudio();
         TestEofStopLatency();
+        TestLoopingBackFollowsPresentation();
         std::puts("AvPlayer tests passed");
         return 0;
     } catch (const std::exception& error) {

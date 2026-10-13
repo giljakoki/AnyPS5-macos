@@ -432,22 +432,26 @@ public:
 
     bool GetVideoData(AvPlayerFrameInfoEx& info) override {
         bool taken = false;
+        bool wrapped = false;
         {
             std::lock_guard lock(mutex);
-            taken = takeVideo(info);
+            taken = takeVideo(info, wrapped);
         }
         condition.notify_all();
+        if (wrapped) events.OnWarning(SCE_AVPLAYER_ERROR_WAR_LOOPING_BACK);
         return taken;
     }
 
     bool GetAudioData(AvPlayerFrameInfo& info) override {
         AvPlayerFrameInfoEx extended{};
         bool taken = false;
+        bool wrapped = false;
         {
             std::lock_guard lock(mutex);
-            taken = takeAudio(extended);
+            taken = takeAudio(extended, wrapped);
         }
         condition.notify_all();
+        if (wrapped) events.OnWarning(SCE_AVPLAYER_ERROR_WAR_LOOPING_BACK);
         if (!taken) return false;
         info = {};
         info.p_data = static_cast<std::uint8_t*>(extended.p_data);
@@ -496,7 +500,7 @@ private:
         return duration != 0 ? std::min(milliseconds, duration) : milliseconds;
     }
 
-    bool takeVideo(AvPlayerFrameInfoEx& info) {
+    bool takeVideo(AvPlayerFrameInfoEx& info, bool& wrapped) {
         if (!started || video.stream < 0 || speed < 0) return false;
         if (speed != NormalSpeed) dropLateAudio();
         auto& frames = video.frames;
@@ -510,6 +514,7 @@ private:
             if (synced && audioDriving && speed == NormalSpeed) return false;
             if (synced && front.seamless && presented && presentationClock.Now() < static_cast<double>(lastPresented + frameDuration())) return false;
             presentationClock.Rebase(static_cast<double>(front.info.timestamp));
+            wrapped = front.seamless;
             clockEpoch = front.epoch;
         }
         if (synced || audioDriving) {
@@ -523,12 +528,13 @@ private:
         return true;
     }
 
-    bool takeAudio(AvPlayerFrameInfoEx& info) {
+    bool takeAudio(AvPlayerFrameInfoEx& info, bool& wrapped) {
         if (!started || paused || audio.stream < 0 || speed != NormalSpeed) return false;
         auto& frames = audio.frames;
         while (!frames.empty() && frames.front().epoch < minEpoch) recycleFront(audio);
         if (frames.empty()) return false;
         const auto epoch = frames.front().epoch;
+        wrapped = epoch > clockEpoch && frames.front().seamless;
         present(audio, info);
         audioDriving = true;
         clockEpoch = std::max(clockEpoch, epoch);
@@ -790,7 +796,6 @@ private:
                         pushAll(PacketKind::Drain, demuxEpoch, 0);
                     }
                     condition.notify_all();
-                    events.OnWarning(SCE_AVPLAYER_ERROR_WAR_LOOPING_BACK);
                     continue;
                 }
                 {
@@ -993,12 +998,19 @@ private:
         }
         std::uint64_t epoch = 0;
         std::uint64_t skipBefore = 0;
+        bool seamless = false;
         {
             std::lock_guard lock(mutex);
             epoch = decoder.epoch;
             skipBefore = decoder.skipBefore;
+            seamless = decoder.seamless;
+            decoder.seamless = false;
         }
-        if (timestamp + static_cast<std::uint64_t>(frame.nb_samples) * 1000 / static_cast<std::uint64_t>(frame.sample_rate) <= skipBefore) return true;
+        if (timestamp + static_cast<std::uint64_t>(frame.nb_samples) * 1000 / static_cast<std::uint64_t>(frame.sample_rate) <= skipBefore) {
+            std::lock_guard lock(mutex);
+            decoder.seamless = seamless;
+            return true;
+        }
         if (!resampler || resamplerFormat != frame.format || resamplerRate != frame.sample_rate || av_channel_layout_compare(&resamplerLayout, &frame.ch_layout) != 0) {
             swr_free(&resampler);
             av_channel_layout_uninit(&resamplerLayout);
@@ -1024,7 +1036,7 @@ private:
             if (const auto acquired = acquireBuffer(decoder, epoch, buffer); acquired != Acquire::Buffer) return acquired == Acquire::Stale;
             const auto size = static_cast<std::uint32_t>(samples * channels * static_cast<int>(sizeof(std::int16_t)));
             std::memcpy(buffer, sampleBuffer.data() + static_cast<std::size_t>(offset) * static_cast<std::size_t>(channels), size);
-            Frame chunk{buffer, {}, epoch, false};
+            Frame chunk{buffer, {}, epoch, seamless && offset == 0};
             chunk.info.p_data = buffer;
             chunk.info.timestamp = timestamp + static_cast<std::uint64_t>(offset) * 1000 / static_cast<std::uint64_t>(frame.sample_rate);
             chunk.info.details.audio.channel_count = static_cast<std::uint16_t>(channels);
