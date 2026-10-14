@@ -242,6 +242,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.narrowSubgroupClock = target.narrowSubgroupClock;
     state.float64DenormPreserve = target.float64DenormPreserve;
     state.float64AsFloat32 = target.float64AsFloat32;
+    state.relaxedFloat = target.relaxedFloat;
     state.stageSubgroups = target.stageSubgroups;
     state.hostSubgroupSize = target.subgroupSize;
     state.splitSubgroup = program.WaveSize() == 32u && target.subgroupSize > 32u;

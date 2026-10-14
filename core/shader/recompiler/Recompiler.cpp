@@ -519,6 +519,10 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
     targetOptions.float64AsFloat32 = request.target.float64AsFloat32;
+    {
+        const auto hostStage = HostStage(request);
+        targetOptions.relaxedFloat = request.target.relaxedFloat && (hostStage == ShaderStage::Fragment || hostStage == ShaderStage::Compute);
+    }
     targetOptions.stageSubgroups = StageHasSubgroups(request.target, HostStage(request));
 
     constexpr SpirvEmitter spirvEmitter;
