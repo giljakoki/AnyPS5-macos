@@ -82,7 +82,7 @@ void AppendDraw(std::vector<std::uint32_t>& commands) {
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
         {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 4u << 1u},
         {0x8c, static_cast<std::uint32_t>(vertices)}, {0x8d, static_cast<std::uint32_t>((vertices >> 32u) & 0xffffu) | (16u << 16u)}, {0x8e, 3}, {0x8f, 0x01016facu},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 1u << 1u}, {0x00c, std::bit_cast<std::uint32_t>(1.0f)},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 1u << 1u}, {0x00c, std::bit_cast<std::uint32_t>(0.5f)},
     };
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
@@ -108,6 +108,16 @@ void Submit(std::vector<std::uint32_t>& commands) {
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "pipelined order: the submission failed");
     AgcDriverWaitIdle_nid_postfix();
+}
+
+// Pixels with the draw's color: red and alpha from the pixel shader's user data (0.5).
+std::size_t DrawnPixels() {
+    std::size_t drawn = 0;
+    const auto half = [](std::byte value) { return std::to_integer<std::uint8_t>(value) == 127u || std::to_integer<std::uint8_t>(value) == 128u; };
+    for (std::size_t at = 0; at < ColorMemory.size(); at += 4) {
+        if (half(ColorMemory[at]) && half(ColorMemory[at + 3])) ++drawn;
+    }
+    return drawn;
 }
 
 std::size_t WordsEqualTo(std::uint32_t pattern) {
@@ -143,6 +153,16 @@ int main() {
             AgcDriverShutdown_nid_postfix();
             return VulkanTestSkipped;
         }
+
+        // Many draws in one submission, each a fresh pipelined commit: every one must draw with its
+        // own program and user data (the commit owns them), not freed or reused ones.
+        std::vector<std::uint32_t> manyDraws;
+        for (int draw = 0; draw < 64; ++draw) AppendDraw(manyDraws);
+        ColorMemory.fill(std::byte{0});
+        Submit(manyDraws);
+        std::uint32_t firstWord = 0;
+        std::memcpy(&firstWord, ColorMemory.data(), 4);
+        Require(DrawnPixels() == words, "pipelined order: 64 draws left " + std::to_string(words - DrawnPixels()) + " of " + std::to_string(words) + " pixels without the draws' color (first pixel 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", firstWord); return std::string(text); }() + ")");
 
         // Draws, then a fill of the same bytes in the same submission: with the pipeline on, the draws
         // are still queued when the fill packet is reached, and the fill must land after them.
