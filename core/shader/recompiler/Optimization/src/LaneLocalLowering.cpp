@@ -153,6 +153,7 @@ private:
     void rewriteThreadBits();
 
     void rewriteUniformLaneReads();
+    void rewriteOneLaneWave();
 
     struct Construct {
         std::size_t header = 0;
@@ -493,6 +494,44 @@ void Lowering::rewriteUniformLaneReads() {
                 if (lane->HasImmediate() && lane->ImmediateU32() >= lanes) continue;
             }
             inst->ReplaceUsesWith(source, true);
+        }
+    }
+}
+
+void Lowering::rewriteOneLaneWave() {
+    if (lanes != 1u) return;
+    for (IrBlock* block : program.BlockOrder()) {
+        const std::vector<IrValue*> instructions(block->Instructions().begin(), block->Instructions().end());
+        for (IrValue* inst : instructions) {
+            switch (inst->Opcode()) {
+            case IrOpcode::Ballot: {
+                if (!inst->HasUses()) break;
+                IrValue& own = program.CreateValue(IrOpcode::SelectU32, IrType::U32);
+                own.AddArgument(inst->Argument(0));
+                own.AddArgument(&builder.Constant(1u));
+                own.AddArgument(&builder.Constant(0u));
+                IrValue& bits = program.CreateValue(IrOpcode::CompositeConstructU32x4, IrType::U32x4);
+                bits.AddArgument(&own);
+                for (int word = 0; word < 3; ++word) bits.AddArgument(&builder.Constant(0u));
+                block->InsertInstructionBefore(inst, &own);
+                block->InsertInstructionBefore(inst, &bits);
+                inst->ReplaceUsesWith(&bits, true);
+                break;
+            }
+            case IrOpcode::LaneId:
+                inst->ReplaceUsesWith(&builder.Constant(0u), true);
+                break;
+            case IrOpcode::ReadFirstLane:
+                inst->ReplaceUsesWith(inst->Argument(0)->Resolve(), true);
+                break;
+            case IrOpcode::ReadLane: {
+                const IrValue* lane = inst->Argument(1)->Resolve();
+                if (lane->HasImmediate() && lane->ImmediateU32() == 0u) inst->ReplaceUsesWith(inst->Argument(0)->Resolve(), true);
+                break;
+            }
+            default:
+                break;
+            }
         }
     }
 }
@@ -1181,6 +1220,8 @@ std::vector<SubgroupUse> Lowering::describe() const {
 
 std::vector<SubgroupUse> Lowering::Run() {
     indexBlocks();
+    rewriteOneLaneWave();
+    cleanup();
     foldLaneIndexValues();
     cleanup();
     rewriteThreadBits();

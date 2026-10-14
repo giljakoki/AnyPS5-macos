@@ -1674,14 +1674,26 @@ void verifyStagesWithoutSubgroups() {
     const auto uniformRead = prepared(firstLane, 32u, 32u, withoutVertex, true);
     require(!uniformRead.empty() && subgroupWords(uniformRead) == 0u, "stages without subgroups: v_readfirstlane of a user data value kept subgroup operations");
     const char* refused = "needs subgroup operations, which the device does not support in vertex shaders (subgroup stages 0x32); exact lowering left:";
-    expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, refused, "stages without subgroups: s_bcnt1 of EXEC was accepted");
-    expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, "a ballot read as a value at 0x60000-0x", "stages without subgroups: s_bcnt1 of EXEC was not reported as a ballot read as a value");
+    const bool oneLaneFallback = std::getenv("APS5_NO_ONE_LANE_VERTEX") == nullptr;
+    if (oneLaneFallback) {
+        const auto oneLane = prepared(counted, 32u, 32u, withoutVertex);
+        require(!oneLane.empty() && subgroupWords(oneLane) == 0u, "stages without subgroups: s_bcnt1 of EXEC, which the exact lowering leaves, did not run as a one-lane wave without subgroup operations");
+    } else {
+        expectFailure([&] { static_cast<void>(prepared(counted, 32u, 32u, withoutVertex)); }, "a ballot read as a value at 0x60000-0x", "stages without subgroups: s_bcnt1 of EXEC was accepted without the one-lane fallback");
+    }
+    require(subgroupWords(prepared(counted, 32u, 32u, ~0u)) != 0u, "stages without subgroups: s_bcnt1 of EXEC on a device with vertex subgroups lost its subgroup operations");
+    expectFailure([&] { static_cast<void>(prepared(dpp, 32u, 32u, withoutVertex)); }, refused, "stages without subgroups: a DPP row shift was accepted by the one-lane wave");
     expectFailure([&] { static_cast<void>(prepared(scalarLeak, 32u, 32u, withoutVertex)); }, "a wave-mask branch whose region leaves a value that the skipped path does not have", "stages without subgroups: an execz region writing an SGPR read after the join was accepted");
     const auto perLane = prepared(waterfall, 32u, 32u, withoutVertex);
     require(!perLane.empty() && subgroupWords(perLane) == 0u, "stages without subgroups: a waterfall loop of v_readfirstlane, v_cmp_eq, s_and_saveexec and s_xor exec over a masked write kept subgroup operations");
     const auto relative = prepared(relativeWaterfall, 64u, 32u, withoutVertex);
     require(!relative.empty() && subgroupWords(relative) == 0u, "stages without subgroups: a wave64 waterfall loop of v_readfirstlane, v_cmpx_eq, v_movrels, s_andn2_b64 and s_cbranch_scc1 kept subgroup operations");
-    expectFailure([&] { static_cast<void>(prepared(escapingRead, 64u, 32u, withoutVertex)); }, "v_readfirstlane/v_readlane of a lane-varying value", "stages without subgroups: a waterfall loop whose v_readfirstlane result is read after the loop was accepted");
+    if (oneLaneFallback) {
+        const auto escaping = prepared(escapingRead, 64u, 32u, withoutVertex);
+        require(!escaping.empty() && subgroupWords(escaping) == 0u, "stages without subgroups: a waterfall loop whose v_readfirstlane result is read after the loop did not run as a one-lane wave without subgroup operations");
+    } else {
+        expectFailure([&] { static_cast<void>(prepared(escapingRead, 64u, 32u, withoutVertex)); }, "v_readfirstlane/v_readlane of a lane-varying value", "stages without subgroups: a waterfall loop whose v_readfirstlane result is read after the loop was accepted without the one-lane fallback");
+    }
     expectFailure([&] { static_cast<void>(prepared(dpp, 32u, 32u, withoutVertex)); }, "DPP at 0x60000-0x", "stages without subgroups: a DPP row shift was accepted");
     require(subgroupWords(prepared(waterfall, 32u, 32u, ~0u)) != 0u && subgroupWords(prepared(relativeWaterfall, 64u, 32u, ~0u)) != 0u, "stages without subgroups: a waterfall loop on a device with vertex subgroups lost its subgroup operations");
     require(!prepared(escapingRead, 64u, 32u, ~0u).empty() && !prepared(dpp, 32u, 32u, ~0u).empty(), "stages without subgroups: programs refused without vertex subgroups did not prepare with them");
@@ -3336,6 +3348,11 @@ void verifySrgbDepthCompareModes() {
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--stages-without-subgroups") {
+            verifyStagesWithoutSubgroups();
+            std::cout << "Vertex programs on a device without vertex subgroups passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";

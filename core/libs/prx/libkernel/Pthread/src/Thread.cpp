@@ -656,6 +656,8 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     if (created == 0) {
         sigset_t allSignals;
         sigfillset(&allSignals);
+        sigdelset(&allSignals, SIGSEGV);
+        sigdelset(&allSignals, SIGBUS);
         pthread_sigmask(SIG_BLOCK, &allSignals, nullptr);
         created = pthread_create(&p->hostThread, &nativeAttr, StartNativeThread, native.get());
         pthread_sigmask(SIG_SETMASK, &creatorMask, nullptr);
