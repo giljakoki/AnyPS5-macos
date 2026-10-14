@@ -1214,6 +1214,23 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     if (state->drawIndirectCount) deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    // MoltenVK on an Apple GPU synchronizes no resource for a host read (no managed storage when every
+    // host-visible memory type is coherent), yet walks them all per such global memory barrier.
+    {
+        bool coherent = true;
+        for (std::uint32_t i = 0; i < state->memoryProperties.memoryTypeCount; ++i) {
+            const auto flags = state->memoryProperties.memoryTypes[i].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) coherent = false;
+        }
+        bool moltenVk = false;
+        if (hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+            VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+            state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+            moltenVk = driver.driverID == VK_DRIVER_ID_MOLTENVK;
+        }
+        Graphics::SetHostReadBarriersInert(moltenVk && coherent && state->properties.vendorID == 0x106b);
+    }
     state->memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // Guest memory is host memory: importing it lets address-based shaders use it in place instead of
     // copying every registered allocation per draw.

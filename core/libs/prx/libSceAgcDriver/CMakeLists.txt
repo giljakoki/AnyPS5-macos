@@ -928,6 +928,8 @@ if(BUILD_TESTING)
     set_target_properties(agc_free_gate_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_free_gate COMMAND agc_free_gate_tests)
     set_tests_properties(agc_free_gate PROPERTIES ENVIRONMENT "APS5_FREE_GATE=1")
+    add_test(NAME agc_free_gate_keep_host_barriers COMMAND agc_free_gate_tests)
+    set_tests_properties(agc_free_gate_keep_host_barriers PROPERTIES ENVIRONMENT "APS5_FREE_GATE=1;APS5_KEEP_HOST_BARRIERS=1")
     if(WIN32)
         set_tests_properties(agc_free_gate PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
