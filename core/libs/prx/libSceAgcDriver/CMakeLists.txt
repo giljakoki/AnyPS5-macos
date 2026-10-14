@@ -864,6 +864,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_storage_baseline_settled PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_registered_covers COMMAND agc_driver_recorder_tests --registered-covers-only)
     add_test(NAME agc_host_import_unmap COMMAND agc_driver_recorder_tests --host-import-unmap-only)
     set_tests_properties(agc_host_import_unmap PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_gpu_free_defer COMMAND agc_driver_recorder_tests --gpu-free-defer-only)

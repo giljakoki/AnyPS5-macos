@@ -2720,6 +2720,33 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     recorder.Sync();
 }
 
+void registeredCoverTests() {
+    constexpr std::size_t piece = 65536;
+    void* block = std::aligned_alloc(65536, 4 * piece);
+    Require(block != nullptr, "cannot allocate the registry block");
+    auto* first = static_cast<std::byte*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(first, piece, true, true, true);
+        mutation.Add(first + piece, piece, true, true, true);
+        mutation.Add(first + 2 * piece, piece, false, false, false);
+    }
+    Require(RegisteredReadableCovers(address, piece) && RegisteredReadableCovers(address + 100, 200) && RegisteredReadableCovers(address + piece, piece), "a range inside one readable registration was not covered");
+    Require(!RegisteredReadableCovers(address + piece - 16, 32), "a range across two registrations was covered");
+    Require(!RegisteredReadableCovers(address + 2 * piece, 16) && !RegisteredReadableCovers(address + 3 * piece, 16), "an unreadable or unregistered range was covered");
+    Require(RegisteredReadableEnd(address + 5) == address + piece && RegisteredReadableEnd(address + piece) == address + 2 * piece, "a readable registration ended elsewhere");
+    Require(RegisteredReadableEnd(address + 2 * piece + 5) == 0 && RegisteredReadableEnd(address + 3 * piece) == 0, "an unreadable or unregistered address had an end");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(first);
+        mutation.Remove(first + piece);
+        mutation.Remove(first + 2 * piece);
+    }
+    std::free(block);
+    std::cout << "registered readable coverage: ok\n";
+}
+
 void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -6199,6 +6226,10 @@ int main(int argc, char** argv) {
             lateLabelTests(recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--registered-covers-only") {
+            registeredCoverTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-unmap-only") {
