@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -130,6 +132,27 @@ std::size_t WordsEqualTo(std::uint32_t pattern) {
     return equal;
 }
 
+// Every committed item, a fill or a label as well as a draw, runs in the collect epoch the worker
+// was in when it queued it: an epoch bump between two items gives the second a new epoch on the
+// committer, and items queued in one epoch share one.
+void CommitsFollowTheWorkersEpoch() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    if (DrawPipeline::Depth() == 0) return;
+    auto& pipeline = DrawPipeline::Queue0();
+    std::array<std::uint64_t, 3> seen{};
+    const auto queue = [&](std::size_t slot, DrawPipeline::Kind kind) {
+        pipeline.Enqueue([&seen, slot] { seen[slot] = AgcDriver::GuestMemory::CollectEpoch(); }, {}, 0, {}, kind);
+    };
+    queue(0, DrawPipeline::Kind::Fill);
+    queue(1, DrawPipeline::Kind::Label);
+    DrawPipeline::EpochToken().fetch_add(1);
+    queue(2, DrawPipeline::Kind::Fill);
+    pipeline.Drain(DrawPipeline::DrainReason::Submission);
+    if (seen[0] == 0) return;
+    Require(seen[0] == seen[1], "pipelined order: two items queued in one epoch were committed in different collect epochs");
+    Require(seen[2] != seen[1], "pipelined order: a fill queued after an epoch bump was committed in the epoch before it");
+}
+
 }
 
 int main() {
@@ -138,6 +161,7 @@ int main() {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
+        CommitsFollowTheWorkersEpoch();
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         constexpr std::uint32_t Before = 0x11223344u, After = 0x5a5a5a5au;

@@ -189,9 +189,13 @@ void Driver::execute(const Submission& submission) {
         }
     } hitchReport{hitches, hitchSampler, hitchWork};
 
-    static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
-    if (!pipelined || epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
-        if (pipelined && !epochEach) noteReleasedTails(submission);
+    // Every submission starts a collect epoch, pipelined or not: the epoch-gated proofs of the
+    // committer (a repeated resident target, a storage image reused from its baseline) must not span
+    // the guest's CPU writes between submissions. APS5_SUBMISSION_EPOCH_KEEP=1 keeps the epoch of a
+    // submission made before the current one began, as the pipelined path first did.
+    static const bool epochKeep = std::getenv("APS5_SUBMISSION_EPOCH_KEEP") != nullptr && std::getenv("APS5_SUBMISSION_EPOCH_EACH") == nullptr;
+    if (!pipelined || !epochKeep || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
+        if (pipelined && epochKeep) noteReleasedTails(submission);
         bumpEpoch(&EpochBumps::submissions);
     }
     clearResolvedAhead();
@@ -222,6 +226,8 @@ void Driver::execute(const Submission& submission) {
             const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
             if (const auto value = DrawPipeline::Queue0().PendingLabel(awaited, Pm4::WaitAwaitedBytes(packet)); value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 ++waitOutcomes().fromRecorderSameQueue;
+                // A wait ends an epoch as waitMemory's own label-history path does.
+                bumpEpoch(&EpochBumps::waits);
                 gateOpened() = true;
                 recent.Record(cursor);
                 cursor = nextCursor;

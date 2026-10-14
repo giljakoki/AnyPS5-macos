@@ -164,7 +164,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, EpochToken().load(std::memory_order_relaxed)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) thread = std::thread([this] { run(); });
     if (committerWaiting) wake.notify_one();
@@ -214,6 +214,7 @@ void DrawPipeline::run() {
     for (;;) {
         Commit* commit = nullptr;
         Kind kind = Kind::Draw;
+        std::uint64_t epoch = 0;
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
@@ -221,7 +222,10 @@ void DrawPipeline::run() {
             committerWaiting = false;
             commit = &items.front().commit;
             kind = items.front().kind;
+            epoch = items.front().epoch;
         }
+        // Every item, not only draws, runs in the collect epoch the worker was in when it queued it.
+        FollowEpoch(epoch);
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;

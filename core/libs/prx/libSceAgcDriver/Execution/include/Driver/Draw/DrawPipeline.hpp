@@ -46,6 +46,7 @@ private:
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
         Kind kind = Kind::Draw;
+        std::uint64_t epoch = 0;
     };
     DrawPipeline() = default;
     void run();
