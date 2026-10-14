@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -52,7 +53,11 @@ public:
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::span<const std::uint8_t> persistent = {}, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
+    struct AttachmentClear {
+        std::uint32_t attachment = 0;
+        VkClearColorValue value{};
+    };
+    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, std::span<const AttachmentClear> clears = {}) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
     void Continue(VkCommandBuffer commands, const State& state) const;
@@ -74,6 +79,7 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
+    VkRenderPass clearingPass(std::uint32_t clearedColors) const;
     void setLibraryState(VkCommandBuffer commands, const State& state) const;
     Context context;
     std::vector<VkShaderModule> _modules;
@@ -93,6 +99,11 @@ private:
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
     std::vector<CachedFramebuffer> framebuffers;
+    std::vector<VkAttachmentDescription> passAttachments;
+    std::vector<VkAttachmentReference> passColorReferences;
+    bool passDepth = false;
+    mutable std::mutex clearingPassesMutex;
+    mutable std::vector<std::pair<std::uint32_t, VkRenderPass>> clearingPasses;
 };
 
 // The pipeline for this configuration, shared across draws and frames: keyed by the stages' variant

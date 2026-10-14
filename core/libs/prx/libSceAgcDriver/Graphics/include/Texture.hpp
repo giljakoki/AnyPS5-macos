@@ -591,6 +591,7 @@ private:
     void startBaseline(bool keepProof);
     void dropOriginal(const char* reason);
     bool clearFilled(Recorder& recorder, std::uint32_t word);
+    void recordColorClear(Recorder& recorder, const VkClearColorValue& value, std::uint32_t layer, std::uint64_t bytes);
     bool inFlightOverlaps(std::uint64_t begin, std::uint64_t end) const;
     bool staleOverlaps(std::uint64_t begin, std::uint64_t end) const;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so

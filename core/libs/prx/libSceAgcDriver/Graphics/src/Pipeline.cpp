@@ -412,7 +412,12 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         passInfo.pAttachments = colors.empty() ? nullptr : colors.data();
         passInfo.subpassCount = 1;
         passInfo.pSubpasses = &subpass;
-        if (!dynamicRendering) Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &renderPass), "vkCreateRenderPass");
+        if (!dynamicRendering) {
+            Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &renderPass), "vkCreateRenderPass");
+            passAttachments = colors;
+            passColorReferences = references;
+            passDepth = state.depth.has_value();
+        }
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         input.vertexBindingDescriptionCount = static_cast<std::uint32_t>(vertexInput.bindings.size());
         input.pVertexBindingDescriptions = vertexInput.bindings.data();
@@ -545,6 +550,8 @@ void Pipeline::release() noexcept {
     if (backFaces) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, backFaces, nullptr);
     if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, nullptr);
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
+    for (const auto& [mask, pass] : clearingPasses) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, pass, nullptr);
+    clearingPasses.clear();
     if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
     for (auto module : _modules) {
         if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
@@ -562,6 +569,7 @@ void Pipeline::Abandon() noexcept {
     optimized.reset();
     for (auto& entry : framebuffers) entry.framebuffer->Abandon();
     framebuffers.clear();
+    clearingPasses.clear();
     pipeline = VK_NULL_HANDLE;
     backFaces = VK_NULL_HANDLE;
     secondChannel = VK_NULL_HANDLE;
@@ -622,7 +630,34 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+VkRenderPass Pipeline::clearingPass(std::uint32_t clearedColors) const {
+    std::lock_guard lock(clearingPassesMutex);
+    for (const auto& [mask, pass] : clearingPasses) {
+        if (mask == clearedColors) return pass;
+    }
+    auto described = passAttachments;
+    for (std::uint32_t index = 0; index < colorAttachments; ++index) {
+        if ((clearedColors & (1u << index)) != 0) described[index].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    }
+    const VkAttachmentReference depthReference{static_cast<std::uint32_t>(colorAttachments), VK_IMAGE_LAYOUT_GENERAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = static_cast<std::uint32_t>(passColorReferences.size());
+    subpass.pColorAttachments = passColorReferences.empty() ? nullptr : passColorReferences.data();
+    if (passDepth) subpass.pDepthStencilAttachment = &depthReference;
+    VkRenderPassCreateInfo passInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    passInfo.attachmentCount = static_cast<std::uint32_t>(described.size());
+    passInfo.pAttachments = described.empty() ? nullptr : described.data();
+    passInfo.subpassCount = 1;
+    passInfo.pSubpasses = &subpass;
+    VkRenderPass created = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &created), "vkCreateRenderPass clearing");
+    clearingPasses.emplace_back(clearedColors, created);
+    return created;
+}
+
+void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, std::span<const AttachmentClear> clears) const {
+    for (const auto& clear : clears) Require(clear.attachment < colorAttachments, "a cleared attachment is not a color attachment of the pipeline");
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -633,6 +668,11 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
             colors[slot].imageLayout = attachmentLayout;
             colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            for (const auto& clear : clears) {
+                if (clear.attachment != colorSlots[slot]) continue;
+                colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                colors[slot].clearValue.color = clear.value;
+            }
         }
         VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
         if (depthFormat != VK_FORMAT_UNDEFINED) {
@@ -656,6 +696,18 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     begin.renderPass = renderPass;
     begin.framebuffer = framebuffer.Handle();
     begin.renderArea = {{0, 0}, extent};
+    std::vector<VkClearValue> clearValues;
+    if (!clears.empty()) {
+        std::uint32_t cleared = 0;
+        clearValues.resize(passAttachments.size());
+        for (const auto& clear : clears) {
+            cleared |= 1u << clear.attachment;
+            clearValues[clear.attachment].color = clear.value;
+        }
+        begin.renderPass = clearingPass(cleared);
+        begin.clearValueCount = static_cast<std::uint32_t>(clearValues.size());
+        begin.pClearValues = clearValues.data();
+    }
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
     Continue(commands, state);
 }
