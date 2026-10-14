@@ -269,7 +269,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         DrawPipeline::Queue0().Enqueue([this, queue, address, bytes = std::move(bytes)] {
             GuestMemory::SetCurrentPacket(0x50, queue);
             commitDmaStore(queue, address, bytes);
-        }, {{address, address + size}});
+        }, {{address, address + size}}, 0, {}, DrawPipeline::Kind::Dma);
         return true;
     }
     const auto copy = Pm4::DecodeMemoryCopy(packet);
@@ -289,7 +289,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         std::vector<std::byte> bytes(copy.bytes);
         GuestMemory::Read(copy.source, bytes, 1);
         commitDmaStore(queue, copy.destination, bytes);
-    }, {{copy->destination, copy->destination + copy->bytes}});
+    }, {{copy->destination, copy->destination + copy->bytes}}, 0, {}, DrawPipeline::Kind::Dma);
     return true;
 }
 
@@ -321,7 +321,7 @@ void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::spa
 
 bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
     static const bool ordered = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_LABELS");
-    if (!ordered || !DeferLabels() || (opcode != 0x49 && opcode != 0x37)) return false;
+    if (!ordered || DrawPipeline::OrderedSuspended() || !DeferLabels() || (opcode != 0x49 && opcode != 0x37)) return false;
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     const bool endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
     const auto label = Pm4::DecodeLabelWrite(packet);
@@ -348,7 +348,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
         GuestMemory::SetCurrentPacket(opcode, queue);
         commitLabel(queue, address, bytes, endOfPipeInterrupt);
-    }, std::move(writes), address, std::move(stored));
+    }, std::move(writes), address, std::move(stored), DrawPipeline::Kind::Label);
     return true;
 }
 

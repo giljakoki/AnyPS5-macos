@@ -28,7 +28,7 @@ namespace {
 
 bool orderedFills() {
     static const bool ordered = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_FILLS");
-    return ordered;
+    return ordered && !DrawPipeline::OrderedSuspended();
 }
 
 bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
@@ -77,7 +77,8 @@ void Driver::execute(const Submission& submission) {
         ~FlipHold() { Release(); }
     } flipHold{*this, submission.holdsFlip};
     const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
-    static const bool orderedWaits = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_LABELS");
+    static const bool orderedWaitsConfigured = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_LABELS");
+    const bool orderedWaits = orderedWaitsConfigured && !DrawPipeline::OrderedSuspended();
     DrawPipeline::Active() = pipelined;
     struct PipelineDrain {
         bool pipelined;
@@ -89,7 +90,8 @@ void Driver::execute(const Submission& submission) {
             }
         }
     } pipelineDrain{pipelined};
-    static const bool orderedCompletion = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_SUBMISSIONS") && orderedWaits;
+    static const bool orderedCompletionConfigured = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_SUBMISSIONS");
+    const bool orderedCompletion = orderedCompletionConfigured && orderedWaits;
     if (pipelined && (submission.suspend || !orderedCompletion)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     if (submission.suspend) {
         PerformanceContext timingContext(submissionTiming);
@@ -481,7 +483,7 @@ void Driver::execute(const Submission& submission) {
             return;
         }
         if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
-            DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {});
+            DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {}, 0, {}, DrawPipeline::Kind::Submit);
             executeRewindTail(submission);
             return;
         }

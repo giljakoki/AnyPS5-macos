@@ -89,6 +89,7 @@ private:
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
     static bool& completionDeferred();
+    static const Submission*& dequeuedSubmission();
     void deferCompletion(const Submission& submission);
     void submitOpenWork();
     void completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites);

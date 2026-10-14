@@ -23,6 +23,7 @@ public:
     using Commit = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    enum class Kind : std::uint8_t { Draw, Fill, Label, Dma, Completion, Submit, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -30,8 +31,9 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static bool Ordered(const char* drainVariable);
+    static bool OrderedSuspended();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, Kind kind = Kind::Draw);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
@@ -43,11 +45,13 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        Kind kind = Kind::Draw;
     };
     DrawPipeline() = default;
     void run();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
+    void checkFootprint(std::chrono::steady_clock::time_point now);
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -67,6 +71,9 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::uint64_t depthSum = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(Kind::Count)> kindCommits{};
+    std::array<std::uint64_t, static_cast<std::size_t>(Kind::Count)> kindNs{};
+    std::chrono::steady_clock::time_point lastFootprintCheck{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

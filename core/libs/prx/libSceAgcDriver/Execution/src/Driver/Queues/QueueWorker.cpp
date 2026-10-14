@@ -58,6 +58,11 @@ bool& Driver::completionDeferred() {
     return deferred;
 }
 
+const Submission*& Driver::dequeuedSubmission() {
+    static thread_local const Submission* dequeued = nullptr;
+    return dequeued;
+}
+
 void Driver::deferCompletion(const Submission& submission) {
     std::uint64_t received = submission.received;
     {
@@ -65,10 +70,20 @@ void Driver::deferCompletion(const Submission& submission) {
         if (queue0Executing != 0) received = std::min(received, queue0Executing);
         queue0Uncommitted.push_back(received);
     }
+    // The label writes enqueue() counted are the dequeued submission's: a released REWIND tail ends
+    // the chain here with its own list, which nothing counted.
+    const auto* dequeued = dequeuedSubmission();
+    auto labelWrites = dequeued != nullptr ? dequeued->labelWrites : submission.labelWrites;
+    try {
+        DrawPipeline::Queue0().Enqueue([this, serial = submission.serial, received, labelWrites = std::move(labelWrites)] {
+            completeSubmission(serial, received, labelWrites);
+        }, {}, 0, {}, DrawPipeline::Kind::Completion);
+    } catch (...) {
+        std::lock_guard lock(mutex);
+        if (const auto found = std::find(queue0Uncommitted.begin(), queue0Uncommitted.end(), received); found != queue0Uncommitted.end()) queue0Uncommitted.erase(found);
+        throw;
+    }
     completionDeferred() = true;
-    DrawPipeline::Queue0().Enqueue([this, serial = submission.serial, received, labelWrites = submission.labelWrites] {
-        completeSubmission(serial, received, labelWrites);
-    }, {});
 }
 
 void Driver::submitOpenWork() {
@@ -241,7 +256,9 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             const auto traceExecuteStart = std::chrono::steady_clock::now();
+            dequeuedSubmission() = &submission;
             execute(submission);
+            dequeuedSubmission() = nullptr;
             if (Graphics::UploadTraceEnabled()) Graphics::UploadTrace("done serial=%llu queue=0x%x after %.1f ms on the worker", static_cast<unsigned long long>(submission.serial), id, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceExecuteStart).count());
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

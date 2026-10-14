@@ -140,6 +140,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto range = DecodePatternFillRange(userData, packet);
         if (!range) return false;
         if (range->invocations == 0) return true;
+        if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(range->control, 8)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         inputLock.lock();
         recordLabelsForPacket(localDevice.get(), queueId);
@@ -299,11 +300,14 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
     };
     static const bool orderedFills = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_FILLS");
-    if (orderedFills && queueId == 0 && DrawPipeline::Active()) {
+    if (orderedFills && !DrawPipeline::OrderedSuspended() && queueId == 0 && DrawPipeline::Active()) {
+        // The committer takes the GPU lock for the store: the pattern fill's control read must not
+        // keep it across the enqueue.
+        if (inputLock.owns_lock()) inputLock.unlock();
         DrawPipeline::Queue0().Enqueue([store, queueId] {
             GuestMemory::SetCurrentPacket(0x15, queueId);
             store();
-        }, {{base, base + bytes}});
+        }, {{base, base + bytes}}, 0, {}, DrawPipeline::Kind::Fill);
         return true;
     }
     store();

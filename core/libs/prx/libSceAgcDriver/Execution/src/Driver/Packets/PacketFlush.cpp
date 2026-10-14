@@ -53,7 +53,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (reap) lastReapTry = now;
     if (DrawPipeline::Active() && (submit || record || capped || recordAtLock)) {
         static const bool committerSubmits = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_LABELS");
-        if (committerSubmits && !record && !recordAtLock && DrawPipeline::Queue0().Busy()) return;
+        if (committerSubmits && !DrawPipeline::OrderedSuspended() && !record && !recordAtLock && DrawPipeline::Queue0().Busy()) return;
         DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush);
     }
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
