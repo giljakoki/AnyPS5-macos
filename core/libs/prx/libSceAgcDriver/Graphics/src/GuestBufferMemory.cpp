@@ -2213,13 +2213,13 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
     return containingRange(lease, address, address + bytes) != nullptr;
 }
 
 std::uint64_t RegisteredReadableEnd(std::uint64_t address) {
     if (address == std::numeric_limits<std::uint64_t>::max()) return 0;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(static_cast<std::uintptr_t>(address), 1);
     const auto* range = containingRange(lease, address, address + 1);
     return range != nullptr ? range->address + range->bytes : 0;
 }
