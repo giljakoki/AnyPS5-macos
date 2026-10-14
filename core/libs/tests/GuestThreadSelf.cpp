@@ -2,6 +2,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
+#include <signal.h>
+#include <time.h>
+#endif
 
 extern "C" {
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
@@ -52,6 +56,33 @@ static constexpr int PTHREAD_CANCEL_ASYNCHRONOUS = 2;
 static constexpr std::intptr_t WorkerRetval = 0x1234;
 
 static void Require(bool value) { if (!value) std::abort(); }
+
+#ifndef _WIN32
+static bool FaultSignalsOpen() {
+    sigset_t mask;
+    if (pthread_sigmask(SIG_SETMASK, nullptr, &mask) != 0) return false;
+    return sigismember(&mask, SIGSEGV) == 0 && sigismember(&mask, SIGBUS) == 0;
+}
+
+static void* APS5_VABI FaultSignalsWorker(void* arg) {
+    *static_cast<bool*>(arg) = FaultSignalsOpen();
+    return nullptr;
+}
+
+static void CheckFaultSignalsStayOpen() {
+    Require(FaultSignalsOpen());
+    for (int round = 0; round < 32; ++round) {
+        bool open = false;
+        Pthread thread = nullptr;
+        Require(scePthreadCreate(&thread, nullptr, FaultSignalsWorker, &open, nullptr) == SCE_OK);
+        Require(scePthreadJoin(thread, nullptr) == SCE_OK);
+        Require(open);
+    }
+    const timespec pause{0, 200'000'000};
+    nanosleep(&pause, nullptr);
+    Require(FaultSignalsOpen());
+}
+#endif
 
 static std::int64_t ThreadIdField(Pthread thread) {
     std::int64_t tid = 0;
@@ -144,5 +175,8 @@ int main() {
     pthread_set_name_np_nid_postfix(mainSelf, nullptr);
     Require(scePthreadGetname(mainSelf, name) == SCE_OK && name[0] == '\0');
     pthread_set_name_np_nid_postfix(nullptr, "ignored");
+#ifndef _WIN32
+    CheckFaultSignalsStayOpen();
+#endif
 
 }
