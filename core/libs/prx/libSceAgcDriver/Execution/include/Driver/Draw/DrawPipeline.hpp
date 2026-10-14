@@ -29,6 +29,7 @@ public:
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
+    static bool Ordered(const char* drainVariable);
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);

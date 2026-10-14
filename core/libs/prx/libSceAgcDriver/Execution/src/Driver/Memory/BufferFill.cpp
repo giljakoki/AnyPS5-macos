@@ -298,7 +298,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             }
         }
     };
-    static const bool orderedFills = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
+    static const bool orderedFills = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_FILLS");
     if (orderedFills && queueId == 0 && DrawPipeline::Active()) {
         DrawPipeline::Queue0().Enqueue([store, queueId] {
             GuestMemory::SetCurrentPacket(0x15, queueId);

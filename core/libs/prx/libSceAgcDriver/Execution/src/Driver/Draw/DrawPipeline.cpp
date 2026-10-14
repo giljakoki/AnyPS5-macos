@@ -34,6 +34,11 @@ std::size_t DrawPipeline::Depth() {
     return depth;
 }
 
+bool DrawPipeline::Ordered(const char* drainVariable) {
+    static const bool orderedItems = std::getenv("APS5_PIPELINE_ORDERED_ITEMS") != nullptr;
+    return orderedItems && std::getenv(drainVariable) == nullptr;
+}
+
 bool& DrawPipeline::Active() {
     static thread_local bool active = false;
     return active;
@@ -124,6 +129,7 @@ void DrawPipeline::run() {
             (*commit)();
         } catch (const std::exception& error) {
             failed = true;
+            fatal = std::current_exception();
             static std::atomic<std::uint64_t> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draw] pipelined commit failed: %.200s\n", error.what());
         } catch (...) {

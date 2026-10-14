@@ -27,7 +27,7 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 bool orderedFills() {
-    static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
+    static const bool ordered = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_FILLS");
     return ordered;
 }
 
@@ -77,7 +77,7 @@ void Driver::execute(const Submission& submission) {
         ~FlipHold() { Release(); }
     } flipHold{*this, submission.holdsFlip};
     const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
-    static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+    static const bool orderedWaits = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_LABELS");
     DrawPipeline::Active() = pipelined;
     struct PipelineDrain {
         bool pipelined;
@@ -89,7 +89,7 @@ void Driver::execute(const Submission& submission) {
             }
         }
     } pipelineDrain{pipelined};
-    static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && orderedWaits;
+    static const bool orderedCompletion = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_SUBMISSIONS") && orderedWaits;
     if (pipelined && (submission.suspend || !orderedCompletion)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     if (submission.suspend) {
         PerformanceContext timingContext(submissionTiming);
@@ -188,8 +188,8 @@ void Driver::execute(const Submission& submission) {
     } hitchReport{hitches, hitchSampler, hitchWork};
 
     static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
-    if (epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
-        if (!epochEach) noteReleasedTails(submission);
+    if (!pipelined || epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
+        if (pipelined && !epochEach) noteReleasedTails(submission);
         bumpEpoch(&EpochBumps::submissions);
     }
     clearResolvedAhead();
