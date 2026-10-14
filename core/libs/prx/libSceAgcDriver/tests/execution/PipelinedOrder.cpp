@@ -13,7 +13,10 @@
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <chrono>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,7 +57,8 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-void AppendDraw(std::vector<std::uint32_t>& commands) {
+// An auto draw of the triangle, or (with `indices`) an indexed draw of the vertices they name.
+void AppendDraw(std::vector<std::uint32_t>& commands, const std::uint16_t* indices = nullptr, std::uint32_t indexCount = 0) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
@@ -89,7 +93,13 @@ void AppendDraw(std::vector<std::uint32_t>& commands) {
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
-    Append(commands, 0x2d, {3, 2});
+    if (indices == nullptr) {
+        Append(commands, 0x2d, {3, 2});
+        return;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(indices);
+    Append(commands, 0x2a, {0});
+    Append(commands, 0x27, {indexCount, Low(address), High(address), indexCount, 0});
 }
 
 // The title's buffer fill kernel over the color target's bytes (the HLE fill path).
@@ -153,6 +163,41 @@ void CommitsFollowTheWorkersEpoch() {
     Require(seen[2] != seen[1], "pipelined order: a fill queued after an epoch bump was committed in the epoch before it");
 }
 
+alignas(256) std::array<std::uint16_t, 4> Indices{};
+
+// The CPU stores new indices after the worker queued an indexed draw and before the committer
+// recorded it (this thread holds the device lock every commit takes): the draw must use the indices
+// it was queued with, as a draw recorded by the worker would have. The old indices name the
+// triangle, the new ones a degenerate triangle that draws nothing.
+void IndicesStoredWhileQueued() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    auto& pipeline = DrawPipeline::Queue0();
+    Indices = {0, 1, 2, 0};
+    ColorMemory.fill(std::byte{0});
+    std::unique_lock held(AgcDriver::GuestMemory::GpuMutex());
+    std::vector<std::uint32_t> commands;
+    AppendDraw(commands, Indices.data(), 3);
+    std::exception_ptr failure;
+    std::thread submitter([&] {
+        try {
+            Submit(commands);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    // The draw's item names the color target among its writes once the worker queued it.
+    bool queued = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!(queued = pipeline.Overlaps(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size())) && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    Indices = {0, 0, 0, 0};
+    held.unlock();
+    submitter.join();
+    if (failure != nullptr) std::rethrow_exception(failure);
+    Require(queued, "pipelined order: the indexed draw was not queued behind the held item");
+    const auto words = ColorMemory.size() / 4;
+    Require(DrawnPixels() == words, "pipelined order: an indexed draw whose indices the CPU replaced while it was queued drew " + std::to_string(DrawnPixels()) + " of " + std::to_string(words) + " pixels (it read the new indices, not those it was queued with)");
+}
+
 }
 
 int main() {
@@ -187,6 +232,8 @@ int main() {
         std::uint32_t firstWord = 0;
         std::memcpy(&firstWord, ColorMemory.data(), 4);
         Require(DrawnPixels() == words, "pipelined order: 64 draws left " + std::to_string(words - DrawnPixels()) + " of " + std::to_string(words) + " pixels without the draws' color (first pixel 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", firstWord); return std::string(text); }() + ")");
+
+        if (AgcDriver::DriverDetail::DrawPipeline::Depth() != 0) IndicesStoredWhileQueued();
 
         // Draws, then a fill of the same bytes in the same submission: with the pipeline on, the draws
         // are still queued when the fill packet is reached, and the fill must land after them.

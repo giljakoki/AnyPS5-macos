@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -488,19 +489,34 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
-    if (pipelined && !drawParameters.indirect && !meshEmulated && deferredLabels().labels.empty()) {
+    // The commit reads the index buffer and vertex inputs later than this worker would: they are
+    // copied now (a queued item writing them is committed first), or the draw is recorded here.
+    std::shared_ptr<const Graphics::PinnedDrawInputs> pins;
+    bool pinned = true;
+    if (pipelined && !drawParameters.indirect && !meshEmulated && deferredLabels().labels.empty() && Graphics::PinDrawInputsEnabled()) {
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            pinned = false;
+        } else {
+            auto taken = Graphics::PinDrawInputs(graphics, drawParameters, stages, [](std::uint64_t address, std::size_t bytes) {
+                auto& pipeline = DrawPipeline::Queue0();
+                if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Inputs);
+            });
+            pinned = taken == nullptr || !taken->tooLarge;
+            pins = std::move(taken);
+        }
+    }
+    if (pipelined && pinned && !drawParameters.indirect && !meshEmulated && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        const auto enqueueGeneration = Graphics::PresentTrace::Enabled() ? GuestMemory::TrackerGeneration() : 0;
         // The commit owns everything its stages point at: heldResults holds the stages' materialized
         // programs (this draw's push constants among them), which the scratch would free at return.
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, enqueueGeneration, programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, pins = std::move(pins), programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            Graphics::PresentTrace::EnqueueGeneration() = enqueueGeneration;
+            const Graphics::PinnedDrawInputs::Scope pinScope(pins.get());
             try {
                 commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
             } catch (const std::exception& error) {

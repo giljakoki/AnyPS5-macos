@@ -33,14 +33,10 @@ public:
         return committing;
     }
 
-    // The write tracker's generation when the worker queued the draw being committed (0: none).
-    static std::uint64_t& EnqueueGeneration() {
-        static thread_local std::uint64_t generation = 0;
-        return generation;
-    }
-
-    // A committed draw into `target` read [begin, end) (kind as GuestBufferMemory::TracedRegions, 'i'
-    // the index buffer), which the CPU wrote after the worker queued the draw.
+    // A committed draw into `target` reads [begin, end) of its index buffer ('i') or vertex inputs
+    // ('v'), whose bytes differ from what the worker read when it queued the draw (PinnedDrawInputs):
+    // lower case when the commit served the worker's copy, upper case when it read the changed bytes
+    // (APS5_NO_PIN_DRAW_INPUTS=1).
     static void WindowWrite(std::uint64_t target, std::uint64_t begin, std::uint64_t end, char kind) {
         if (!Enabled()) return;
         auto& self = instance();
@@ -56,7 +52,8 @@ public:
         ++it->second.count;
     }
 
-    // A committed draw whose reads were checked for CPU writes since its enqueue.
+    // A committed draw whose pinned inputs were compared: clean unless it read bytes other than the
+    // worker's (only with APS5_NO_PIN_DRAW_INPUTS=1).
     static void WindowChecked(bool clean) {
         if (!Enabled()) return;
         auto& self = instance();
@@ -249,7 +246,7 @@ private:
             line += text;
         }
         if (frame.windowClean != 0 || frame.windowDirty != 0) {
-            // window=<committed draws whose reads the CPU left alone>/<draws reading CPU-written bytes>
+            // window=<committed draws that read their enqueue-time inputs>/<draws that read changed bytes>
             std::snprintf(text, sizeof(text), " window=%u/%u", frame.windowClean, frame.windowDirty);
             line += text;
         }

@@ -7,7 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -32,6 +34,51 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment);
+
+// A pipelined draw (APS5_PIPELINED_DRAWS) is recorded on the committer after the worker queued it,
+// and the CPU may store new bytes over its index buffer or vertex inputs in between. The worker
+// copies them when it queues the draw (PinDrawInputs), so the commit records the bytes a draw recorded
+// at that point would have read: where the guest's bytes differ at the commit, the draw's inputs are
+// copied from the worker's (never bound in place, never kept for reuse). APS5_NO_PIN_DRAW_INPUTS=1
+// turns this off (under APS5_TRACE_PRESENT_DRAWS the copies are still taken, to count the changes).
+struct PinnedDrawInputs {
+    struct Range {
+        std::uint64_t address = 0;
+        std::vector<std::byte> bytes;
+        char kind = 'i';
+    };
+    std::vector<Range> ranges;
+    // More bytes than APS5_PIN_DRAW_INPUTS_LIMIT_KB (4 MiB by default): the draw is recorded on the
+    // worker instead.
+    bool tooLarge = false;
+    // Whether the commit serves the copies (false: compared for the trace only).
+    bool apply = true;
+    // Set by the commit when some guest bytes differed from the copies.
+    mutable bool changed = false;
+
+    // Whether the guest's bytes over [address, address + bytes) differ from the pinned ones, where
+    // pinned (noted for the trace with `kind` and `target`).
+    bool Differs(std::uint64_t address, std::size_t bytes, char kind, std::uint64_t target) const;
+    // Overwrites the pinned parts of `out` (the bytes at `address`).
+    void Apply(std::uint64_t address, std::span<std::byte> out) const;
+
+    // The pins of the draw the calling thread records (set by the pipeline's commit).
+    static const PinnedDrawInputs*& Current();
+    class Scope {
+    public:
+        explicit Scope(const PinnedDrawInputs* pins) : previous(Current()) { Current() = pins; }
+        ~Scope() { Current() = previous; }
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+
+    private:
+        const PinnedDrawInputs* previous;
+    };
+};
+bool PinDrawInputsEnabled();
+// The worker's copies of a draw's index buffer and vertex inputs (null when it reads none of them);
+// `beforeRead` runs before each range is read (the pipeline drains queued items writing it).
+std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const std::function<void(std::uint64_t, std::size_t)>& beforeRead);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
 

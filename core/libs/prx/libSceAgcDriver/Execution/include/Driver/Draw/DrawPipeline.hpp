@@ -22,7 +22,7 @@ class DrawPipeline {
 public:
     using Commit = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
-    enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Inputs, Count };
     enum class Kind : std::uint8_t { Draw, Fill, Label, Dma, Completion, Submit, Count };
 
     static DrawPipeline& Queue0();

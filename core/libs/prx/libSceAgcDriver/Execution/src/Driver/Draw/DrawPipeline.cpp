@@ -22,7 +22,7 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission", "inputs"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::Kind::Count)> KindNames{"draw", "fill", "label", "dma", "completion", "submit"};
 
 std::atomic<bool> orderedSuspended{false};

@@ -1122,7 +1122,120 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return import;
 }
 
+const PinnedDrawInputs*& PinnedDrawInputs::Current() {
+    static thread_local const PinnedDrawInputs* current = nullptr;
+    return current;
+}
+
+bool PinnedDrawInputs::Differs(std::uint64_t address, std::size_t bytes, char kind, std::uint64_t target) const {
+    const auto end = address + bytes;
+    bool differs = false;
+    for (const auto& range : ranges) {
+        const auto begin = std::max(address, range.address);
+        const auto limit = std::min<std::uint64_t>(end, range.address + range.bytes.size());
+        if (begin >= limit) continue;
+        const auto count = static_cast<std::size_t>(limit - begin);
+        GuestMemory::FlushGpuWrites(begin, count);
+        // An unmapped page differs too: the worker's bytes are what the draw read when it was queued.
+        if (GuestMemory::CompareMapped(begin, std::span(range.bytes).subspan(static_cast<std::size_t>(begin - range.address), count)) == GuestMemory::Compare::Equal) continue;
+        differs = true;
+        PresentTrace::WindowWrite(target, begin, limit, apply ? kind : static_cast<char>(kind - 'a' + 'A'));
+    }
+    if (differs) changed = true;
+    return differs && apply;
+}
+
+void PinnedDrawInputs::Apply(std::uint64_t address, std::span<std::byte> out) const {
+    const auto end = address + out.size();
+    for (const auto& range : ranges) {
+        const auto begin = std::max(address, range.address);
+        const auto limit = std::min<std::uint64_t>(end, range.address + range.bytes.size());
+        if (begin >= limit) continue;
+        std::memcpy(out.data() + (begin - address), range.bytes.data() + (begin - range.address), static_cast<std::size_t>(limit - begin));
+    }
+}
+
+bool PinDrawInputsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PIN_DRAW_INPUTS") == nullptr || PresentTrace::Enabled();
+    return enabled;
+}
+
+std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const std::function<void(std::uint64_t, std::size_t)>& beforeRead) {
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_PIN_DRAW_INPUTS_LIMIT_KB");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) << 10u : std::size_t{4} << 20u;
+    }();
+    static const bool apply = std::getenv("APS5_NO_PIN_DRAW_INPUTS") == nullptr;
+    // A mesh draw reads its indices as a shader buffer; an indirect draw's counts are unknown here.
+    if (state.stages.mesh || draw.indirect || shaders.empty() || shaders.front().program == nullptr) return nullptr;
+    auto pins = std::make_shared<PinnedDrawInputs>();
+    pins->apply = apply;
+    std::size_t total = 0;
+    // The index of the pinned range, or none when it is empty, too large or unreadable (the commit
+    // then reads the guest's bytes and fails as before).
+    const auto pin = [&](std::uint64_t address, std::uint64_t bytes, char kind) -> std::optional<std::size_t> {
+        if (bytes == 0 || address == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return std::nullopt;
+        total += static_cast<std::size_t>(std::min<std::uint64_t>(bytes, limit + 1));
+        if (total > limit) {
+            pins->tooLarge = true;
+            return std::nullopt;
+        }
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return std::nullopt;
+        beforeRead(address, static_cast<std::size_t>(bytes));
+        PinnedDrawInputs::Range range{address, std::vector<std::byte>(static_cast<std::size_t>(bytes)), kind};
+        GuestMemory::Read(address, range.bytes, 1);
+        pins->ranges.push_back(std::move(range));
+        return pins->ranges.size() - 1;
+    };
+    std::uint32_t maxIndex = 0;
+    if (draw.indexed) {
+        if (draw.indexSize != 2 && draw.indexSize != 4) return nullptr;
+        const auto index = pin(draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, 'i');
+        if (!index) return pins->tooLarge || !pins->ranges.empty() ? pins : nullptr;
+        // As prepareDrawInputs sizes the vertex copies (with the restart index skipped whenever the
+        // state enables it; a commit that counts it reads past the pinned bytes, from the guest).
+        const auto highest = HighestDrawIndex(pins->ranges[*index].bytes, draw.indexSize, state.primitiveRestart);
+        if (!highest || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) return pins;
+        maxIndex = *highest + draw.firstVertex;
+    } else {
+        if (draw.indexCount == 0 || draw.instanceCount == 0 || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return nullptr;
+        maxIndex = draw.firstVertex + draw.indexCount - 1u;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fetched;
+    for (const auto& attribute : shaders.front().program->vertexAttributes) {
+        if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) continue;
+        std::size_t bytes = 0;
+        try {
+            bytes = VertexBufferReadSize(attribute, maxIndex, draw.instanceCount, draw.firstInstance);
+        } catch (const std::exception&) {
+            continue;
+        }
+        const auto& fields = attribute.resource.fields;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        fetched.emplace_back(address, address + bytes);
+    }
+    std::sort(fetched.begin(), fetched.end());
+    for (std::size_t at = 0; at < fetched.size();) {
+        auto [begin, end] = fetched[at];
+        for (++at; at < fetched.size() && fetched[at].first <= end; ++at) end = std::max(end, fetched[at].second);
+        pin(begin, end - begin, 'v');
+        if (pins->tooLarge) return pins;
+    }
+    return pins->ranges.empty() ? nullptr : pins;
+}
+
 namespace {
+
+// A draw input served from the worker's copies (PinnedDrawInputs): the guest's bytes under the
+// pinned ones, never bound in place or kept for reuse (generation 0).
+DrawInputCopy pinnedDrawInput(const Context& context, const PinnedDrawInputs& pins, std::uint64_t address, std::size_t bytes, std::size_t alignment, VkBufferUsageFlags usage) {
+    DrawInputCopy copy;
+    copy.buffer = std::make_shared<Buffer>(context, bytes, usage);
+    if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    else std::fill(copy.buffer->Bytes().begin(), copy.buffer->Bytes().end(), std::byte{0});
+    pins.Apply(address, copy.buffer->Bytes());
+    return copy;
+}
 
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
 // buffer copy with its highest index, the vertex buffer copies and their layout, the fragment
@@ -1167,6 +1280,8 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRec
 // instead of computed.
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
     DrawInputs inputs;
+    const auto* pins = PinnedDrawInputs::Current();
+    const auto pinTarget = state.colors.empty() ? 0 : state.colors.front().address;
     inputs.importEpoch = HostImportsEpoch();
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1235,9 +1350,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        const bool indexPinned = pins != nullptr && pins->Differs(draw.indexAddress, static_cast<std::size_t>(indexBytes), 'i', pinTarget);
+        const auto* import = indexPinned ? nullptr : InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        if (indexPinned) copy = pinnedDrawInput(context, *pins, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        else if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else if (recheckIndices) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (!copy.reused) {
@@ -1325,6 +1442,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+        if (pins != nullptr && pins->Differs(begin, bytes, 'v', pinTarget)) {
+            auto copy = pinnedDrawInput(context, *pins, begin, bytes, 1, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            rangeHandles.push_back(copy.buffer->Handle());
+            rangeOffsets.push_back(0);
+            inputs.vertexBuffers.push_back(std::move(copy.buffer));
+            continue;
+        }
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range])) {
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
@@ -1344,6 +1468,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f]);
+        if (pins != nullptr && pins->Differs(begin, fetchValid[f], 'v', pinTarget)) pins->Apply(begin, copy.buffer->Bytes().first(fetchValid[f]));
         soloHandles[f] = copy.buffer->Handle();
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
@@ -1385,22 +1510,13 @@ struct ResidentRepeat {
 thread_local ResidentRepeat lastResident;
 std::atomic<std::uint64_t> residentRepeats{0};
 
-// APS5_TRACE_PRESENT_DRAWS: whether the CPU wrote what a pipelined draw reads (its buffer regions
-// and index buffer) between the worker queueing it and the committer recording it.
-void traceWindowWrites(const State& state, const Pm4::DrawParameters& draw, std::uint64_t indexBytes, const ShaderResources& resources) {
+// APS5_TRACE_PRESENT_DRAWS: whether a pipelined draw read index or vertex bytes other than those the
+// worker saw when it queued the draw (PinnedDrawInputs::Differs notes each changed range).
+void traceWindowWrites() {
     if (!PresentTrace::Enabled() || !PresentTrace::Committing()) return;
-    const auto since = PresentTrace::EnqueueGeneration();
-    if (since == 0) return;
-    const auto target = state.colors.empty() ? 0 : state.colors.front().address;
-    bool clean = true;
-    const auto check = [&](std::uint64_t begin, std::uint64_t end, char kind) {
-        if (end <= begin || GuestMemory::UnchangedSinceCollected(begin, static_cast<std::size_t>(end - begin), since)) return;
-        clean = false;
-        PresentTrace::WindowWrite(target, begin, end, kind);
-    };
-    for (const auto& [range, kind] : resources.TracedRegions()) check(range.first, range.second, kind);
-    if (draw.indexed && indexBytes != 0) check(draw.indexAddress, draw.indexAddress + indexBytes, 'i');
-    PresentTrace::WindowChecked(clean);
+    const auto* pins = PinnedDrawInputs::Current();
+    if (pins == nullptr) return;
+    PresentTrace::WindowChecked(!pins->changed || pins->apply);
 }
 
 std::array<std::uint64_t, 15> residentRepeatKey(const ColorTarget& color) {
@@ -2314,7 +2430,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     if (PresentTrace::Enabled()) {
         resources->ForEachValidatedTexture([](std::uint64_t address, const void* source, std::uint64_t generation) { PresentTrace::Sampled(address, source, generation); });
         for (const auto& binding : targets) PresentTrace::TargetDraw(binding.color.address, binding.resident.get(), binding.resident != nullptr ? binding.resident->Generation() : 0, binding.resident != nullptr || binding.multisampled ? 'f' : 'c');
-        traceWindowWrites(state, draw, indexBytes, *resources);
+        traceWindowWrites();
     }
     // The memory-state decision of an indirect draw, made here after the resource build (which may
     // retire imports and wait for recorded work) and before anything is recorded, exactly as
@@ -2822,7 +2938,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     if (PresentTrace::Enabled()) {
         resources->ForEachValidatedTexture([](std::uint64_t address, const void* source, std::uint64_t generation) { PresentTrace::Sampled(address, source, generation); });
         for (std::size_t index = 0; index < targets.size(); ++index) PresentTrace::TargetDraw(state.colors[index].address, targets[index].get(), targets[index]->Generation(), 'r');
-        traceWindowWrites(state, draw, inputs.indexBytes, *resources);
+        traceWindowWrites();
     }
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
