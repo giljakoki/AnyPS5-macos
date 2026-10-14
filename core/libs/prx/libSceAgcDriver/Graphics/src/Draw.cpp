@@ -1127,7 +1127,67 @@ const PinnedDrawInputs*& PinnedDrawInputs::Current() {
     return current;
 }
 
+namespace {
+
+// APS5_PIN_DRAW_INPUTS: full (default: the worker reads the inputs through the flush hook and
+// copies them), copy (copies without the flush hook), flush (only the flush hook over the inputs,
+// nothing copied), index (full, the index buffer only), off (also APS5_NO_PIN_DRAW_INPUTS=1).
+enum class PinMode : std::uint8_t { Off, Full, Copy, Flush, Index };
+
+PinMode pinMode() {
+    static const PinMode mode = [] {
+        if (std::getenv("APS5_NO_PIN_DRAW_INPUTS") != nullptr) return PinMode::Off;
+        const char* text = std::getenv("APS5_PIN_DRAW_INPUTS");
+        if (text == nullptr || std::strcmp(text, "full") == 0) return PinMode::Full;
+        if (std::strcmp(text, "copy") == 0) return PinMode::Copy;
+        if (std::strcmp(text, "flush") == 0) return PinMode::Flush;
+        if (std::strcmp(text, "index") == 0) return PinMode::Index;
+        return PinMode::Off;
+    }();
+    return mode;
+}
+
+constexpr std::array<const char*, 5> PinModeNames{"off", "full", "copy", "flush", "index"};
+
+// The [pin] line every 10 s while pinning is on: what the worker read and what it cost, and how
+// often the commit found other bytes and served the copies.
+struct PinCounters {
+    std::atomic<std::uint64_t> draws{0}, ranges{0}, indexBytes{0}, vertexBytes{0}, tooLarge{0};
+    std::atomic<std::uint64_t> workerNs{0}, accessibleNs{0}, flushNs{0}, copyNs{0};
+    std::atomic<std::uint64_t> compares{0}, compareNs{0}, changedIndex{0}, changedVertex{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+PinCounters& pinCounters() {
+    static PinCounters& counters = *new PinCounters();
+    return counters;
+}
+
+std::uint64_t pinNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void reportPins() {
+    auto& c = pinCounters();
+    const auto now = static_cast<std::int64_t>(pinNow());
+    auto last = c.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        c.lastReport.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !c.lastReport.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto draws = take(c.draws), ranges = take(c.ranges), indexBytes = take(c.indexBytes), vertexBytes = take(c.vertexBytes), tooLarge = take(c.tooLarge);
+    const auto worker = take(c.workerNs), accessible = take(c.accessibleNs), flush = take(c.flushNs), copy = take(c.copyNs);
+    const auto compares = take(c.compares), compare = take(c.compareNs), changedIndex = take(c.changedIndex), changedVertex = take(c.changedVertex);
+    const auto per = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(count); };
+    std::fprintf(stderr, "[pin] (10 s, mode %s): %llu draws pinned, %llu ranges, index %.1f KiB, vertex %.1f KiB (%.0f B per draw), %llu too large; worker %.1f us per draw (accessible %.1f, flush hook %.1f, copy %.1f); commit compares %llu at %.1f us each; changed at the commit: index %llu, vertex %llu\n", PinModeNames[static_cast<std::size_t>(pinMode())], static_cast<unsigned long long>(draws), static_cast<unsigned long long>(ranges), static_cast<double>(indexBytes) / 1024.0, static_cast<double>(vertexBytes) / 1024.0, draws == 0 ? 0.0 : static_cast<double>(indexBytes + vertexBytes) / static_cast<double>(draws), static_cast<unsigned long long>(tooLarge), per(worker, draws), per(accessible, draws), per(flush, draws), per(copy, draws), static_cast<unsigned long long>(compares), per(compare, compares), static_cast<unsigned long long>(changedIndex), static_cast<unsigned long long>(changedVertex));
+}
+
+}
+
 bool PinnedDrawInputs::Differs(std::uint64_t address, std::size_t bytes, char kind, std::uint64_t target) const {
+    const auto start = pinNow();
     const auto end = address + bytes;
     bool differs = false;
     for (const auto& range : ranges) {
@@ -1135,13 +1195,20 @@ bool PinnedDrawInputs::Differs(std::uint64_t address, std::size_t bytes, char ki
         const auto limit = std::min<std::uint64_t>(end, range.address + range.bytes.size());
         if (begin >= limit) continue;
         const auto count = static_cast<std::size_t>(limit - begin);
-        GuestMemory::FlushGpuWrites(begin, count);
-        // An unmapped page differs too: the worker's bytes are what the draw read when it was queued.
+        // No flush hook: the worker's bytes were flushed, and the guest's are flushed by the path
+        // that reads them when they agree. Bytes a pending GPU result still covers compare as
+        // different and the copy is served, which is what the worker read. An unmapped page differs too.
         if (GuestMemory::CompareMapped(begin, std::span(range.bytes).subspan(static_cast<std::size_t>(begin - range.address), count)) == GuestMemory::Compare::Equal) continue;
         differs = true;
         PresentTrace::WindowWrite(target, begin, limit, apply ? kind : static_cast<char>(kind - 'a' + 'A'));
     }
-    if (differs) changed = true;
+    auto& counters = pinCounters();
+    counters.compares.fetch_add(1, std::memory_order_relaxed);
+    counters.compareNs.fetch_add(pinNow() - start, std::memory_order_relaxed);
+    if (differs) {
+        changed = true;
+        (kind == 'i' ? counters.changedIndex : counters.changedVertex).fetch_add(1, std::memory_order_relaxed);
+    }
     return differs && apply;
 }
 
@@ -1156,8 +1223,7 @@ void PinnedDrawInputs::Apply(std::uint64_t address, std::span<std::byte> out) co
 }
 
 bool PinDrawInputsEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_PIN_DRAW_INPUTS") == nullptr || PresentTrace::Enabled();
-    return enabled;
+    return pinMode() != PinMode::Off;
 }
 
 std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const std::function<void(std::uint64_t, std::size_t)>& beforeRead) {
@@ -1165,14 +1231,16 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
         const char* text = std::getenv("APS5_PIN_DRAW_INPUTS_LIMIT_KB");
         return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) << 10u : std::size_t{4} << 20u;
     }();
-    static const bool apply = std::getenv("APS5_NO_PIN_DRAW_INPUTS") == nullptr;
+    const auto mode = pinMode();
     // A mesh draw reads its indices as a shader buffer; an indirect draw's counts are unknown here.
-    if (state.stages.mesh || draw.indirect || shaders.empty() || shaders.front().program == nullptr) return nullptr;
+    if (mode == PinMode::Off || state.stages.mesh || draw.indirect || shaders.empty() || shaders.front().program == nullptr) return nullptr;
+    reportPins();
+    auto& counters = pinCounters();
+    const auto started = pinNow();
     auto pins = std::make_shared<PinnedDrawInputs>();
-    pins->apply = apply;
     std::size_t total = 0;
     // The index of the pinned range, or none when it is empty, too large or unreadable (the commit
-    // then reads the guest's bytes and fails as before).
+    // then reads the guest's bytes and fails as before). Flush mode keeps the bytes for the sizing only.
     const auto pin = [&](std::uint64_t address, std::uint64_t bytes, char kind) -> std::optional<std::size_t> {
         if (bytes == 0 || address == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return std::nullopt;
         total += static_cast<std::size_t>(std::min<std::uint64_t>(bytes, limit + 1));
@@ -1180,25 +1248,46 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
             pins->tooLarge = true;
             return std::nullopt;
         }
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return std::nullopt;
+        auto at = pinNow();
+        const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+        auto now = pinNow();
+        counters.accessibleNs.fetch_add(now - at, std::memory_order_relaxed);
+        if (!accessible) return std::nullopt;
         beforeRead(address, static_cast<std::size_t>(bytes));
+        at = pinNow();
+        if (mode != PinMode::Copy) GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+        now = pinNow();
+        counters.flushNs.fetch_add(now - at, std::memory_order_relaxed);
+        if (mode == PinMode::Flush && kind != 'i') return std::nullopt;
         PinnedDrawInputs::Range range{address, std::vector<std::byte>(static_cast<std::size_t>(bytes)), kind};
-        GuestMemory::Read(address, range.bytes, 1);
+        std::memcpy(range.bytes.data(), reinterpret_cast<const void*>(address), range.bytes.size());
+        counters.copyNs.fetch_add(pinNow() - now, std::memory_order_relaxed);
+        counters.ranges.fetch_add(1, std::memory_order_relaxed);
+        (kind == 'i' ? counters.indexBytes : counters.vertexBytes).fetch_add(bytes, std::memory_order_relaxed);
         pins->ranges.push_back(std::move(range));
         return pins->ranges.size() - 1;
     };
+    const auto finish = [&](std::shared_ptr<PinnedDrawInputs> result) {
+        counters.draws.fetch_add(1, std::memory_order_relaxed);
+        counters.workerNs.fetch_add(pinNow() - started, std::memory_order_relaxed);
+        if (pins->tooLarge) counters.tooLarge.fetch_add(1, std::memory_order_relaxed);
+        // Flush mode leaves the commit nothing to compare.
+        if (mode == PinMode::Flush && result != nullptr && !result->tooLarge) return std::shared_ptr<PinnedDrawInputs>{};
+        return result;
+    };
     std::uint32_t maxIndex = 0;
     if (draw.indexed) {
-        if (draw.indexSize != 2 && draw.indexSize != 4) return nullptr;
+        if (draw.indexSize != 2 && draw.indexSize != 4) return finish(nullptr);
         const auto index = pin(draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, 'i');
-        if (!index) return pins->tooLarge || !pins->ranges.empty() ? pins : nullptr;
+        if (!index) return finish(pins->tooLarge || !pins->ranges.empty() ? pins : nullptr);
+        if (mode == PinMode::Index) return finish(pins);
         // As prepareDrawInputs sizes the vertex copies (with the restart index skipped whenever the
         // state enables it; a commit that counts it reads past the pinned bytes, from the guest).
         const auto highest = HighestDrawIndex(pins->ranges[*index].bytes, draw.indexSize, state.primitiveRestart);
-        if (!highest || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) return pins;
+        if (!highest || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) return finish(pins);
         maxIndex = *highest + draw.firstVertex;
     } else {
-        if (draw.indexCount == 0 || draw.instanceCount == 0 || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return nullptr;
+        if (mode == PinMode::Index || draw.indexCount == 0 || draw.instanceCount == 0 || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return finish(nullptr);
         maxIndex = draw.firstVertex + draw.indexCount - 1u;
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> fetched;
@@ -1219,9 +1308,9 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
         auto [begin, end] = fetched[at];
         for (++at; at < fetched.size() && fetched[at].first <= end; ++at) end = std::max(end, fetched[at].second);
         pin(begin, end - begin, 'v');
-        if (pins->tooLarge) return pins;
+        if (pins->tooLarge) return finish(pins);
     }
-    return pins->ranges.empty() ? nullptr : pins;
+    return finish(pins->ranges.empty() ? nullptr : pins);
 }
 
 namespace {

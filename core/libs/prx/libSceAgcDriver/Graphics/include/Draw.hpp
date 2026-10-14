@@ -39,8 +39,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 // and the CPU may store new bytes over its index buffer or vertex inputs in between. The worker
 // copies them when it queues the draw (PinDrawInputs), so the commit records the bytes a draw recorded
 // at that point would have read: where the guest's bytes differ at the commit, the draw's inputs are
-// copied from the worker's (never bound in place, never kept for reuse). APS5_NO_PIN_DRAW_INPUTS=1
-// turns this off (under APS5_TRACE_PRESENT_DRAWS the copies are still taken, to count the changes).
+// copied from the worker's (never bound in place, never kept for reuse). APS5_PIN_DRAW_INPUTS selects
+// what the worker does (full, copy, flush, index, off; APS5_NO_PIN_DRAW_INPUTS=1 is off), and a [pin]
+// line every 10 s reports the bytes, the costs and the changes found at the commit.
 struct PinnedDrawInputs {
     struct Range {
         std::uint64_t address = 0;
