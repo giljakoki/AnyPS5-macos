@@ -5,9 +5,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -184,6 +186,10 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+// Bumped under surfacesMutex whenever a surface is added: RetireDepthSurfacesAt skips the scan for
+// an address it already retired while nothing was added since.
+std::atomic<std::uint64_t> surfacesAdded{0};
+
 std::set<std::uint64_t>& clearedHtiles() {
     static auto* cleared = new std::set<std::uint64_t>();
     return *cleared;
@@ -211,6 +217,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         return surface->view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+    surfacesAdded.fetch_add(1, std::memory_order_release);
     return surfaces().back()->view;
 }
 
@@ -367,9 +374,26 @@ bool DepthSurfaceAt(std::uint64_t address) {
 }
 
 void RetireDepthSurfacesAt(const Context& context, std::uint64_t address) {
+    // A color target's address the thread retired with no surface added since has none to retire
+    // (APS5_NO_RETIRE_MEMO=1 scans every time).
+    struct Retired {
+        VkDevice device = VK_NULL_HANDLE;
+        std::uint64_t address = 0;
+        std::uint64_t added = ~std::uint64_t{0};
+    };
+    static const bool memo = std::getenv("APS5_NO_RETIRE_MEMO") == nullptr;
+    thread_local std::array<Retired, 4> recent{};
+    thread_local std::size_t nextRecent = 0;
+    if (memo) {
+        const auto added = surfacesAdded.load(std::memory_order_acquire);
+        for (const auto& entry : recent) {
+            if (entry.device == context.device && entry.address == address && entry.added == added) return;
+        }
+    }
     std::vector<std::unique_ptr<DepthSurface>> retired;
     {
         std::lock_guard lock(surfacesMutex());
+        if (memo) recent[nextRecent++ % recent.size()] = {context.device, address, surfacesAdded.load(std::memory_order_relaxed)};
         auto& list = surfaces();
         const auto reused = [&](const std::unique_ptr<DepthSurface>& surface) {
             return surface->context.device == context.device && (surface->target.address == address || surface->target.stencilAddress == address);

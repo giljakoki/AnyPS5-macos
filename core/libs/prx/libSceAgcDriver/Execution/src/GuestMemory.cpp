@@ -1238,6 +1238,8 @@ namespace {
 struct DriverWriteLog {
     std::mutex mutex;
     std::uint64_t serial = 0;
+    // `serial`, stored under the mutex after the entry: read without it by DriverWroteOverThrough.
+    std::atomic<std::uint64_t> published{0};
     std::array<std::array<std::uint64_t, 3>, 8192> entries{};
 };
 
@@ -1254,6 +1256,7 @@ void NoteDriverWrite(std::uint64_t address, std::size_t bytes, bool recorded) {
     const std::lock_guard lock(log.mutex);
     ++log.serial;
     log.entries[log.serial % log.entries.size()] = {address, address + bytes, recorded ? 1u : 0u};
+    log.published.store(log.serial, std::memory_order_release);
 }
 
 std::uint64_t DriverWriteSerial() {
@@ -1269,6 +1272,23 @@ bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t sin
     const auto end = address + bytes;
     for (auto serial = since + 1; serial <= log.serial; ++serial) {
         const auto& entry = log.entries[serial % log.entries.size()];
+        if (entry[0] < end && address < entry[1] && !(storesOnly && entry[2] != 0)) return true;
+    }
+    return false;
+}
+
+bool DriverWroteOverThrough(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool storesOnly, std::uint64_t& serial) {
+    auto& log = driverWriteLog();
+    if (log.published.load(std::memory_order_acquire) == since) {
+        serial = since;
+        return false;
+    }
+    const std::lock_guard lock(log.mutex);
+    serial = log.serial;
+    if (since > log.serial || log.serial - since >= log.entries.size()) return true;
+    const auto end = address + bytes;
+    for (auto at = since + 1; at <= log.serial; ++at) {
+        const auto& entry = log.entries[at % log.entries.size()];
         if (entry[0] < end && address < entry[1] && !(storesOnly && entry[2] != 0)) return true;
     }
     return false;

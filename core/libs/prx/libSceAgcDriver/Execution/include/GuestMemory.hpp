@@ -113,6 +113,9 @@ std::uint64_t TrackerGeneration();
 void NoteDriverWrite(std::uint64_t address, std::size_t bytes, bool recorded = false);
 std::uint64_t DriverWriteSerial();
 bool DriverWroteOver(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool storesOnly = false);
+// DriverWroteOver that also returns the serial it checked through in `serial`, without the log
+// mutex when nothing was noted since `since`.
+bool DriverWroteOverThrough(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool storesOnly, std::uint64_t& serial);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label

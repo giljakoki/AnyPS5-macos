@@ -4,7 +4,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include <cstdint>
+#include <array>
 #include <optional>
+#include <vector>
 #include <set>
 #include <string>
 
@@ -38,6 +40,8 @@ private:
 // The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport,
 // scissor, depth bounds and depth bias are dynamic state set at Begin, so pipelines are shared by draws that differ only there
 // (see CachedPipeline).
+struct BindShadow;
+
 class Pipeline {
 public:
     // `state` carries the blend states with the outputs the pixel shader lacks already masked and
@@ -74,7 +78,7 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
-    void setLibraryState(VkCommandBuffer commands, const State& state) const;
+    void setLibraryState(VkCommandBuffer commands, const State& state, BindShadow* shadow, std::uint32_t& skipped) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -93,6 +97,51 @@ private:
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
     std::vector<CachedFramebuffer> framebuffers;
+};
+
+// The graphics state recorded into the render pass the calling thread has open: a draw continuing
+// the pass skips the binds and dynamic state repeating what is already recorded there (the
+// pipeline, viewport, scissor, depth bias and bounds, the library pipelines' dynamic state, the
+// descriptor set, push constants, vertex and index buffers). Pipeline::Begin starts it afresh; it
+// tracks one command buffer and is dropped whenever another thread recorded through it since.
+// Binding a pipeline forgets what that pipeline does not keep (state it has static, the set and
+// push constants of another layout). APS5_NO_BIND_SHADOW=1 records every bind as before.
+struct BindShadow {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::optional<VkViewport> viewport;
+    std::optional<VkRect2D> scissor;
+    std::optional<std::array<float, 3>> depthBias;
+    std::optional<std::array<float, 2>> depthBounds;
+    // The rest of a library pipeline's dynamic state (setLibraryState), known together.
+    bool libraryKnown = false;
+    VkCullModeFlags cullMode = 0;
+    VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    bool depthTest = false;
+    bool depthWrite = false;
+    VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
+    bool boundsTest = false;
+    bool stencilTest = false;
+    VkStencilOpState stencilFront{};
+    VkStencilOpState stencilBack{};
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    bool pushKnown = false;
+    VkShaderStageFlags pushStages = 0;
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    bool vertexKnown = false;
+    std::vector<VkBuffer> vertexBuffers;
+    std::vector<VkDeviceSize> vertexOffsets;
+    bool indexKnown = false;
+    VkBuffer indexBuffer = VK_NULL_HANDLE;
+    VkDeviceSize indexOffset = 0;
+    VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    // The calling thread's shadow for `commands` (cleared first when `fresh`, when it tracked
+    // another buffer or another thread recorded since), or nullptr under APS5_NO_BIND_SHADOW.
+    static BindShadow* For(VkCommandBuffer commands, bool fresh = false);
+    // Draws whose binds the shadow skipped, for the [draws] line.
+    static std::uint64_t Skipped();
+    static void CountSkipped(std::uint32_t count);
 };
 
 // The pipeline for this configuration, shared across draws and frames: keyed by the stages' variant

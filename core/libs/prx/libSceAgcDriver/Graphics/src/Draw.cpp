@@ -712,6 +712,12 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu draws repeated their resident target without a lookup)", static_cast<unsigned long long>(repeats - reportedRepeats));
             reportedRepeats = repeats;
         }
+        if (i == PhaseRecord && room()) {
+            static std::uint64_t reportedSkips = 0;
+            const auto skips = BindShadow::Skipped();
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu repeated binds skipped)", static_cast<unsigned long long>(skips - reportedSkips));
+            reportedSkips = skips;
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -1379,6 +1385,8 @@ struct ResidentRepeat {
     std::uint64_t present = 0;
     std::uint64_t forget = 0;
     std::uint64_t writes = 0;
+    // StorageTexture::PendingSerial when FindPending last accepted the image (0: not checked).
+    std::uint64_t pending = 0;
 };
 
 thread_local ResidentRepeat lastResident;
@@ -1393,8 +1401,36 @@ bool residentRepeatEnabled() {
     return !disabled;
 }
 
+// The repeat's checks without a mutex where an atomic answers them (APS5_NO_LOCKFREE_REPEAT=1 takes
+// every lock as before): the storage cache's flag on the image instead of its map (the LRU touch
+// the full lookup made earlier in this present stands), the driver-write log's published serial,
+// and the pending registry's serial while it is unchanged since FindPending accepted the image.
+bool lockFreeRepeat() {
+    static const bool disabled = std::getenv("APS5_NO_LOCKFREE_REPEAT") != nullptr;
+    return !disabled;
+}
+
 std::shared_ptr<StorageTexture> repeatedResidentTarget(const Context& context, const ColorTarget& color) {
     if (!residentRepeatEnabled()) return nullptr;
+    if (lockFreeRepeat()) {
+        const auto epoch = GuestMemory::CollectEpoch();
+        const auto forget = GuestMemory::ForgetSerial();
+        auto& last = lastResident;
+        if (epoch == 0 || (forget & 1u) != 0 || last.epoch != epoch || last.present != Recorder::Presents() || last.forget != forget || last.key != residentRepeatKey(color)) return nullptr;
+        auto image = last.image.lock();
+        if (image == nullptr || !image->Cached() || !StorageImageServesKeys(*image, color.dccAddress)) return nullptr;
+        std::uint64_t writes = 0;
+        if (GuestMemory::DriverWroteOverThrough(color.address, color.bytes, last.writes, false, writes)) return nullptr;
+        const auto pendingSerial = StorageTexture::PendingSerial();
+        if (last.pending == 0 || last.pending != pendingSerial) {
+            const auto pending = StorageTexture::FindPending(color.address, color.bytes);
+            if (pending != nullptr && pending != image) return nullptr;
+            last.pending = pendingSerial;
+        }
+        last.writes = writes;
+        residentRepeats.fetch_add(1, std::memory_order_relaxed);
+        return image;
+    }
     const auto epoch = GuestMemory::CollectEpoch();
     const auto forget = GuestMemory::ForgetSerial();
     auto& last = lastResident;
@@ -1576,8 +1612,34 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
         context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, inputs.meshGroups, draw.instanceCount, 1);
         return;
     }
-    if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
-    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    // Buffers the open pass already has bound at the same offsets are not bound again (BindShadow).
+    auto* shadow = BindShadow::For(commands);
+    if (!inputs.vertexHandles.empty()) {
+        if (shadow != nullptr && shadow->vertexKnown && shadow->vertexBuffers == inputs.vertexHandles && shadow->vertexOffsets == inputs.vertexOffsets) {
+            BindShadow::CountSkipped(1);
+        } else {
+            context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
+            if (shadow != nullptr) {
+                shadow->vertexKnown = true;
+                shadow->vertexBuffers = inputs.vertexHandles;
+                shadow->vertexOffsets = inputs.vertexOffsets;
+            }
+        }
+    }
+    if (draw.indexed) {
+        const auto indexType = draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+        if (shadow != nullptr && shadow->indexKnown && shadow->indexBuffer == inputs.indexHandle && shadow->indexOffset == inputs.indexOffset && shadow->indexType == indexType) {
+            BindShadow::CountSkipped(1);
+        } else {
+            context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, indexType);
+            if (shadow != nullptr) {
+                shadow->indexKnown = true;
+                shadow->indexBuffer = inputs.indexHandle;
+                shadow->indexOffset = inputs.indexOffset;
+                shadow->indexType = indexType;
+            }
+        }
+    }
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
@@ -2034,11 +2096,20 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    // A set the open pass already has bound under the bound pipeline's layout is not bound again
+    // (BindShadow; Continue forgot it when the layout changed).
+    auto* shadow = BindShadow::For(commands);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
-        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+        if (shadow != nullptr && set != VK_NULL_HANDLE && shadow->set == set && shadow->layout == record.pipeline->Layout()) {
+            BindShadow::CountSkipped(1);
+        } else {
+            context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+            if (shadow != nullptr) shadow->set = shadow->layout == record.pipeline->Layout() ? set : VK_NULL_HANDLE;
+        }
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
+        if (shadow != nullptr) shadow->set = VK_NULL_HANDLE;
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
