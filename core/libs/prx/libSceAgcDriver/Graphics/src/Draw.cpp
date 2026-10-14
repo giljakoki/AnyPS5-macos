@@ -1129,16 +1129,21 @@ const PinnedDrawInputs*& PinnedDrawInputs::Current() {
 
 namespace {
 
-// APS5_PIN_DRAW_INPUTS: full (default: the worker reads the inputs through the flush hook and
-// copies them), copy (copies without the flush hook), flush (only the flush hook over the inputs,
-// nothing copied), index (full, the index buffer only), off (also APS5_NO_PIN_DRAW_INPUTS=1).
-enum class PinMode : std::uint8_t { Off, Full, Copy, Flush, Index };
+// APS5_PIN_DRAW_INPUTS: size (default: nothing copied; a draw whose index buffer and vertex fetch
+// ranges exceed the limit is recorded on the worker), full (the worker reads the inputs through the
+// flush hook and copies them), copy (copies without the flush hook), flush (only the flush hook over
+// the inputs, nothing copied), index (full, the index buffer only), off (also
+// APS5_NO_PIN_DRAW_INPUTS=1: every draw is queued). Every mode but off and index records the large
+// draws on the worker: Hades II (PPSA36082) draws its characters missing or unlit for runs of frames
+// when those are committed by the pipeline, while no copied byte ever differed at the commit.
+enum class PinMode : std::uint8_t { Off, Full, Copy, Flush, Index, Size };
 
 PinMode pinMode() {
     static const PinMode mode = [] {
         if (std::getenv("APS5_NO_PIN_DRAW_INPUTS") != nullptr) return PinMode::Off;
         const char* text = std::getenv("APS5_PIN_DRAW_INPUTS");
-        if (text == nullptr || std::strcmp(text, "full") == 0) return PinMode::Full;
+        if (text == nullptr || std::strcmp(text, "size") == 0) return PinMode::Size;
+        if (std::strcmp(text, "full") == 0) return PinMode::Full;
         if (std::strcmp(text, "copy") == 0) return PinMode::Copy;
         if (std::strcmp(text, "flush") == 0) return PinMode::Flush;
         if (std::strcmp(text, "index") == 0) return PinMode::Index;
@@ -1147,7 +1152,7 @@ PinMode pinMode() {
     return mode;
 }
 
-constexpr std::array<const char*, 5> PinModeNames{"off", "full", "copy", "flush", "index"};
+constexpr std::array<const char*, 6> PinModeNames{"off", "full", "copy", "flush", "index", "size"};
 
 // The [pin] line every 10 s while pinning is on: what the worker read and what it cost, and how
 // often the commit found other bytes and served the copies.
@@ -1165,6 +1170,19 @@ PinCounters& pinCounters() {
 
 std::uint64_t pinNow() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// The first large draws (APS5_PIN_DRAW_INPUTS sizes past the limit), for finding what they draw.
+void noteLargeDraw(const Pm4::DrawParameters& draw, std::size_t total, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& fetched) {
+    static std::atomic<int> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) >= 24) return;
+    std::string ranges;
+    for (const auto& [begin, end] : fetched) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " 0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+        ranges += text;
+    }
+    std::fprintf(stderr, "[pin] large draw: %s %u indices at 0x%llx (size %u), first vertex %u, %u instances, %zu KiB sized; vertex fetches:%s\n", draw.indexed ? "indexed" : "auto", draw.indexCount, static_cast<unsigned long long>(draw.indexAddress), draw.indexSize, draw.firstVertex, draw.instanceCount, total >> 10u, ranges.empty() ? " none" : ranges.c_str());
 }
 
 void reportPins() {
@@ -1239,6 +1257,7 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
     const auto started = pinNow();
     auto pins = std::make_shared<PinnedDrawInputs>();
     std::size_t total = 0;
+    std::span<const std::byte> sizedIndices;
     // The index of the pinned range, or none when it is empty, too large or unreadable (the commit
     // then reads the guest's bytes and fails as before). Flush mode keeps the bytes for the sizing only.
     const auto pin = [&](std::uint64_t address, std::uint64_t bytes, char kind) -> std::optional<std::size_t> {
@@ -1253,6 +1272,13 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
         auto now = pinNow();
         counters.accessibleNs.fetch_add(now - at, std::memory_order_relaxed);
         if (!accessible) return std::nullopt;
+        if (mode == PinMode::Size) {
+            // Sized, not read: only the index buffer is scanned, in place, for the highest index.
+            (kind == 'i' ? counters.indexBytes : counters.vertexBytes).fetch_add(bytes, std::memory_order_relaxed);
+            if (kind != 'i') return std::nullopt;
+            sizedIndices = std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(bytes));
+            return std::size_t{0};
+        }
         beforeRead(address, static_cast<std::size_t>(bytes));
         at = pinNow();
         if (mode != PinMode::Copy) GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
@@ -1267,12 +1293,15 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
         pins->ranges.push_back(std::move(range));
         return pins->ranges.size() - 1;
     };
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fetched;
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& fetchedRanges = fetched;
     const auto finish = [&](std::shared_ptr<PinnedDrawInputs> result) {
         counters.draws.fetch_add(1, std::memory_order_relaxed);
         counters.workerNs.fetch_add(pinNow() - started, std::memory_order_relaxed);
         if (pins->tooLarge) counters.tooLarge.fetch_add(1, std::memory_order_relaxed);
-        // Flush mode leaves the commit nothing to compare.
-        if (mode == PinMode::Flush && result != nullptr && !result->tooLarge) return std::shared_ptr<PinnedDrawInputs>{};
+        if (pins->tooLarge) noteLargeDraw(draw, total, fetchedRanges);
+        // Flush and size modes leave the commit nothing to compare.
+        if ((mode == PinMode::Flush || mode == PinMode::Size) && result != nullptr && !result->tooLarge) return std::shared_ptr<PinnedDrawInputs>{};
         return result;
     };
     std::uint32_t maxIndex = 0;
@@ -1280,17 +1309,17 @@ std::shared_ptr<PinnedDrawInputs> PinDrawInputs(const State& state, const Pm4::D
         if (draw.indexSize != 2 && draw.indexSize != 4) return finish(nullptr);
         const auto index = pin(draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, 'i');
         if (!index) return finish(pins->tooLarge || !pins->ranges.empty() ? pins : nullptr);
+        if (mode == PinMode::Size && sizedIndices.empty()) return finish(nullptr);
         if (mode == PinMode::Index) return finish(pins);
         // As prepareDrawInputs sizes the vertex copies (with the restart index skipped whenever the
         // state enables it; a commit that counts it reads past the pinned bytes, from the guest).
-        const auto highest = HighestDrawIndex(pins->ranges[*index].bytes, draw.indexSize, state.primitiveRestart);
+        const auto highest = HighestDrawIndex(mode == PinMode::Size ? sizedIndices : std::span<const std::byte>(pins->ranges[*index].bytes), draw.indexSize, state.primitiveRestart);
         if (!highest || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) return finish(pins);
         maxIndex = *highest + draw.firstVertex;
     } else {
         if (mode == PinMode::Index || draw.indexCount == 0 || draw.instanceCount == 0 || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return finish(nullptr);
         maxIndex = draw.firstVertex + draw.indexCount - 1u;
     }
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> fetched;
     for (const auto& attribute : shaders.front().program->vertexAttributes) {
         if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) continue;
         std::size_t bytes = 0;

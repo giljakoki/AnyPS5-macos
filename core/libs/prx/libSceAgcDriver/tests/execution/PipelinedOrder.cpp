@@ -14,6 +14,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -201,6 +202,9 @@ void IndicesStoredWhileQueued() {
 }
 
 int main() {
+    // The copies the index-rewrite case checks are taken in the copy mode (the default size mode only
+    // records large draws on the worker); a mode set by the caller is kept.
+    setenv("APS5_PIN_DRAW_INPUTS", "copy", 0);
     try {
         {
             const auto device = OpenVulkanTestDevice();
