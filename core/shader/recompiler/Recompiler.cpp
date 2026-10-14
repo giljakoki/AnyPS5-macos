@@ -222,11 +222,25 @@ std::string HexAddress(std::uint64_t value) {
     return text;
 }
 
+struct LaneLocalLeft : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+bool OneLaneVertexFallback() {
+    static const bool disabled = std::getenv("APS5_NO_ONE_LANE_VERTEX") != nullptr;
+    return !disabled;
+}
+
+bool OneLaneVertexStage(const RecompileRequest& request) {
+    return request.target.subgroupSize == 1u && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local);
+}
+
 void LowerLaneLocal(const RecompileRequest& request, const ShaderStageInputInfo& inputInfo, IrProgram& program) {
     const auto stage = request.shader.stage;
     if (!LaneLocalStage(stage) || StageHasSubgroups(request.target, stage)) return;
     if (inputInfo.vertex == nullptr) throw std::runtime_error("vertex input metadata is missing");
-    const std::uint32_t lanes = request.context.waveSize == 64u && inputInfo.vertex->hostSubgroupSize == 32u ? 32u : request.context.waveSize;
+    const std::uint32_t hostLanes = inputInfo.vertex->hostSubgroupSize;
+    const std::uint32_t lanes = hostLanes == 1u ? 1u : request.context.waveSize == 64u && hostLanes == 32u ? 32u : request.context.waveSize;
     constexpr LaneLocalLowering laneLocalLowering;
     const auto remaining = laneLocalLowering.Lower(program, lanes);
     DumpIr(request, program, "lanes");
@@ -239,7 +253,7 @@ void LowerLaneLocal(const RecompileRequest& request, const ShaderStageInputInfo&
         message += (index == 0 ? " " : "; ") + use.description + " at " + HexAddress(code + use.startPc) + "-" + HexAddress(code + use.endPc);
     }
     if (remaining.size() > shown) message += "; and " + std::to_string(remaining.size() - shown) + " more";
-    throw std::runtime_error(message);
+    throw LaneLocalLeft(message);
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
@@ -478,7 +492,15 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     deadCodeEliminator.RemoveIdentities(program);
     deadCodeEliminator.Eliminate(program);
 
-    LowerLaneLocal(request, inputInfo, program);
+    try {
+        LowerLaneLocal(request, inputInfo, program);
+    } catch (const LaneLocalLeft&) {
+        const bool vertexStage = request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local;
+        if (!vertexStage || OneLaneVertexStage(request) || !OneLaneVertexFallback()) throw;
+        auto oneLane = request;
+        oneLane.target.subgroupSize = 1u;
+        return compileVariant(oneLane, PrepareResourceProgram(oneLane), emissionFailure);
+    }
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
