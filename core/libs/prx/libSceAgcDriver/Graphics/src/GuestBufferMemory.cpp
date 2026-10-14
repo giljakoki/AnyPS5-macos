@@ -3900,6 +3900,21 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
     return result;
 }
 
+std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, char>> GuestBufferMemory::TracedRegions() const {
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, char>> result;
+    if (!uploaded || committed) return result;
+    const auto add = [&](const auto& region) {
+        char kind = region.direct != nullptr ? 'd' : region.mirror != nullptr ? 'm' : 'c';
+        if (region.writable) kind = static_cast<char>(kind - 'a' + 'A');
+        result.push_back({{region.begin, region.end}, kind});
+    };
+    if (space != nullptr) {
+        for (const auto& region : space->base) add(region);
+    }
+    for (const auto& region : regions) add(region);
+    return result;
+}
+
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

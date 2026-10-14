@@ -287,6 +287,9 @@ public:
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
+    // APS5_TRACE_PRESENT_DRAWS: every region the build serves, with how ('d' imported in place, 'm' an
+    // image mirror, 'c' copied at the build; upper case when the shader may write it).
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, char>> TracedRegions() const;
 
 private:
     struct Region {

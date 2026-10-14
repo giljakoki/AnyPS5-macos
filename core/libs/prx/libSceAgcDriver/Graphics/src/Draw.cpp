@@ -1385,6 +1385,24 @@ struct ResidentRepeat {
 thread_local ResidentRepeat lastResident;
 std::atomic<std::uint64_t> residentRepeats{0};
 
+// APS5_TRACE_PRESENT_DRAWS: whether the CPU wrote what a pipelined draw reads (its buffer regions
+// and index buffer) between the worker queueing it and the committer recording it.
+void traceWindowWrites(const State& state, const Pm4::DrawParameters& draw, std::uint64_t indexBytes, const ShaderResources& resources) {
+    if (!PresentTrace::Enabled() || !PresentTrace::Committing()) return;
+    const auto since = PresentTrace::EnqueueGeneration();
+    if (since == 0) return;
+    const auto target = state.colors.empty() ? 0 : state.colors.front().address;
+    bool clean = true;
+    const auto check = [&](std::uint64_t begin, std::uint64_t end, char kind) {
+        if (end <= begin || GuestMemory::UnchangedSinceCollected(begin, static_cast<std::size_t>(end - begin), since)) return;
+        clean = false;
+        PresentTrace::WindowWrite(target, begin, end, kind);
+    };
+    for (const auto& [range, kind] : resources.TracedRegions()) check(range.first, range.second, kind);
+    if (draw.indexed && indexBytes != 0) check(draw.indexAddress, draw.indexAddress + indexBytes, 'i');
+    PresentTrace::WindowChecked(clean);
+}
+
 std::array<std::uint64_t, 15> residentRepeatKey(const ColorTarget& color) {
     return {color.address, color.bytes, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode), color.elementBytes, color.dccAddress, color.dccAlphaOnMsb ? 1u : 0u, color.cmaskAddress, color.surfaceAddress, (static_cast<std::uint64_t>(color.extent.width) << 32u) | color.extent.height, (static_cast<std::uint64_t>(color.surfaceExtent.width) << 32u) | color.surfaceExtent.height, color.mipCount, color.mip, color.depth, color.depthSlice};
 }
@@ -2296,6 +2314,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     if (PresentTrace::Enabled()) {
         resources->ForEachValidatedTexture([](std::uint64_t address, const void* source, std::uint64_t generation) { PresentTrace::Sampled(address, source, generation); });
         for (const auto& binding : targets) PresentTrace::TargetDraw(binding.color.address, binding.resident.get(), binding.resident != nullptr ? binding.resident->Generation() : 0, binding.resident != nullptr || binding.multisampled ? 'f' : 'c');
+        traceWindowWrites(state, draw, indexBytes, *resources);
     }
     // The memory-state decision of an indirect draw, made here after the resource build (which may
     // retire imports and wait for recorded work) and before anything is recorded, exactly as
@@ -2803,6 +2822,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     if (PresentTrace::Enabled()) {
         resources->ForEachValidatedTexture([](std::uint64_t address, const void* source, std::uint64_t generation) { PresentTrace::Sampled(address, source, generation); });
         for (std::size_t index = 0; index < targets.size(); ++index) PresentTrace::TargetDraw(state.colors[index].address, targets[index].get(), targets[index]->Generation(), 'r');
+        traceWindowWrites(state, draw, inputs.indexBytes, *resources);
     }
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);

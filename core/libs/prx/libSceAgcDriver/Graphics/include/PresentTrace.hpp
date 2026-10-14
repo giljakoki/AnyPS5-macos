@@ -33,6 +33,37 @@ public:
         return committing;
     }
 
+    // The write tracker's generation when the worker queued the draw being committed (0: none).
+    static std::uint64_t& EnqueueGeneration() {
+        static thread_local std::uint64_t generation = 0;
+        return generation;
+    }
+
+    // A committed draw into `target` read [begin, end) (kind as GuestBufferMemory::TracedRegions, 'i'
+    // the index buffer), which the CPU wrote after the worker queued the draw.
+    static void WindowWrite(std::uint64_t target, std::uint64_t begin, std::uint64_t end, char kind) {
+        if (!Enabled()) return;
+        auto& self = instance();
+        std::lock_guard lock(self.mutex);
+        auto it = self.frame.windowWrites.find(begin);
+        if (it == self.frame.windowWrites.end()) {
+            if (self.frame.windowWrites.size() >= Bound) {
+                ++self.frame.droppedWindowWrites;
+                return;
+            }
+            it = self.frame.windowWrites.emplace(begin, WindowWritten{end - begin, target, kind, 0}).first;
+        }
+        ++it->second.count;
+    }
+
+    // A committed draw whose reads were checked for CPU writes since its enqueue.
+    static void WindowChecked(bool clean) {
+        if (!Enabled()) return;
+        auto& self = instance();
+        std::lock_guard lock(self.mutex);
+        ++(clean ? self.frame.windowClean : self.frame.windowDirty);
+    }
+
     // A queue-0 draw packet the worker handled with CB0 at `address`; verdict 0 drawn (recorded or
     // queued), 1 nothing to draw, 2 rejected or thrown.
     static void WorkerDraw(std::uint64_t address, int verdict) {
@@ -165,7 +196,15 @@ private:
         std::uint64_t generation = 0;
         bool sameImage = false;
     };
+    struct WindowWritten {
+        std::uint64_t bytes;
+        std::uint64_t target;
+        char kind;
+        std::uint32_t count;
+    };
     struct Frame {
+        std::map<std::uint64_t, WindowWritten> windowWrites;
+        std::uint32_t droppedWindowWrites = 0, windowClean = 0, windowDirty = 0;
         std::map<std::uint64_t, Target> targets;
         std::map<std::pair<std::uint64_t, const void*>, Sample> samples;
         std::uint32_t droppedTargets = 0, droppedSamples = 0, skipped = 0;
@@ -209,6 +248,17 @@ private:
             else std::snprintf(text, sizeof(text), " s=%llx:snap@%llu:x%u@%u-%u/%u:p%ud%u", static_cast<unsigned long long>(key.first), static_cast<unsigned long long>(s.generation), s.count, s.firstAt, s.lastAt, total, s.pipelined, s.direct);
             line += text;
         }
+        if (frame.windowClean != 0 || frame.windowDirty != 0) {
+            // window=<committed draws whose reads the CPU left alone>/<draws reading CPU-written bytes>
+            std::snprintf(text, sizeof(text), " window=%u/%u", frame.windowClean, frame.windowDirty);
+            line += text;
+        }
+        for (const auto& [begin, w] : frame.windowWrites) {
+            // ww=<begin>+<bytes>:<kind>:x<draws>:t<target>
+            std::snprintf(text, sizeof(text), " ww=%llx+%llx:%c:x%u:t%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(w.bytes), w.kind, w.count, static_cast<unsigned long long>(w.target));
+            line += text;
+        }
+        if (frame.droppedWindowWrites != 0) line += " ww-dropped=" + std::to_string(frame.droppedWindowWrites);
         if (frame.droppedTargets != 0 || frame.droppedSamples != 0) {
             std::snprintf(text, sizeof(text), " dropped=%u/%u", frame.droppedTargets, frame.droppedSamples);
             line += text;
