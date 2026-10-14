@@ -75,6 +75,19 @@ VKAPI_ATTR VkResult VKAPI_CALL fakeQueueSubmit(VkQueue, std::uint32_t count, con
     return VK_SUCCESS;
 }
 
+// The barrier the host-read strip passes on (see hostBarrierSemantics).
+struct FakeBarrier {
+    VkPipelineStageFlags destination = 0;
+    VkAccessFlags memoryAccess = 0;
+    VkAccessFlags bufferAccess = 0;
+} fakeBarrier;
+
+VKAPI_ATTR void VKAPI_CALL fakeCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags destination, VkDependencyFlags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t, const VkImageMemoryBarrier*) {
+    fakeBarrier.destination = destination;
+    fakeBarrier.memoryAccess = memoryCount != 0 ? memory[0].dstAccessMask : 0;
+    fakeBarrier.bufferAccess = bufferCount != 0 ? buffers[0].dstAccessMask : 0;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fakeDeviceProc(VkDevice, const char* name) {
     const std::string_view wanted(name);
 #define FAKE(vkName, function) \
@@ -88,6 +101,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fakeDeviceProc(VkDevice, const char* na
     FAKE(vkDestroySemaphore, fakeDestroySemaphore)
     FAKE(vkGetSemaphoreCounterValue, fakeCounterValue)
     FAKE(vkQueueSubmit, fakeQueueSubmit)
+    FAKE(vkCmdPipelineBarrier, fakeCmdPipelineBarrier)
 #undef FAKE
     return nullptr;
 }
@@ -305,7 +319,40 @@ int unrelatedAddressableFrees() {
 
 }
 
+// The host-read strip (SetHostReadBarriersInert): a global memory barrier toward the host loses its
+// host read while the device says host reads are inert, keeps the host stage, and leaves buffer
+// barriers alone; off, or under APS5_KEEP_HOST_BARRIERS=1, the barrier reaches the driver unchanged.
+void hostBarrierSemantics() {
+    const auto guarded = GuardDeviceProc(&fakeDeviceProc);
+    const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(guarded(handleOf<VkDevice>(0x3200), "vkCmdPipelineBarrier"));
+    const auto commands = handleOf<VkCommandBuffer>(0x5300);
+    VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+    VkBufferMemoryBarrier buffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, handleOf<VkBuffer>(0x7100), 0, VK_WHOLE_SIZE};
+    const auto record = [&] { barrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 1, &buffer, 0, nullptr); };
+    const char* keep = std::getenv("APS5_KEEP_HOST_BARRIERS");
+    const bool kept = keep != nullptr && std::string_view(keep) != "0";
+    SetHostReadBarriersInert(false);
+    record();
+    Expect(fakeBarrier.memoryAccess == (VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT), "a host read was left out while host reads are not inert");
+    SetHostReadBarriersInert(true);
+    Expect(HostReadBarriersInert() == !kept, "APS5_KEEP_HOST_BARRIERS did not decide the strip");
+    TakeHostReadBarriersStripped();
+    record();
+    Expect(fakeBarrier.destination == (VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT), "the host stage was changed");
+    Expect(fakeBarrier.bufferAccess == VK_ACCESS_HOST_READ_BIT, "a buffer barrier's host read was changed");
+    Expect(memory.dstAccessMask == (VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT), "the caller's barrier was modified");
+    if (kept) {
+        Expect(fakeBarrier.memoryAccess == (VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT) && TakeHostReadBarriersStripped() == 0, "APS5_KEEP_HOST_BARRIERS=1 left a host read out");
+    } else {
+        Expect(fakeBarrier.memoryAccess == VK_ACCESS_SHADER_READ_BIT && TakeHostReadBarriersStripped() == 1, "an inert host read reached the driver");
+    }
+    SetHostReadBarriersInert(false);
+}
+
 int main() {
+    hostBarrierSemantics();
+    if (failures != 0) return 1;
+    std::printf("host barrier semantics passed\n");
     // APS5_FREE_GATE=0 runs only the device part, which then shows the loss the gate prevents.
     if (FreeGateEnabled()) {
         gateSemantics();

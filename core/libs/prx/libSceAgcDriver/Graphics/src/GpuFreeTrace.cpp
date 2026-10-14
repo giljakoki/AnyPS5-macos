@@ -457,6 +457,42 @@ VKAPI_ATTR void VKAPI_CALL guardedDestroyDevice(VkDevice device, const VkAllocat
     state.destroyDevice(device, allocator);
 }
 
+PFN_vkCmdPipelineBarrier cmdPipelineBarrierReal = nullptr;
+
+// Host-read visibility in global memory barriers (see SetHostReadBarriersInert). APS5_KEEP_HOST_BARRIERS=1
+// passes them to the driver unchanged.
+bool HostBarrierStripping() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_KEEP_HOST_BARRIERS");
+        return value == nullptr || std::string_view(value) == "0";
+    }();
+    return enabled;
+}
+std::atomic<bool> hostReadBarriersInert{false};
+std::atomic<std::uint64_t> hostReadBarriersStripped{0};
+
+VKAPI_ATTR void VKAPI_CALL strippedPipelineBarrier(VkCommandBuffer commands, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memoryBarriers, std::uint32_t bufferCount, const VkBufferMemoryBarrier* bufferBarriers, std::uint32_t imageCount, const VkImageMemoryBarrier* imageBarriers) {
+    // A global memory barrier making writes visible to host reads: with the driver's host-read sync
+    // inert for every resource, the access bit only costs a walk over all of them.
+    constexpr std::uint32_t Inline = 4;
+    VkMemoryBarrier stripped[Inline];
+    if ((destination & VK_PIPELINE_STAGE_HOST_BIT) != 0 && memoryCount != 0 && memoryCount <= Inline && hostReadBarriersInert.load(std::memory_order_relaxed)) {
+        bool any = false;
+        for (std::uint32_t i = 0; i < memoryCount; ++i) {
+            stripped[i] = memoryBarriers[i];
+            if ((stripped[i].dstAccessMask & VK_ACCESS_HOST_READ_BIT) != 0) {
+                stripped[i].dstAccessMask &= ~VK_ACCESS_HOST_READ_BIT;
+                any = true;
+            }
+        }
+        if (any) {
+            memoryBarriers = stripped;
+            hostReadBarriersStripped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    cmdPipelineBarrierReal(commands, source, destination, flags, memoryCount, memoryBarriers, bufferCount, bufferBarriers, imageCount, imageBarriers);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL guardedDeviceProc(VkDevice device, const char* name) {
     auto& state = State();
     const auto real = state.real(device, name);
@@ -471,6 +507,11 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL guardedDeviceProc(VkDevice device, cons
     if (std::strcmp(name, "vkDestroyImageView") == 0) return swap(state.destroyImageView, &guardedDestroyImageView);
     if (std::strcmp(name, "vkDestroyBufferView") == 0) return swap(state.destroyBufferView, &guardedDestroyBufferView);
     if (std::strcmp(name, "vkDestroyDevice") == 0) return swap(state.destroyDevice, &guardedDestroyDevice);
+    if (HostBarrierStripping() && std::strcmp(name, "vkCmdPipelineBarrier") == 0) {
+        const auto wrapped = StaleHandleWrapper(name, real);
+        cmdPipelineBarrierReal = reinterpret_cast<PFN_vkCmdPipelineBarrier>(wrapped != nullptr ? wrapped : real);
+        return reinterpret_cast<PFN_vkVoidFunction>(&strippedPipelineBarrier);
+    }
     if (GateEnabled()) {
         auto& gate = Gate();
         // The gate's own calls go straight to the driver, resolved per device at its first lookup.
@@ -523,7 +564,7 @@ void printFrame(void* frame) {
 }
 
 PFN_vkGetDeviceProcAddr GuardDeviceProc(PFN_vkGetDeviceProcAddr real) {
-    if (!Traced() && !Deferring() && !StaleHandlesTraced() && !GateEnabled()) return real;
+    if (!Traced() && !Deferring() && !StaleHandlesTraced() && !GateEnabled() && !HostBarrierStripping()) return real;
     if (GateEnabled()) std::fprintf(stderr, "[gpu-free] free gate: Vulkan memory and query pools are freed once every queue submission made before the free completed (APS5_FREE_GATE=0 disables)\n");
     if (StaleHandlesTraced()) std::fprintf(stderr, "[stale] APS5_TRACE_STALE_HANDLES: commands recording freed memory or destroyed objects, and memory freed while a command buffer uses it, are reported\n");
     auto& state = State();
@@ -544,6 +585,18 @@ void ReportImportRetirementsIfLinked(const char* why) {
 
 bool FreeGateEnabled() {
     return GateEnabled();
+}
+
+void SetHostReadBarriersInert(bool inert) {
+    hostReadBarriersInert.store(inert && HostBarrierStripping(), std::memory_order_relaxed);
+}
+
+bool HostReadBarriersInert() {
+    return hostReadBarriersInert.load(std::memory_order_relaxed);
+}
+
+std::uint64_t TakeHostReadBarriersStripped() {
+    return hostReadBarriersStripped.exchange(0, std::memory_order_relaxed);
 }
 
 void ReportGpuFrees(const char* why) {
