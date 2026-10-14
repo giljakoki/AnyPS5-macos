@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -339,6 +340,7 @@ void Driver::execute(const Submission& submission) {
             if (APS5_ENABLE_TIMING_LOG) frame->CollectBackground();
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
+            Graphics::PresentTrace::Flip();
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
             static const bool earlyFlips = [] {
@@ -419,6 +421,7 @@ void Driver::execute(const Submission& submission) {
                         if (ms >= 1.0) Graphics::UploadTrace("draw at DWORD %zu of serial=%llu took %.1f ms on the worker", cursor, static_cast<unsigned long long>(submission.serial), ms);
                     }
                     drawn = verdict == DrawVerdict::Drawn;
+                    if (submission.queue == 0) Graphics::PresentTrace::WorkerDraw(color, verdict == DrawVerdict::Drawn ? 0 : verdict == DrawVerdict::Nothing ? 1 : 2);
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
                         countSkip(Graphics::DrawSkip::Prechecked);
@@ -431,6 +434,7 @@ void Driver::execute(const Submission& submission) {
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
+                    if (submission.queue == 0) Graphics::PresentTrace::WorkerDraw(color, 2);
                     if (!SkipFailedWork()) throw;
                     NoteSkippedWork(error.what(), "draw");
                 }

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -229,6 +230,7 @@ void DrawPipeline::run() {
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
+        Graphics::PresentTrace::Committing() = true;
         try {
             (*commit)();
         } catch (const std::exception& error) {
@@ -239,6 +241,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
+        Graphics::PresentTrace::Committing() = false;
         const auto spent = elapsedNs(start);
         std::lock_guard lock(mutex);
         items.pop_front();

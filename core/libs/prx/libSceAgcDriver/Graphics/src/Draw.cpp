@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -2154,7 +2155,10 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
-    if (inputs.nothing) return;
+    if (inputs.nothing) {
+        for (const auto& color : state.colors) PresentTrace::TargetDraw(color.address, nullptr, 0, 'n');
+        return;
+    }
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     timing.Mark("validate");
@@ -2289,6 +2293,10 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
+    if (PresentTrace::Enabled()) {
+        resources->ForEachValidatedTexture([](std::uint64_t address, const void* source, std::uint64_t generation) { PresentTrace::Sampled(address, source, generation); });
+        for (const auto& binding : targets) PresentTrace::TargetDraw(binding.color.address, binding.resident.get(), binding.resident != nullptr ? binding.resident->Generation() : 0, binding.resident != nullptr || binding.multisampled ? 'f' : 'c');
+    }
     // The memory-state decision of an indirect draw, made here after the resource build (which may
     // retire imports and wait for recorded work) and before anything is recorded, exactly as
     // VulkanDevice::dispatch decides for DISPATCH_INDIRECT: the GPU reads the records in place from
@@ -2750,6 +2758,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
     if (inputs.nothing) {
+        for (const auto& color : state.colors) PresentTrace::TargetDraw(color.address, nullptr, 0, 'n');
         result.recorded = true;
         return result;
     }
@@ -2791,6 +2800,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
         return miss(DrawRecipeMiss::Proof);
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    if (PresentTrace::Enabled()) {
+        resources->ForEachValidatedTexture([](std::uint64_t address, const void* source, std::uint64_t generation) { PresentTrace::Sampled(address, source, generation); });
+        for (std::size_t index = 0; index < targets.size(); ++index) PresentTrace::TargetDraw(state.colors[index].address, targets[index].get(), targets[index]->Generation(), 'r');
+    }
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
