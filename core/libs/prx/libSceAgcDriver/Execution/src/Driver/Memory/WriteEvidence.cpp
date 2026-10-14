@@ -204,6 +204,20 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     return validateSkipVerify() ? Policy::VerifyRaw : Policy::Raw;
 }
 
+// A cache entry's captured bytes are compared with guest memory on the worker: a queued pipeline item
+// that writes them (a fill, a label, a draw's storage writes) has not been recorded yet, so neither
+// the recorder's pending view nor guest memory shows it. The pipeline is drained first.
+void Driver::drainQueuedWritesOver(std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    if (!DrawPipeline::Active()) return;
+    auto& pipeline = DrawPipeline::Queue0();
+    if (!pipeline.Busy() || GuestMemory::GpuMutex().HeldByThisThread()) return;
+    for (const auto& region : regions) {
+        if (!pipeline.Overlaps(region.guestAddress, region.bytes.size())) continue;
+        pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        return;
+    }
+}
+
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();

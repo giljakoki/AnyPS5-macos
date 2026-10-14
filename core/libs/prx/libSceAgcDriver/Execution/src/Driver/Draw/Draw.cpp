@@ -316,6 +316,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
     }
 
+    // What the worker read for this draw (its stages' captures and decode reads, a draw-cache hit's
+    // validated bytes) may be written by an item still queued for the committer (a label, a fill, an
+    // earlier draw's storage writes): then the reads were stale, so the pipeline is drained and the
+    // draw prepared again, as recordQueuedLabelsAfterCapture does for queued labels.
+    if (pipelined && DrawPipeline::Queue0().Busy()) {
+        auto& pipeline = DrawPipeline::Queue0();
+        if (std::any_of(memory.begin(), memory.end(), [&](const ShaderRecompiler::MemoryRegion& region) { return pipeline.Overlaps(region.guestAddress, region.bytes.size()); })) {
+            pipeline.Drain(DrawPipeline::DrainReason::Capture);
+            return draw(queue, packet, submission, rejected);
+        }
+    }
     if (pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
 
@@ -501,6 +512,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         timing.Mark("draw_enqueued");
         return drawn();
     }
+    // Recorded here, on the worker (a mesh-emulated draw): every queued item comes first.
+    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);

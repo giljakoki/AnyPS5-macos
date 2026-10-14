@@ -188,6 +188,7 @@ private:
     static bool knownValueCurrent(const WrittenBuffer& writer);
     ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {});
     static ShaderMemory::PendingWrite queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
+    static void drainQueuedWritesOver(std::span<const ShaderRecompiler::MemoryRegion> regions);
     template<typename TVisit>
     static void forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);
     void noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled);

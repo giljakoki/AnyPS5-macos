@@ -13,6 +13,7 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
     bool stable = true;
     std::uint64_t rawRegions = 0, mismatches = 0;
     double waited = 0;
+    drainQueuedWritesOver(captured);
     PendingView pending;
     pending.Load();
     thread_local std::vector<std::byte>* knownSlot = nullptr;

@@ -201,6 +201,8 @@ void Driver::run(std::uint32_t id) noexcept {
                         const bool storeIdleResults = id == 0 && allQueuesIdle() && !completionsPending();
                         lock.unlock();
                         if (storeIdleResults) {
+                            // The committer may still hold this queue's last items: the results it records belong in the store.
+                            if (id == 0) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
                             if (const auto localDevice = device.Load()) {
                                 auto* hitches = FrameHitches();
                                 const auto storeStart = hitches != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

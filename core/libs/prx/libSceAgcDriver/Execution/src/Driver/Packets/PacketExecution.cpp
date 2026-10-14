@@ -236,6 +236,8 @@ void Driver::execute(const Submission& submission) {
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
         if (predicated) {
+            // The predicate is read here, on the worker: a queued item may still write it.
+            if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
             if (!Pm4::PredicationPasses(queue)) {
