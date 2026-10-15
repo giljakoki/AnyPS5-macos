@@ -566,9 +566,13 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
         const auto borderType = (words[3] >> 30u) & 0x3u;
         const bool border = addressX == EmulatedCompare::AddressBorder || addressY == EmulatedCompare::AddressBorder;
         if (border && borderType == 3u) throw std::runtime_error("comparison sampling of a color texture with a border color table is not implemented");
-        if (magFilter != minFilter || magFilter > 1u) throw std::runtime_error("comparison sampling of a color texture is implemented only with equal point or bilinear minification and magnification filters");
+        // The emulation filters one level with either point or bilinear taps. A single-level texture is sampled at
+        // level 0, where the magnification filter applies; otherwise filter bilinearly when either filter is not
+        // point. Anisotropic filters (2, 3) are bilinear here. Unity's shadow samplers mix point and bilinear.
+        const bool singleLevelImage = ((descriptor.dwords[3] >> 12u) & 0xfu) == ((descriptor.dwords[3] >> 16u) & 0xfu);
+        const bool linear = singleLevelImage ? magFilter != 0u : (magFilter != 0u || minFilter != 0u);
         if (unnormalized) throw std::runtime_error("comparison sampling of a color texture does not implement unnormalized coordinates");
-        const auto state = EmulatedCompare::Enabled | (function << EmulatedCompare::FunctionShift) | (magFilter == 1u ? EmulatedCompare::Linear : 0u)
+        const auto state = EmulatedCompare::Enabled | (function << EmulatedCompare::FunctionShift) | (linear ? EmulatedCompare::Linear : 0u)
             | (addressX << EmulatedCompare::ClampXShift) | (addressY << EmulatedCompare::ClampYShift) | (border && borderType == 2u ? EmulatedCompare::BorderWhite : 0u);
         if (samplerState.has_value() && *samplerState != state) throw std::runtime_error("comparison sampling of a color texture through samplers that disagree is not implemented");
         samplerState = state;
