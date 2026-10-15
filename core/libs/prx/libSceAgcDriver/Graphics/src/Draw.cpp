@@ -2015,7 +2015,19 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    // A fill deferred past the open pass is checked against the draw's in-place input reads too.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inputReads;
+    if (recorder->RenderPassOpen() && Recorder::DeferredFillsEnabled()) {
+        inputReads = resources.InPlaceReads();
+        inputReads.insert(inputReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+        passAccess.inputReads = inputReads;
+    }
+    if (Recorder::PassesProfiled()) {
+        const bool depthAttached = state.depth.has_value() && !record.targetViews.empty();
+        passAccess.colorKey = DrawRenderPassKey(context, state, depthAttached ? record.targetViews.first(record.targetViews.size() - 1) : record.targetViews);
+        passAccess.depthAttached = depthAttached;
+    }
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     std::vector<Recorder::ClearableAttachment> clearable;
     if (recorder->HasDeferredClears() && record.proxies.empty() && state.samples == 1 && record.framebuffer != nullptr) {

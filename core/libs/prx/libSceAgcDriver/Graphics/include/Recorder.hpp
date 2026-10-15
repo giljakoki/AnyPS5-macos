@@ -124,6 +124,21 @@ public:
     bool DeferClear(DeferredClear clear);
     bool HasDeferredClears() const { return open != nullptr && !open->deferredClears.empty(); }
     bool HasDeferredClear(VkImage image) const;
+    // A buffer fill (VulkanDevice::FillBuffer) asked for while a draw's render pass is open is
+    // recorded when the pass ends instead of ending it: the draws recorded before it precede it
+    // either way, and a later draw whose access may touch [begin, end) ends the pass first
+    // (StartDrawPass). `record` records the fill with its own leading and trailing barriers.
+    // APS5_NO_DEFERRED_FILLS=1 records every fill at once (ending the pass).
+    struct DeferredFill {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::function<void(VkCommandBuffer)> record;
+    };
+    static bool DeferredFillsEnabled();
+    // APS5_PROFILE_DRAW or APS5_PROFILE_GPU: the [passes] lines are collected.
+    static bool PassesProfiled();
+    bool RenderPassOpen() const { return open != nullptr && open->renderPass.open; }
+    void DeferFill(DeferredFill fill);
     struct ClearableAttachment {
         std::uint32_t attachment = 0;
         VkImage image = VK_NULL_HANDLE;
@@ -719,12 +734,17 @@ private:
             bool open = false;
             bool fenced = false;
             std::uint64_t key = 0;
+            // For the [passes] profile: the key of the color attachments alone and whether the
+            // pass has a depth attachment (PassAccess::colorKey, depthAttached).
+            std::uint64_t colorKey = 0;
+            bool depthAttached = false;
             std::uint32_t timing = NoTiming;
             std::uint32_t targetTiming = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         PassHazards passHazards;
         std::vector<DeferredClear> deferredClears;
+        std::vector<DeferredFill> deferredFills;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).

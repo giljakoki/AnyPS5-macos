@@ -6071,6 +6071,46 @@ void deferredClearTests(const Device& device, Recorder& recorder) {
                 ClearDepthSurfaces(context.device);
             }
         }
+        {
+            // A fill deferred past an open pass: a draw that leaves its range alone continues the
+            // pass, one whose (input) reads overlap it ends the pass and the fill lands first.
+            Buffer filled(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            std::memset(filled.Bytes().data(), 0, 256);
+            int recorded = 0;
+            const auto deferFill = [&](std::uint32_t word) {
+                recorder.DeferFill({0x1000, 0x1100, [&, word](VkCommandBuffer commands) {
+                    ++recorded;
+                    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, filled.Handle(), 0, 256, word);
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                }});
+            };
+            const auto draw = [&](const PassAccess& access) {
+                auto start = recorder.StartDrawPass(0xf111, false, false, access, {}, {side, side});
+                if (!start.continued) pipeline->Begin(start.commands, *framebuffer, {side, side}, state, {});
+                recorder.LeaveRenderPassOpen(0xf111, Recorder::NoTiming, false, access);
+                return start.continued;
+            };
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> apart{{{0x2000, 0x2100}}};
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> inside{{{0x1080, 0x1090}}};
+            static_cast<void>(draw(PassAccess{}));
+            Require(recorder.RenderPassOpen(), "a draw left no pass open");
+            deferFill(0xabababab);
+            Require(draw(PassAccess{apart}) && recorded == 0, "a draw apart from a deferred fill did not continue the pass, or the fill was recorded");
+            PassAccess input{};
+            input.inputReads = inside;
+            Require(!draw(input) && recorded == 1, "a draw reading a deferred fill's range in place continued the pass before the fill");
+            deferFill(0xcdcdcdcd);
+            PassAccess unknown{};
+            unknown.anyReads = true;
+            Require(!draw(unknown) && recorded == 2, "a draw of unknown reads continued the pass past a deferred fill");
+            deferFill(0x12121212);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            std::uint32_t word = 0;
+            std::memcpy(&word, filled.Bytes().data() + 128, 4);
+            Require(recorded == 3 && word == 0x12121212u, "a deferred fill did not land at Submit");
+        }
     }
     ClearCachedTextures(context.device);
     ClearCachedPipelines(context.device);

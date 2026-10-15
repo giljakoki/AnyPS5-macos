@@ -1391,8 +1391,16 @@ bool passProfiled() {
     return profiled;
 }
 
-enum class PassEnd : std::uint8_t { Command, TargetChanged, Hazard, Forced, DeferredClear, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(PassEnd::Count)> PassEndNames{"other command", "another target or state", "hazard", "forced", "deferred clear"};
+enum class PassEnd : std::uint8_t { Command, TargetChanged, Hazard, Forced, DeferredClear, DeferredFill, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(PassEnd::Count)> PassEndNames{"other command", "another target or state", "hazard", "forced", "deferred clear", "deferred fill"};
+// The [passes] line's split of target changes (by the open pass's and the next draw's color key
+// and depth attachment) and of hazards (by kind, and whether the next draw had the same target).
+enum class TargetChange : std::uint8_t { DepthToggled, SameColors, OtherColors, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(TargetChange::Count)> TargetChangeNames{"depth attachment toggled", "same colors otherwise", "other colors"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetChange::Count)> targetChanges{};
+constexpr std::array<const char*, 7> PassHazardNames{"none", "raw", "waw", "war", "image", "unknown read", "unknown write"};
+std::array<std::atomic<std::uint64_t>, 7> hazardsSameTarget{}, hazardsOtherTarget{};
+std::atomic<std::uint64_t> fillsDeferred{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PassEnd::Count)> passEnds{};
 std::atomic<std::uint64_t> passesBegun{0};
 std::atomic<std::uint64_t> clearsDeferred{0};
@@ -1446,6 +1454,18 @@ void reportPassEnds() {
     }
     const auto breakers = topCallers(passBreakers);
     AgcDriver::ProfilePrint_nid_no_patch("[passes] %llu render passes begun (10 s); ended by: %s; ending commands (offset of the caller<its caller in their modules):%s\n", static_cast<unsigned long long>(passesBegun.exchange(0, std::memory_order_relaxed)), line.c_str(), breakers.c_str());
+    std::string changes, hazards;
+    for (std::size_t i = 0; i < targetChanges.size(); ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 0 ? "" : ",", TargetChangeNames[i], static_cast<unsigned long long>(targetChanges[i].exchange(0, std::memory_order_relaxed)));
+        changes += text;
+    }
+    for (std::size_t i = 1; i < PassHazardNames.size(); ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %s %llu/%llu", i == 1 ? "" : ",", PassHazardNames[i], static_cast<unsigned long long>(hazardsSameTarget[i].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(hazardsOtherTarget[i].exchange(0, std::memory_order_relaxed)));
+        hazards += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[passes] target changes (incl. those with a hazard):%s; hazards by kind, same target/another target:%s; %llu fills deferred past an open pass\n", changes.c_str(), hazards.c_str(), static_cast<unsigned long long>(fillsDeferred.exchange(0, std::memory_order_relaxed)));
     const auto deferred = clearsDeferred.exchange(0, std::memory_order_relaxed);
     if (deferred == 0) return;
     const auto recorders = topCallers(clearRecorders);
@@ -1462,6 +1482,21 @@ bool Recorder::DeferredClearsEnabled() {
 bool Recorder::DeferredDepthClearsEnabled() {
     static const bool enabled = DeferredClearsEnabled() && std::getenv("APS5_NO_DEFERRED_DEPTH_CLEARS") == nullptr;
     return enabled;
+}
+
+bool Recorder::PassesProfiled() {
+    return passProfiled();
+}
+
+bool Recorder::DeferredFillsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DEFERRED_FILLS") == nullptr;
+    return enabled;
+}
+
+void Recorder::DeferFill(DeferredFill fill) {
+    Require(open != nullptr && open->renderPass.open && fill.record, "a fill is deferred only past an open render pass");
+    if (passProfiled()) fillsDeferred.fetch_add(1, std::memory_order_relaxed);
+    open->deferredFills.push_back(std::move(fill));
 }
 
 bool Recorder::HasDeferredClear(VkImage image) const {
@@ -1523,8 +1558,17 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     ensureOpen();
     auto& pass = open->renderPass;
     const bool clearsPending = !open->deferredClears.empty();
-    if (!pass.open || forced || clearsPending || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
-        if (pass.open) notePassEnd(forced || !clearsPending ? PassEnd::Forced : PassEnd::DeferredClear);
+    // A draw that may touch a deferred fill's range sees the fill: the pass ends (recording it).
+    const bool fillHazard = pass.open && !open->deferredFills.empty() && (access.anyReads || access.anyWrites || std::any_of(open->deferredFills.begin(), open->deferredFills.end(), [&](const DeferredFill& fill) {
+        const auto overlaps = [&](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < fill.end && fill.begin < range.second; }); };
+        return overlaps(access.reads) || overlaps(access.writes) || overlaps(access.inputReads);
+    }));
+    if (pass.open && passProfiled() && !forced && !clearsPending && !fillHazard && pass.key != key) {
+        const auto change = pass.colorKey != access.colorKey ? TargetChange::OtherColors : pass.depthAttached != access.depthAttached ? TargetChange::DepthToggled : TargetChange::SameColors;
+        targetChanges[static_cast<std::size_t>(change)].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!pass.open || forced || clearsPending || fillHazard || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        if (pass.open) notePassEnd(forced ? PassEnd::Forced : clearsPending ? PassEnd::DeferredClear : fillHazard ? PassEnd::DeferredFill : PassEnd::Forced);
         if (passProfiled()) passesBegun.fetch_add(1, std::memory_order_relaxed);
         if (pass.open) endOpenRenderPass();
         std::vector<TakenClear> taken;
@@ -1546,6 +1590,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard != PassHazard::None && passProfiled()) (pass.key == key ? hazardsSameTarget : hazardsOtherTarget)[static_cast<std::size_t>(hazard)].fetch_add(1, std::memory_order_relaxed);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     notePassEnd(hazard != PassHazard::None ? PassEnd::Hazard : PassEnd::TargetChanged);
@@ -1572,6 +1617,8 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     }
     pass.open = true;
     pass.key = key;
+    pass.colorKey = access.colorKey;
+    pass.depthAttached = access.depthAttached;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
 }
@@ -1589,6 +1636,13 @@ void Recorder::endOpenRenderPass(bool barrier) {
     if (pass.afterPass) pass.afterPass(open->commands);
     EndGpuTiming(pass.targetTiming);
     EndGpuTiming(pass.timing);
+    // Fills asked for while the pass was open, after its draws (each with its own barriers; the
+    // pass's trailing barrier above still covers what is recorded after them).
+    if (!open->deferredFills.empty()) {
+        auto fills = std::move(open->deferredFills);
+        open->deferredFills.clear();
+        for (auto& fill : fills) fill.record(open->commands);
+    }
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
     pass = {};

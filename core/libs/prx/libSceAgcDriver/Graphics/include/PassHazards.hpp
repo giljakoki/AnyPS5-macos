@@ -22,6 +22,14 @@ struct PassAccess {
     std::span<const std::pair<VkImage, bool>> attachments;
     bool anyReads = false;
     bool anyWrites = false;
+    // Regions read in place that the draw-to-draw checks leave out (index and vertex buffers, no
+    // draw writes them): only a fill deferred past the open pass is checked against them
+    // (Recorder::DeferFill).
+    GuestRangeList inputReads;
+    // For the [passes] profile only: the key of the color attachments and extent alone, and
+    // whether a depth attachment is bound (a target change that only toggles depth is told apart).
+    std::uint64_t colorKey = 0;
+    bool depthAttached = false;
 };
 
 enum class PassHazard : std::uint8_t { None, ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, UnknownRead, UnknownWrite };

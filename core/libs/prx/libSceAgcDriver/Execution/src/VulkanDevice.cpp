@@ -2017,6 +2017,40 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     }
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
+    // Inside an open draw pass the fill is recorded when the pass ends, after its draws, instead
+    // of ending it (Recorder::DeferFill: a later draw that may touch the range ends the pass
+    // first). The import's buffer outlives the batch even if the import retires meanwhile.
+    if ((uniform || patternBuffer != nullptr) && recorder.RenderPassOpen() && Graphics::Recorder::DeferredFillsEnabled() && !Graphics::Recorder::BarrierValidate()) {
+        const auto offset = address - import->base;
+        const VkBuffer target = import->buffer;
+        const VkBuffer source = patternBuffer != nullptr ? patternBuffer->Handle() : VK_NULL_HANDLE;
+        const auto word = pattern[0];
+        recorder.DeferFill({address, address + bytes, [context, target, source, offset, bytes, word](VkCommandBuffer commands) {
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            Graphics::Recorder::CountBarriers(Graphics::Recorder::CommandClass::Fill);
+            if (source == VK_NULL_HANDLE) {
+                context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, target, offset, bytes, word);
+            } else {
+                const std::size_t chunk = PatternBufferBytes;
+                std::vector<VkBufferCopy> copies;
+                for (std::size_t done = 0; done < bytes; done += chunk) copies.push_back({0, offset + done, std::min(chunk, bytes - done)});
+                context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, source, target, static_cast<std::uint32_t>(copies.size()), copies.data());
+            }
+            // As below, and the vertex, index and uniform reads of draws in a pass that follows
+            // without a leading barrier of its own (a merged one, Recorder::StartDrawPass).
+            constexpr VkAccessFlags visible = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, visible);
+            Graphics::Recorder::CountBarriers(Graphics::Recorder::CommandClass::Fill);
+        }});
+        if (uniform) ++uniformFills;
+        else ++patternFills;
+        phase(recordMs);
+        if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
+        else recorder.NotePendingWrite(address, bytes);
+        GuestMemory::MarkWritten(address, bytes);
+        phase(notesMs);
+        return true;
+    }
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
