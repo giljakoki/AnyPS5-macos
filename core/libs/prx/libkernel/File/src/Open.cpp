@@ -127,6 +127,8 @@ static int MapFlags(int sceFlags) {
 }
 #else
 #include <fcntl.h>
+#include <mutex>
+#include <sys/resource.h>
 #include <unistd.h>
 static int NativeOpen(const std::filesystem::path& p, int nativeFlags, std::uint16_t mode) {
     return ::open(p.c_str(), nativeFlags, static_cast<mode_t>(mode));
@@ -143,6 +145,36 @@ static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
     return result == -2 ? ::write(fd, buf, n) : result;
 }
 static int NativeClose(int fd) { return ::close(fd); }
+// Unity's PS5 file layer keeps a per-thread pread window keyed only by the
+// descriptor number and never drops it on close, so a number handed straight
+// back to the next open serves the previous file's bytes (Outer Wilds read a
+// serialized string length from another file and crashed). Allocate guest file
+// numbers round-robin below the guest FD_SETSIZE instead of lowest-free, so a
+// closed number comes back only after the whole range has been cycled.
+static int RotateDescriptor(int fd) {
+    static constexpr int GuestFdSetSize = 1024;
+    static auto& lock = *new std::mutex;  // also used by opens after static destruction
+    static int next = 0;
+    rlimit limit{};
+    const int ceiling = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < static_cast<rlim_t>(GuestFdSetSize)
+        ? static_cast<int>(limit.rlim_cur) : GuestFdSetSize;
+    std::lock_guard guard(lock);
+    if (fd >= next || fd >= ceiling) {
+        next = fd + 1;
+        return fd;
+    }
+    const int moved = ::fcntl(fd, F_DUPFD, next);
+    if (moved < 0 || moved >= ceiling) {
+        if (moved >= 0) ::close(moved);
+        next = fd + 1;
+        return fd;
+    }
+    const int descriptorFlags = ::fcntl(fd, F_GETFD);
+    if (descriptorFlags > 0) ::fcntl(moved, F_SETFD, descriptorFlags);
+    ::close(fd);
+    next = moved + 1;
+    return moved;
+}
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::unlink(p.c_str());
 }
@@ -233,6 +265,9 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
+#ifndef _WIN32
+    fd = RotateDescriptor(fd);
+#endif
     return fd;
 }
 
