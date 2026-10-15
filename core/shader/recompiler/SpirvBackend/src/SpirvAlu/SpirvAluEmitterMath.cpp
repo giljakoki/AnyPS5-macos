@@ -20,7 +20,7 @@ struct Pair {
 };
 
 std::uint32_t Exact(SpirvEmitterState& state, std::uint32_t result) {
-    state.module.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+    if (!state.relaxedFloat) state.module.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
     return result;
 }
 

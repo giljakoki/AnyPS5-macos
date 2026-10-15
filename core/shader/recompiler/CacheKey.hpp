@@ -246,6 +246,7 @@ private:
         append(key, value.narrowSubgroupClock);
         append(key, value.float64DenormPreserve);
         append(key, value.float64AsFloat32);
+        append(key, value.relaxedFloat);
         append(key, value.subgroupStages);
     }
 };
