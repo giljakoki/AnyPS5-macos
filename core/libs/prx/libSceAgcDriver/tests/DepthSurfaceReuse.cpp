@@ -9,6 +9,9 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <set>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -24,6 +27,7 @@ constexpr std::uint32_t FormatR8G8B8A8Unorm = 56;
 constexpr std::uint32_t TileDepth64KB = 0x18;
 constexpr std::uint32_t TileRenderTarget64KB = 0x1b;
 constexpr std::uint32_t Type2D = 9;
+constexpr std::uint32_t TypeCube = 11;
 constexpr std::uint32_t Type2DArray = 13;
 
 std::uintptr_t nextHandle = 0x1000;
@@ -33,7 +37,11 @@ THandle newHandle() {
     return reinterpret_cast<THandle>(nextHandle += 0x10);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*, VkImage* image) {
+VkImageCreateInfo lastImageInfo{};
+VkImageViewCreateInfo lastViewInfo{};
+
+VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
+    lastImageInfo = *info;
     *image = newHandle<VkImage>();
     return VK_SUCCESS;
 }
@@ -51,7 +59,8 @@ VKAPI_ATTR VkResult VKAPI_CALL bindImageMemory(VkDevice, VkImage, VkDeviceMemory
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL createImageView(VkDevice, const VkImageViewCreateInfo*, const VkAllocationCallbacks*, VkImageView* view) {
+VKAPI_ATTR VkResult VKAPI_CALL createImageView(VkDevice, const VkImageViewCreateInfo* info, const VkAllocationCallbacks*, VkImageView* view) {
+    lastViewInfo = *info;
     *view = newHandle<VkImageView>();
     return VK_SUCCESS;
 }
@@ -109,6 +118,17 @@ VKAPI_ATTR void VKAPI_CALL formatProperties(VkPhysicalDevice, VkFormat, VkFormat
     properties->optimalTilingFeatures = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 }
 
+struct LayerCopy {
+    VkImage source;
+    VkImage destination;
+    VkImageCopy region;
+};
+std::vector<LayerCopy> layerCopies;
+
+VKAPI_ATTR void VKAPI_CALL cmdCopyImage(VkCommandBuffer, VkImage source, VkImageLayout, VkImage destination, VkImageLayout, std::uint32_t count, const VkImageCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) layerCopies.push_back({source, destination, regions[i]});
+}
+
 PFN_vkVoidFunction VKAPI_CALL deviceProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
         {"vkCreateImage", reinterpret_cast<PFN_vkVoidFunction>(createImage)},
@@ -129,7 +149,8 @@ PFN_vkVoidFunction VKAPI_CALL deviceProc(VkDevice, const char* name) {
         {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(destroyImage)},
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(freeMemory)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(cmdPipelineBarrier)},
-        {"vkCmdClearDepthStencilImage", reinterpret_cast<PFN_vkVoidFunction>(cmdClearDepthStencilImage)}
+        {"vkCmdClearDepthStencilImage", reinterpret_cast<PFN_vkVoidFunction>(cmdClearDepthStencilImage)},
+        {"vkCmdCopyImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImage)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -222,6 +243,40 @@ void RunDepthSurfaceReuseTests() {
     Require(DepthSurfaceAt(depth32) && first != VK_NULL_HANDLE, "a depth target bound again after its retirement gets a fresh surface");
     Require(DepthSurfaceView(context, {depth32, 0, {384, 384}, VK_FORMAT_D32_SFLOAT, 1.0f, 0}) == first, "the fresh surface serves the next binding of the same target");
     Require(lookup(context, {depth32, FormatR32Float, 384, 384}) != nullptr, "the fresh surface serves samples again");
+
+    {
+        // A point light's D16 cube shadow map: each face drawn as its own slice (DB_DEPTH_VIEW
+        // SLICE_START), then sampled as one R16 unorm cube (Outer Wilds).
+        constexpr std::uint64_t cube = 0x70000000;
+        const VkExtent2D extent{1024, 1024};
+        const auto stride = DepthSliceBytes(extent, 2u);
+        for (std::uint32_t face = 0; face < 5; ++face) DepthSurfaceView(context, {cube + face * stride, 0, extent, VK_FORMAT_D16_UNORM, 1.0f, 0});
+        std::string missing;
+        try {
+            lookup(context, {cube, FormatR16Unorm, 1024, 1024, TileDepth64KB, TypeCube, 5});
+        } catch (const std::runtime_error& error) {
+            missing = error.what();
+        }
+        Require(missing.find("slice 5") != std::string::npos, "a cube over depth slices of which one was never drawn must name the missing slice");
+        DepthSurfaceView(context, {cube + 5 * stride, 0, extent, VK_FORMAT_D16_UNORM, 1.0f, 0});
+        layerCopies.clear();
+        const auto sampled = lookup(context, {cube, FormatR16Unorm, 1024, 1024, TileDepth64KB, TypeCube, 5});
+        Require(sampled != nullptr && lastImageInfo.format == VK_FORMAT_D16_UNORM && lastImageInfo.arrayLayers == 6 && (lastImageInfo.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0, "a D16 cube sampled as R16 unorm must get a cube-compatible six-layer D16 image");
+        Require(lastViewInfo.viewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY && lastViewInfo.format == VK_FORMAT_D16_UNORM && lastViewInfo.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && lastViewInfo.subresourceRange.layerCount == 6, "the cube must be sampled, as shaders address cubes, through a six-layer array view of the depth aspect");
+        std::set<VkImage> sources;
+        bool exact = layerCopies.size() == 6;
+        for (std::uint32_t face = 0; exact && face < 6; ++face) {
+            const auto& copy = layerCopies[face];
+            sources.insert(copy.source);
+            exact = copy.destination == sampled->Image() && copy.region.srcSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && copy.region.dstSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && copy.region.srcSubresource.baseArrayLayer == 0 && copy.region.dstSubresource.baseArrayLayer == face && copy.region.dstSubresource.layerCount == 1 && copy.region.extent.width == 1024 && copy.region.extent.height == 1024 && copy.region.extent.depth == 1;
+        }
+        Require(exact && sources.size() == 6 && sources.count(sampled->Image()) == 0, "each face's depth plane must be copied, same format, into its own layer");
+        layerCopies.clear();
+        Require(lookup(context, {cube, FormatR16Unorm, 1024, 1024, TileDepth64KB, TypeCube, 5}) == sampled && layerCopies.size() == 6, "every lookup of the cube must copy the faces anew, so faces drawn since are seen");
+        const auto words = tsharp({cube, FormatR16Unorm, 1024, 1024, TileDepth64KB, TypeCube, 5});
+        Require(!DepthSurfaceHolds(context, DecodeTextureResource(words), sampled.get()), "a layered depth lookup must never be fast-proven");
+        for (std::uint32_t face = 0; face < 6; ++face) RetireDepthSurfacesAt(context, cube + face * stride);
+    }
 
     static constexpr std::array<std::uint32_t, 12> storeKernel{0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u, 0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du, 0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u};
     const auto storeUserData = [](std::uint64_t image, std::uint32_t width, std::uint32_t height, std::uint64_t value) {

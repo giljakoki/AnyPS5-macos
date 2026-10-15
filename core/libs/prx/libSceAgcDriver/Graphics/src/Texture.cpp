@@ -808,6 +808,95 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
 
+Texture::Texture(const Context& context, VkFormat depthFormat, const GuestTextureResource& descriptor, std::uint32_t layers, VkComponentMapping components, DepthLayersTag) : context(context), depthFormat(depthFormat) {
+    try {
+        Require(descriptor.dimension == TextureDimension::kCube || descriptor.dimension == TextureDimension::k2DArray, "depth layers need a cube or 2D array texture");
+        Require(layers > descriptor.baseArray, "depth layers view no slice");
+        copyWidth = descriptor.width;
+        copyHeight = descriptor.height;
+        copyLevels = 1;
+        copyLayers = layers;
+        layout = VK_IMAGE_LAYOUT_GENERAL;
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.flags = descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = depthFormat;
+        imageInfo.extent = {descriptor.width, descriptor.height, 1u};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = layers;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage depth layers");
+        owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocationBytes = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory depth layers");
+        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth layers");
+        const auto viewLayerCount = layers - descriptor.baseArray;
+        if (descriptor.dimension == TextureDimension::kCube) Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = image;
+        viewInfo.viewType = ViewTypeFor(descriptor.dimension, viewLayerCount);
+        viewInfo.format = depthFormat;
+        viewFormat = depthFormat;
+        viewInfo.components = components;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, descriptor.baseArray, viewLayerCount};
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth layers");
+        viewRange = {viewInfo.viewType, 1u, viewLayerCount};
+        createFirstLayerView(descriptor, viewInfo);
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+void Texture::RecordDepthLayerCopy(std::span<const VkImage> slices) {
+    Require(slices.size() == copyLayers, "depth layer copy needs one depth surface per layer");
+    auto* recorder = Recorder::Active();
+    std::unique_ptr<CommandBatch> batch;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (recorder != nullptr) {
+        commands = recorder->Commands();
+        recorder->Keep(owned);
+    } else {
+        batch = std::make_unique<CommandBatch>(context);
+        commands = batch->Handle();
+    }
+    const auto barrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    // Depth writes of the slices (and earlier samples of this image) before the copy.
+    const VkMemoryBarrier produced{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    VkImageMemoryBarrier toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toGeneral.srcAccessMask = 0;
+    toGeneral.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.image = image;
+    const bool stencil = depthFormat == VK_FORMAT_D16_UNORM_S8_UINT || depthFormat == VK_FORMAT_D24_UNORM_S8_UINT || depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    toGeneral.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u), 0, 1, 0, copyLayers};
+    barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, copiedOnce ? 0u : 1u, &toGeneral);
+    const auto copy = context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    for (std::uint32_t layer = 0; layer < copyLayers; ++layer) {
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, layer, 1};
+        region.extent = {copyWidth, copyHeight, 1u};
+        copy(commands, slices[layer], VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    }
+    const VkMemoryBarrier copied{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &copied, 0, nullptr, 0, nullptr);
+    if (batch) batch->SubmitAndWait();
+    copiedOnce = true;
+}
+
 Texture::~Texture() {
     release();
 }

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -124,24 +125,34 @@ public:
         key[9] = components.g;
         key[10] = components.b;
         key[11] = components.a;
-        if (const auto found = textures.find(key); found != textures.end()) return found->second;
+        const bool layeredLookup = resource.dimension == TextureDimension::kCube || resource.dimension == TextureDimension::k2DArray;
+        if (const auto found = textures.find(key); found != textures.end() && !layeredLookup) return found->second;
         Require(target.samples == 1, "sampling a multisampled depth surface is not implemented");
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto format = ResolveTextureFormat(resource.format);
         const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
-        if ((format != expected && !depthBits) || resource.dimension != TextureDimension::k2D || resource.width != target.extent.width || resource.height != target.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0) {
+        const bool layered = !stencil && (resource.dimension == TextureDimension::kCube || resource.dimension == TextureDimension::k2DArray);
+        if ((format != expected && !depthBits) || (resource.dimension != TextureDimension::k2D && !layered) || resource.width != target.extent.width || resource.height != target.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || (resource.baseArray != 0 && !layered)) {
             char text[448];
             std::snprintf(text, sizeof(text), "AGC graphics: sampling the %s plane of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), tile mode %u, dimension %d, levels %u-%u, slice %u is not implemented (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
                           stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, resource.format, static_cast<int>(format),
                           static_cast<unsigned>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray, key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
             throw std::runtime_error(text);
         }
+        if (layered) return Layered(key, resource, components);
         auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components);
         textures.emplace(key, texture);
         return texture;
     }
+
+    // A cube or 2D array over this surface as slice 0 and the depth surfaces drawn as its further
+    // slices (DB_DEPTH_VIEW SLICE_START places slice i DepthSliceBytes apart): the slices' depth
+    // planes are copied, same format so bit for bit, into the texture's own layers anew at every
+    // lookup. The lookup is never fast-proven (DepthSurfaceHolds refuses layered resources), so a
+    // slice drawn since the last bind is always seen. Under surfacesMutex.
+    std::shared_ptr<Texture> Layered(const std::array<std::uint32_t, 12>& key, const GuestTextureResource& resource, VkComponentMapping components);
 
     bool Holds(const Texture* texture) const {
         return std::any_of(textures.begin(), textures.end(), [&](const auto& entry) { return entry.second.get() == texture; });
@@ -187,6 +198,34 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
 std::set<std::uint64_t>& clearedHtiles() {
     static auto* cleared = new std::set<std::uint64_t>();
     return *cleared;
+}
+
+std::shared_ptr<Texture> DepthSurface::Layered(const std::array<std::uint32_t, 12>& key, const GuestTextureResource& resource, VkComponentMapping components) {
+    const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const auto layers = DescribeSurface(resource).imageLayers;
+    const auto stride = DepthSliceBytes(target.extent, d16 ? 2u : 4u);
+    std::vector<VkImage> slices(layers, VK_NULL_HANDLE);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const auto address = target.address + static_cast<std::uint64_t>(layer) * stride;
+        const auto& list = surfaces();
+        const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
+            return surface->context.device == context.device && surface->target.address == address && surface->target.format == target.format && surface->target.samples == 1 && surface->target.extent.width == target.extent.width && surface->target.extent.height == target.extent.height;
+        });
+        if (found == list.rend()) {
+            char text[320];
+            std::snprintf(text, sizeof(text), "AGC graphics: sampling %u depth slices from depth surface 0x%llx (%ux%u, vk format %d) as a %s texture, slice %u (0x%llx) of which no draw rendered, is not implemented", layers, static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.dimension == TextureDimension::kCube ? "cube" : "2D array", layer, static_cast<unsigned long long>(address));
+            throw std::runtime_error(text);
+        }
+        (*found)->ApplyFastClear();
+        slices[layer] = (*found)->image;
+    }
+    auto found = textures.find(key);
+    if (found == textures.end()) {
+        // The layers take the surface's own format: depth copies need matching formats.
+        found = textures.emplace(key, std::make_shared<Texture>(context, target.format, resource, layers, components, Texture::DepthLayersTag{})).first;
+    }
+    found->second->RecordDepthLayerCopy(slices);
+    return found->second;
 }
 
 }
