@@ -116,16 +116,17 @@ def cap_unity_video_out(app0, width):
     changed = []
     if width <= 0:
         return changed
-    key = "platform-ps5-video-out-width="
     for config in sorted(app0.glob("**/boot.config")):
         lines = config.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
         edited = False
         for index, line in enumerate(lines):
-            if not line.startswith(key):
+            # platform-ps5-video-out-width and the per-mode keys such as platform-ps5-standardmode-video-out-width.
+            key, separator, value = line.partition("=")
+            if not separator or not key.startswith("platform-ps5-") or not key.endswith("video-out-width"):
                 continue
-            value = line[len(key):].strip()
+            value = value.strip()
             if value.isdigit() and int(value) > width:
-                lines[index] = f"{key}{width}" + ("\n" if line.endswith("\n") else "")
+                lines[index] = f"{key}={width}" + ("\n" if line.endswith("\n") else "")
                 edited = True
         if edited:
             config.unlink()
