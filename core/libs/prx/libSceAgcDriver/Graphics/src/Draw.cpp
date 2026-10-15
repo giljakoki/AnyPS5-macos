@@ -395,6 +395,44 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 enum DrawPhase : std::size_t { PhaseValidate, PhaseIndex, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "index", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
 
+// The lookup and record phases split further (APS5_PROFILE_DRAW): where a recorded draw's time
+// goes inside them, the vkCmd* calls (the [vkcmd] line) included in the record split's parts.
+enum DrawSplit : std::size_t { SplitKey, SplitFind, SplitRevalidate, SplitMoved, SplitStores, SplitBindings, SplitAccess, SplitStartPass, SplitBegin, SplitBind, SplitProbe, SplitCommands, SplitLeave, SplitCount };
+constexpr std::array<const char*, SplitCount> DrawSplitNames{"key", "find", "revalidate", "moved", "stores", "bindings", "access", "startPass", "begin/continue", "bind+push", "probe", "drawCommands", "leave"};
+struct DrawSplitTotals {
+    std::array<std::atomic<std::uint64_t>, SplitCount> ns{};
+    std::array<std::atomic<std::uint64_t>, SplitCount> counts{};
+};
+DrawSplitTotals& drawSplits() {
+    static auto* const totals = new DrawSplitTotals();
+    return *totals;
+}
+// Marks the end of one split part since the previous mark (a no-op unless profiled).
+struct SplitTimer {
+    bool profile;
+    std::chrono::steady_clock::time_point last;
+    explicit SplitTimer(bool profile) : profile(profile), last(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    void mark(DrawSplit which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        drawSplits().ns[which].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        drawSplits().counts[which].fetch_add(1, std::memory_order_relaxed);
+        last = now;
+    }
+};
+void reportDrawSplits() {
+    std::string line = "[draws] lookup/record split (us per draw that ran the part, count):";
+    for (std::size_t i = 0; i < SplitCount; ++i) {
+        const auto ns = drawSplits().ns[i].exchange(0, std::memory_order_relaxed);
+        const auto count = drawSplits().counts[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char part[96];
+        std::snprintf(part, sizeof(part), " %s %.2f (%llu)", DrawSplitNames[i], static_cast<double>(ns) / 1e3 / static_cast<double>(count), static_cast<unsigned long long>(count));
+        line += part;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
 // APS5_SYNC_COMPLETION_DRAWS) forced it, or its completion work writes copied guest buffers or
@@ -744,6 +782,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    reportDrawSplits();
     reportBatchProbe();
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
@@ -1027,6 +1066,13 @@ void CountDrawSkip(DrawSkip kind, double us) {
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
     return !noDrawRecipe;
+}
+
+// Whether draws with a depth attachment build recipes too (APS5_NO_DEPTH_RECIPE unset): a hit looks
+// the depth surface's view up as Draw does and misses when it is not the recipe's.
+bool DepthRecipes() {
+    static const bool noDepthRecipe = std::getenv("APS5_NO_DEPTH_RECIPE") != nullptr;
+    return !noDepthRecipe;
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
@@ -1759,12 +1805,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
+        SplitTimer split(timer.profile);
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        split.mark(SplitKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+            split.mark(SplitFind);
             const bool valid = cached->Revalidate(shaders);
+            split.mark(SplitRevalidate);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            split.mark(SplitMoved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
@@ -2232,6 +2283,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
+    SplitTimer split(timer.profile);
     // The pass is named by its attachment views (stable while the kept targets live, so unique
     // within the open batch) and the extent. The previous draw's pass is continued only when this
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
@@ -2250,7 +2302,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    split.mark(SplitStores);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    split.mark(SplitBindings);
     retakeDrawInputs(context, inputs, record.indirect);
     Require(resources.DirectImportsCurrent(), "a host import the draw's descriptor set reads in place was retired after the set was proved");
     const bool capture = CaptureInputsEnabled();
@@ -2294,7 +2348,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // view; a draw that samples the surface had the clear recorded when it looked it up.
         if (state.depth && record.framebuffer->Layers() == 1 && !record.targetViews.empty()) clearable.push_back({static_cast<std::uint32_t>(state.colors.size()), VK_NULL_HANDLE, state.depth->format, 0, 1, record.targetViews.back()});
     }
+    split.mark(SplitAccess);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess, clearable, state.renderExtent);
+    split.mark(SplitStartPass);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -2369,6 +2425,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, clears);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    split.mark(SplitBegin);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
@@ -2377,9 +2434,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    split.mark(SplitBind);
     if (timer.profile) probeBatch(!gpuIndirect && !meshIndirect && !state.stages.mesh && draw.instanceCount == 1 && !record.pipeline->SplitsFaces() && !record.pipeline->SplitsSecondChannel(), continued, record.pipeline.get(), drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE, record.resources, drawBindings != nullptr ? drawBindings->snapshots.size() : 0, record.pushBytes);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    split.mark(SplitProbe);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    split.mark(SplitCommands);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
@@ -2402,6 +2462,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    split.mark(SplitLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, describePrograms(shaders));
     timer.phase(PhaseKeep);
@@ -2789,7 +2850,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (!state.depth || DepthRecipes()) && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -3090,7 +3151,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
-    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
+    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size() + (state.depth ? 1u : 0u), "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
     if (inputs.nothing) {
         for (const auto& color : state.colors) PresentTrace::TargetDraw(color.address, nullptr, 0, 'n');
@@ -3116,6 +3177,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
+    }
+    // The depth attachment as Draw looks it up (DepthSurfaceView: the surface's view, its fast
+    // clear applied), after the color targets as there; a surface replaced since the recipe was
+    // made (another view) is a miss and the ordinary path builds anew.
+    if (state.depth) {
+        timer.phase(PhaseSetup);
+        const auto depthView = DepthSurfaceView(context, *state.depth);
+        timer.phase(PhaseReadTarget);
+        if (depthView != recipe.targetViews.back()) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed

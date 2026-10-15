@@ -72,11 +72,13 @@ struct Shaders {
     std::uint32_t vertexPush = 0;
 };
 
-inline Shaders Compile(AgcDriver::VulkanDevice& device) {
+// `vertices`: where the vertex shader fetches Triangles() from (a copy in guest memory), or null for
+// Triangles() itself.
+inline Shaders Compile(AgcDriver::VulkanDevice& device, const void* vertices = nullptr) {
     const auto target = device.Target();
     Shaders shaders;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
-    const auto vertexBuffer = BufferDescriptor(Triangles().data(), 16u, static_cast<std::uint32_t>(Triangles().size()));
+    const auto vertexBuffer = BufferDescriptor(vertices != nullptr ? vertices : Triangles().data(), 16u, static_cast<std::uint32_t>(Triangles().size()));
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
     ShaderRecompiler::RecompileRequest vertex{
