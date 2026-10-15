@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/StaleHandleTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -149,7 +150,10 @@ void QueueSubmitter::run() {
         VkResult result = VK_SUCCESS;
         {
             std::lock_guard queueLock(queueMutex);
+            const bool timed = VkCallsProfiled();
+            const auto submitStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             result = submit(queue, 1, &submission, job.fence);
+            if (timed) NoteQueueSubmitTime(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - submitStart).count());
         }
         threadSubmissions.fetch_add(1, std::memory_order_relaxed);
         lock.lock();

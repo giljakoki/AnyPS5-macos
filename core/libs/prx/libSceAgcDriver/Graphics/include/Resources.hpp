@@ -77,6 +77,16 @@ void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPip
 // Resolves every DeviceFunctions entry point of the context's device (once, at device setup).
 void FillDeviceFunctions(const Context& context, DeviceFunctions& functions);
 
+// APS5_PROFILE_VKCMD=1 (or APS5_PROFILE_DRAW=1): FillDeviceFunctions wraps the table's entry points
+// in timers and a [vkcmd] line every 10 s gives each call's count and microseconds inside the
+// driver (MoltenVK), per thread class (the pipelined committer, other threads), plus the submit
+// thread's vkQueueSubmit (MoltenVK's Metal encoding with the default synchronous submits).
+bool VkCallsProfiled();
+// The calling thread's calls count as the committer's (DrawPipeline's thread sets it).
+void MarkVkCommitterThread();
+// The submit thread's vkQueueSubmit time (QueueSubmitter).
+void NoteQueueSubmitTime(double us);
+
 class RenderTarget {
 public:
     RenderTarget(const Context& context, const ColorTarget& target, bool blending);

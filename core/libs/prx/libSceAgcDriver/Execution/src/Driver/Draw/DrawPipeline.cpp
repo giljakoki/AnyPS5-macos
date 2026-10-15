@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -210,6 +211,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         pthread_attr_setstacksize(&attributes, 64u << 20u);
         pthread_t committer;
         const int created = pthread_create(&committer, &attributes, [](void* pipeline) -> void* {
+            Graphics::MarkVkCommitterThread();
             static_cast<DrawPipeline*>(pipeline)->run();
             return nullptr;
         }, this);

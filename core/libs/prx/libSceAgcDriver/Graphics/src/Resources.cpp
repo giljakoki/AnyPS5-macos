@@ -4,7 +4,14 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <string>
+#include <type_traits>
 
 namespace AgcDriver::Graphics {
 
@@ -231,6 +238,180 @@ void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPip
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+namespace {
+
+// The timed device entry points (VkCallsProfiled): one trampoline per table member forwards to the
+// resolved function and adds its duration to the calling thread class's counters.
+#define APS5_VK_TIMED_CALLS(X) \
+    X(cmdPipelineBarrier, PFN_vkCmdPipelineBarrier, "PipelineBarrier") \
+    X(cmdCopyBuffer, PFN_vkCmdCopyBuffer, "CopyBuffer") \
+    X(cmdUpdateBuffer, PFN_vkCmdUpdateBuffer, "UpdateBuffer") \
+    X(cmdFillBuffer, PFN_vkCmdFillBuffer, "FillBuffer") \
+    X(cmdBindPipeline, PFN_vkCmdBindPipeline, "BindPipeline") \
+    X(cmdBindDescriptorSets, PFN_vkCmdBindDescriptorSets, "BindDescriptorSets") \
+    X(cmdPushConstants, PFN_vkCmdPushConstants, "PushConstants") \
+    X(cmdDispatch, PFN_vkCmdDispatch, "Dispatch") \
+    X(cmdDispatchIndirect, PFN_vkCmdDispatchIndirect, "DispatchIndirect") \
+    X(cmdBeginRenderPass, PFN_vkCmdBeginRenderPass, "BeginRenderPass") \
+    X(cmdEndRenderPass, PFN_vkCmdEndRenderPass, "EndRenderPass") \
+    X(cmdBeginRendering, PFN_vkCmdBeginRenderingKHR, "BeginRendering") \
+    X(cmdEndRendering, PFN_vkCmdEndRenderingKHR, "EndRendering") \
+    X(cmdSetViewport, PFN_vkCmdSetViewport, "SetViewport") \
+    X(cmdSetScissor, PFN_vkCmdSetScissor, "SetScissor") \
+    X(cmdSetDepthBounds, PFN_vkCmdSetDepthBounds, "SetDepthBounds") \
+    X(cmdSetDepthBias, PFN_vkCmdSetDepthBias, "SetDepthBias") \
+    X(cmdSetCullMode, PFN_vkCmdSetCullModeEXT, "SetCullMode") \
+    X(cmdSetFrontFace, PFN_vkCmdSetFrontFaceEXT, "SetFrontFace") \
+    X(cmdSetDepthTestEnable, PFN_vkCmdSetDepthTestEnableEXT, "SetDepthTestEnable") \
+    X(cmdSetDepthWriteEnable, PFN_vkCmdSetDepthWriteEnableEXT, "SetDepthWriteEnable") \
+    X(cmdSetDepthCompareOp, PFN_vkCmdSetDepthCompareOpEXT, "SetDepthCompareOp") \
+    X(cmdSetDepthBoundsTestEnable, PFN_vkCmdSetDepthBoundsTestEnableEXT, "SetDepthBoundsTestEnable") \
+    X(cmdSetStencilTestEnable, PFN_vkCmdSetStencilTestEnableEXT, "SetStencilTestEnable") \
+    X(cmdSetStencilOp, PFN_vkCmdSetStencilOpEXT, "SetStencilOp") \
+    X(cmdSetStencilCompareMask, PFN_vkCmdSetStencilCompareMask, "SetStencilCompareMask") \
+    X(cmdSetStencilWriteMask, PFN_vkCmdSetStencilWriteMask, "SetStencilWriteMask") \
+    X(cmdSetStencilReference, PFN_vkCmdSetStencilReference, "SetStencilReference") \
+    X(cmdBindVertexBuffers, PFN_vkCmdBindVertexBuffers, "BindVertexBuffers") \
+    X(cmdBindIndexBuffer, PFN_vkCmdBindIndexBuffer, "BindIndexBuffer") \
+    X(cmdDraw, PFN_vkCmdDraw, "Draw") \
+    X(cmdDrawIndexed, PFN_vkCmdDrawIndexed, "DrawIndexed") \
+    X(cmdDrawIndirect, PFN_vkCmdDrawIndirect, "DrawIndirect") \
+    X(cmdDrawIndexedIndirect, PFN_vkCmdDrawIndexedIndirect, "DrawIndexedIndirect") \
+    X(cmdCopyBufferToImage, PFN_vkCmdCopyBufferToImage, "CopyBufferToImage") \
+    X(cmdCopyImageToBuffer, PFN_vkCmdCopyImageToBuffer, "CopyImageToBuffer") \
+    X(cmdClearColorImage, PFN_vkCmdClearColorImage, "ClearColorImage") \
+    X(updateDescriptorSets, PFN_vkUpdateDescriptorSets, "UpdateDescriptorSets") \
+    X(allocateDescriptorSets, PFN_vkAllocateDescriptorSets, "AllocateDescriptorSets")
+
+enum VkTimedCall : std::size_t {
+#define APS5_VK_ENUM(member, type, name) VkTimed_##member,
+    APS5_VK_TIMED_CALLS(APS5_VK_ENUM)
+#undef APS5_VK_ENUM
+    VkTimedQueueSubmit,
+    VkTimedCount
+};
+
+constexpr std::array<const char*, VkTimedCount> VkTimedNames{
+#define APS5_VK_NAME(member, type, name) name,
+    APS5_VK_TIMED_CALLS(APS5_VK_NAME)
+#undef APS5_VK_NAME
+    "QueueSubmit(submit thread)"};
+
+struct VkCallCounters {
+    std::array<std::atomic<std::uint64_t>, VkTimedCount> calls{};
+    std::array<std::atomic<std::uint64_t>, VkTimedCount> nanoseconds{};
+};
+
+struct VkCallProfile {
+    // [0] the committer, [1] every other thread.
+    std::array<VkCallCounters, 2> threads;
+    std::atomic<std::int64_t> windowStart{0};
+    std::atomic<bool> printing{false};
+};
+
+VkCallProfile& vkCallProfile() {
+    static auto* const profile = new VkCallProfile();
+    return *profile;
+}
+
+thread_local bool vkCommitterThread = false;
+
+std::int64_t vkNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void reportVkCalls(std::int64_t now) {
+    auto& profile = vkCallProfile();
+    auto start = profile.windowStart.load(std::memory_order_relaxed);
+    if (start == 0) {
+        profile.windowStart.compare_exchange_strong(start, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - start < 10'000'000'000ll || profile.printing.exchange(true, std::memory_order_acquire)) return;
+    if (!profile.windowStart.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+        profile.printing.store(false, std::memory_order_release);
+        return;
+    }
+    const double seconds = static_cast<double>(now - start) / 1e9;
+    for (std::size_t thread = 0; thread < profile.threads.size(); ++thread) {
+        auto& counters = profile.threads[thread];
+        std::string line = thread == 0 ? "[vkcmd] committer" : "[vkcmd] other threads";
+        char part[160];
+        std::snprintf(part, sizeof(part), " (%.0f s, calls/us each/ms total):", seconds);
+        line += part;
+        double totalMs = 0;
+        std::uint64_t totalCalls = 0;
+        for (std::size_t index = 0; index < VkTimedCount; ++index) {
+            const auto calls = counters.calls[index].exchange(0, std::memory_order_relaxed);
+            const auto ns = counters.nanoseconds[index].exchange(0, std::memory_order_relaxed);
+            if (calls == 0) continue;
+            totalMs += static_cast<double>(ns) / 1e6;
+            totalCalls += calls;
+            std::snprintf(part, sizeof(part), " %s %llu/%.2f/%.1f", VkTimedNames[index], static_cast<unsigned long long>(calls), static_cast<double>(ns) / 1e3 / static_cast<double>(calls), static_cast<double>(ns) / 1e6);
+            line += part;
+        }
+        std::snprintf(part, sizeof(part), "; total %llu calls %.1f ms\n", static_cast<unsigned long long>(totalCalls), totalMs);
+        line += part;
+        std::fputs(line.c_str(), stderr);
+    }
+    std::fflush(stderr);
+    profile.printing.store(false, std::memory_order_release);
+}
+
+void noteVkCall(std::size_t index, std::int64_t start) {
+    const auto now = vkNowNs();
+    auto& counters = vkCallProfile().threads[vkCommitterThread ? 0 : 1];
+    counters.calls[index].fetch_add(1, std::memory_order_relaxed);
+    counters.nanoseconds[index].fetch_add(static_cast<std::uint64_t>(now - start), std::memory_order_relaxed);
+    reportVkCalls(now);
+}
+
+template<std::size_t Index, typename TFunction>
+struct TimedVkCall;
+
+template<std::size_t Index, typename TResult, typename... TArgs>
+struct TimedVkCall<Index, TResult(VKAPI_PTR*)(TArgs...)> {
+    static inline TResult(VKAPI_PTR* real)(TArgs...) = nullptr;
+    static TResult VKAPI_CALL Call(TArgs... args) {
+        const auto start = vkNowNs();
+        if constexpr (std::is_void_v<TResult>) {
+            real(args...);
+            noteVkCall(Index, start);
+        } else {
+            auto result = real(args...);
+            noteVkCall(Index, start);
+            return result;
+        }
+    }
+};
+
+void wrapTimedVkCalls(DeviceFunctions& functions) {
+#define APS5_VK_WRAP(member, type, name) \
+    if (functions.member != nullptr) { \
+        TimedVkCall<VkTimed_##member, type>::real = functions.member; \
+        functions.member = &TimedVkCall<VkTimed_##member, type>::Call; \
+    }
+    APS5_VK_TIMED_CALLS(APS5_VK_WRAP)
+#undef APS5_VK_WRAP
+}
+
+}
+
+bool VkCallsProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_VKCMD") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+void MarkVkCommitterThread() {
+    vkCommitterThread = true;
+}
+
+void NoteQueueSubmitTime(double us) {
+    if (!VkCallsProfiled()) return;
+    const auto now = vkNowNs();
+    noteVkCall(VkTimedQueueSubmit, now - static_cast<std::int64_t>(us * 1000.0));
+}
+
 void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.cmdPipelineBarrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
     functions.cmdCopyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
@@ -274,6 +455,9 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.updateDescriptorSets = context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets");
     functions.allocateDescriptorSets = context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets");
     functions.getFenceStatus = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus");
+    // The timers are installed once per process: the trampolines keep one real entry point each
+    // (every device of the process resolves the same MoltenVK functions).
+    if (VkCallsProfiled()) wrapTimedVkCalls(functions);
 }
 
 RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bool blending) : context(context) {
