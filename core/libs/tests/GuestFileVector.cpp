@@ -18,8 +18,11 @@ static int ClosePipe(int end) { return ::_close(end); }
 #else
 #include <fcntl.h>
 #include <unistd.h>
-static int MakePipe(int* ends) { return ::pipe(ends); }
-static int ClosePipe(int end) { return ::close(end); }
+extern "C" int APS5_VABI pipe_nid_postfix(int*);
+extern "C" int APS5_VABI close_nid_postfix(int);
+// Descriptors handed to the guest must come from the guest-facing calls.
+static int MakePipe(int* ends) { return pipe_nid_postfix(ends); }
+static int ClosePipe(int end) { return close_nid_postfix(end); }
 #endif
 
 struct GuestIovec {

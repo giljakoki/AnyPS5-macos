@@ -15,6 +15,7 @@
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/FileLock.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
+#include "prx/libkernel/File/include/GuestDescriptors.hpp"
 #include "prx/libkernel/Aio/include/ReadTrace.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
@@ -426,6 +427,8 @@ extern "C" int APS5_VABI pipe_nid_postfix(int* descriptors) {
     const int result = ::pipe(native);
 #endif
     if (result != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    File::AdoptGuestDescriptor(native[0]);
+    File::AdoptGuestDescriptor(native[1]);
     std::memcpy(descriptors, native, sizeof(native));
     return 0;
 }
@@ -482,6 +485,7 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
 
 int APS5_VABI close_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Close(d);
+    if (!File::ReleaseGuestDescriptor(d)) return PosixFailure(GUEST_EBADF);
     File::ForgetRandomDevice(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
@@ -509,6 +513,7 @@ int APS5_VABI dup_nid_postfix(int d) {
     if (duplicate >= GuestSockets::FirstDescriptor)
         throw std::runtime_error(std::string(__func__) + ": host descriptor reached the guest socket range");
     if (File::IsRandomDevice(d)) File::RememberRandomDevice(duplicate);
+    File::AdoptGuestDescriptor(duplicate);
     return duplicate;
 }
 
@@ -543,6 +548,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     if (result < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
     File::ForgetRandomDevice(to);
     if (sourceIsRandom) File::RememberRandomDevice(to);
+    File::AdoptGuestDescriptor(result);
     return result;
 #endif
 }
@@ -742,6 +748,7 @@ int APS5_VABI sceKernelCheckReachability(const char* path) {
 
 int APS5_VABI sceKernelFstat(int d, FileStat* sb) {
     if (sb == nullptr) throw std::invalid_argument("sceKernelFstat: sb is null");
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     if (!File::FillFileStatFromDescriptor(d, sb)) return SceErrorFromErrno(errno);
     return 0;
 }
@@ -949,6 +956,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
@@ -964,6 +972,7 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     char empty = 0;
     const auto result = NativePwrite(d, nbytes == 0 && buf == nullptr ? &empty : buf, nbytes, offset);
     return result < 0 ? SceErrorFromErrno(errno) : result;
@@ -981,6 +990,7 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
     if (offset != nullptr && total > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - *offset)) return SceErrorFromErrno(GUEST_EINVAL);
     if (offset != nullptr) {
         if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     }
     std::deque<GuestArena::HostWrite> destinations;
     if (!write && !OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromErrno(GUEST_EFAULT);
@@ -1034,6 +1044,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
@@ -1048,6 +1059,7 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     const auto result = NativePwrite(d, buf, nbytes, offset);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
@@ -1093,6 +1105,7 @@ int64_t APS5_VABI sceKernelPreadv(int d, const KernelIovec* iov, int iovcnt, int
     if (const int error = CheckIovecs(iov, iovcnt)) return error;
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
 #ifdef __APPLE__
     if (iovcnt == 0) return EmptyIovecs(d);
 #endif
@@ -1107,6 +1120,7 @@ int64_t APS5_VABI sceKernelPwritev(int d, const KernelIovec* iov, int iovcnt, in
     if (const int error = CheckIovecs(iov, iovcnt)) return error;
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
 #ifdef __APPLE__
     if (iovcnt == 0) return EmptyIovecs(d);
 #endif

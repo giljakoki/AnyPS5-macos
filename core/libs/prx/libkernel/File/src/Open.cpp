@@ -1,5 +1,6 @@
 #include "prx/libkernel/Aio/include/ReadThrottle.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
+#include "prx/libkernel/File/include/GuestDescriptors.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
@@ -154,19 +155,21 @@ static int NativeClose(int fd) { return ::close(fd); }
 static int RotateDescriptor(int fd) {
     static constexpr int GuestFdSetSize = 1024;
     static auto& lock = *new std::mutex;  // also used by opens after static destruction
-    static int next = 0;
+    static int next = File::GuestDescriptorFloor();
     rlimit limit{};
     const int ceiling = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < static_cast<rlim_t>(GuestFdSetSize)
         ? static_cast<int>(limit.rlim_cur) : GuestFdSetSize;
     std::lock_guard guard(lock);
+    const int floor = File::GuestDescriptorFloor() < ceiling ? File::GuestDescriptorFloor() : 0;
     if (fd >= next || fd >= ceiling) {
         next = fd + 1;
         return fd;
     }
+    if (next < floor) next = floor;
     const int moved = ::fcntl(fd, F_DUPFD, next);
     if (moved < 0 || moved >= ceiling) {
         if (moved >= 0) ::close(moved);
-        next = fd + 1;
+        next = floor > fd ? floor : fd + 1;
         return fd;
     }
     const int descriptorFlags = ::fcntl(fd, F_GETFD);
@@ -228,6 +231,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     if (path != nullptr && File::IsRandomDevicePath(path)) {
         if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY) throw std::runtime_error(std::string(__func__) + ": writing to " + path + " is not implemented");
         const int fd = File::OpenRandomDevice();
+        if (fd >= 0) File::AdoptGuestDescriptor(fd);
         return fd < 0 ? SceErrorFromErrno(errno) : fd;
     }
     std::filesystem::path native;
@@ -268,10 +272,12 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
 #ifndef _WIN32
     fd = RotateDescriptor(fd);
 #endif
+    File::AdoptGuestDescriptor(fd);
     return fd;
 }
 
 int APS5_VABI sceKernelClose(int d) {
+    if (!File::ReleaseGuestDescriptor(d)) return SCE_KERNEL_ERROR_EBADF;
     File::ForgetRandomDevice(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
@@ -289,6 +295,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
         const auto n = GuestSockets::Read(d, buf, nbytes);
         return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
     }
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     if (buf == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": buf is null");
     }
@@ -308,6 +315,7 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
         const auto n = GuestSockets::Write(d, buf, nbytes);
         return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
     }
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     if (buf == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": buf is null");
     }
@@ -326,6 +334,7 @@ std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
         return *directory;
     }
 #endif
+    if (File::GuestDescriptorRejected(d)) return SCE_KERNEL_ERROR_EBADF;
     std::int64_t result = NativeLseek(d, offset, whence);
     if (result < 0) return SceIoErrorFromErrno(errno);
     return result;
