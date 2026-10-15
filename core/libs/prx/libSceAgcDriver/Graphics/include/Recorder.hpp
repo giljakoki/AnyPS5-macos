@@ -79,6 +79,10 @@ private:
     std::condition_variable work;
     std::condition_variable drained;
     std::deque<Job> jobs;
+    // Jobs ever enqueued and submitted: Drain waits for the ones enqueued before it, not for an empty
+    // queue, which a worker that keeps submitting could postpone indefinitely.
+    std::uint64_t enqueued = 0;
+    std::uint64_t completed = 0;
     VkResult error = VK_SUCCESS;
     bool stopping = false;
     std::mutex queueMutex;
