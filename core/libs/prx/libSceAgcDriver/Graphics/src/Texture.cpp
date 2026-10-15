@@ -3978,38 +3978,48 @@ std::size_t StorageTexture::ClearFilledInside(std::uint64_t address, std::size_t
     return cleared;
 }
 
+void StorageTexture::recordColorClear(Recorder& recorder, const VkClearColorValue& value, std::uint32_t layer, std::uint64_t bytes) {
+    const bool whole = layer == WholeImage;
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, whole ? 0u : layer, whole ? geometry.imageLayers : 1u};
+    const auto record = [context = context, recorder = &recorder, image = image, range, value, whole, bytes](VkCommandBuffer commands) {
+        const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::FillClear);
+        Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
+        if (Recorder::BarrierValidate()) {
+            const std::pair<VkImage, bool> cleared{image, true};
+            recorder->NoteAccess(Recorder::CommandClass::FillClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
+        }
+        VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toClear.oldLayout = whole ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+        toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toClear.image = image;
+        toClear.subresourceRange = range;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+        VkImageMemoryBarrier toGeneral = toClear;
+        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        recorder->EndGpuTiming(timing, bytes);
+    };
+    const bool loadable = whole && attachable && descriptor.mipCount == 1 && geometry.imageDepth == 1 && descriptor.dimension != TextureDimension::k3D;
+    if (loadable && recorder.DeferClear({image, storageFormat, {descriptor.width, descriptor.height}, geometry.imageLayers, value, record})) return;
+    record(recorder.Commands());
+}
+
 bool StorageTexture::clearFilled(Recorder& recorder, std::uint32_t word) {
     if (dirty || anyLayerPending() || (descriptor.dccAddress != 0 && TextureClearKeys(descriptor, guestBytes) != DccKeys::Uncompressed)) return false;
     const std::array<std::uint32_t, 4> pattern{word, word, word, word};
     VkClearColorValue clearValue{};
     const auto elementBytes = BytesPerElement(descriptor.format);
     if (!FillClearColor(storageFormat, elementBytes, pattern, clearValue)) return false;
-    const auto commands = recorder.Commands();
-    const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::FillClear);
-    Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
     if (auto self = weak_from_this().lock()) recorder.Keep(std::move(self));
-    if (Recorder::BarrierValidate()) {
-        const std::pair<VkImage, bool> clearedImage{image, true};
-        recorder.NoteAccess(Recorder::CommandClass::FillClear, Recorder::Access{{}, {}, std::span(&clearedImage, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
-    VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toClear.image = image;
-    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
-    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
-    VkImageMemoryBarrier toGeneral = toClear;
-    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-    recorder.EndGpuTiming(timing, guestBytes);
+    recordColorClear(recorder, clearValue, WholeImage, guestBytes);
     quiesceCompare();
     original.resize(static_cast<std::size_t>(guestBytes));
     for (std::size_t offset = 0; offset + sizeof(word) <= original.size(); offset += sizeof(word)) std::memcpy(original.data() + offset, &word, sizeof(word));
@@ -4326,33 +4336,8 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // below makes those units stale (nothing for a 64 KiB-multiple surface).
     PublishShadow(begin, bytes, PublishScope::PartialUnits, PublishReason::FillClear);
     GuestMemory::MarkWritten(begin, bytes, true);
-    const auto commands = recorder->Commands();
-    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::FillClear);
-    Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-    if (Recorder::BarrierValidate()) {
-        const std::pair<VkImage, bool> cleared{image, true};
-        recorder->NoteAccess(Recorder::CommandClass::FillClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
-    VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    // A whole image is discarded into the clear; one layer keeps the others' content.
-    toClear.oldLayout = layer == WholeImage ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
-    toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toClear.image = image;
-    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, layer == WholeImage ? 0u : layer, layer == WholeImage ? geometry.imageLayers : 1u};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
-    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
-    VkImageMemoryBarrier toGeneral = toClear;
-    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-    recorder->EndGpuTiming(timing, bytes);
+    recordColorClear(*recorder, clearValue, layer, bytes);
     traceRefusal.cleared = true;
     // The image holds the fill and guest memory what it held: the texels reach it at the
     // write-back, which keeps the 64 KiB blocks the CPU writes from now on (a CPU write before the

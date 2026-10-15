@@ -99,23 +99,57 @@ public:
     DepthSurface(const DepthSurface&) = delete;
     DepthSurface& operator=(const DepthSurface&) = delete;
 
-    void ApplyFastClear() {
+    // Records the pending fast clear. `deferrable`: the recorder may keep it for the next render
+    // pass that binds this surface as its depth attachment to load as its clear (on tile GPUs a
+    // clear is otherwise a pass of its own that stores the whole surface, which the next pass
+    // loads again); any other recorded command records it first (Recorder::DeferClear).
+    void ApplyFastClear(bool deferrable = false) {
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
         if ((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) RequireClearDepth(context, target, clearDepth);
         pendingClear = 0;
-        if (aspects == 0) return;
+        if (aspects == 0) {
+            if (!deferrable) settleDeferredClear();
+            return;
+        }
         auto* recorder = RecorderFor(context);
-        std::unique_ptr<CommandBatch> batch;
-        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
-        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
         const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
-        constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
         const VkClearDepthStencilValue clear{clearDepth, clearStencil};
-        context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
-        if (batch) batch->SubmitAndWait();
-        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+        const auto record = [context = context, image = image, range, clear](VkCommandBuffer commands) {
+            constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        };
+        if (recorder == nullptr) {
+            CommandBatch batch(context);
+            record(batch.Handle());
+            batch.SubmitAndWait();
+            return;
+        }
+        Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+        // Only a single-sample surface whose stencil plane, if any, is a separate attachment
+        // aspect of the same image (the clear covers the aspects the pass would load).
+        if (deferrable && Recorder::DeferredDepthClearsEnabled() && target.samples == 1) {
+            Recorder::DeferredClear deferred;
+            deferred.image = image;
+            deferred.format = target.format;
+            deferred.extent = target.extent;
+            deferred.layers = 1;
+            deferred.record = record;
+            deferred.aspects = aspects;
+            deferred.depthStencil = clear;
+            deferred.view = view;
+            if (recorder->DeferClear(std::move(deferred))) return;
+        }
+        record(recorder->Commands());
+    }
+
+    // A clear the recorder keeps for this surface's next pass is recorded before the surface is
+    // read any other way (sampled, copied): such reads are recorded after the caller returns,
+    // possibly inside a pass that would otherwise load the clear after the read.
+    void settleDeferredClear() {
+        auto* recorder = RecorderFor(context);
+        if (recorder != nullptr && recorder->HasDeferredClear(image)) recorder->Commands();
     }
 
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
@@ -246,7 +280,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface->clearDepth = target.clearDepth;
         surface->clearStencil = target.clearStencil;
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        surface->ApplyFastClear();
+        surface->ApplyFastClear(true);
         return surface->view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
