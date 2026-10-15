@@ -54,7 +54,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
     };
     mix(value & 3u);
     if (value == 0) {
-        readable = false;
+        mix(0x4e554c4cull);
         return hash;
     }
     std::array<std::uint32_t, MaxContentWords> content;
@@ -74,14 +74,26 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
     return hash;
 }
 
-void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::size_t userWords) {
+void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, std::span<const Graphics::DecodeRead> decodeReads, bool eligible, std::uint32_t hiddenWords, std::size_t userWords) {
     eligible = eligible && drawRelocationEnabled();
     const std::uint64_t present = userWords >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << userWords) - 1;
     const std::uint64_t hidden = hiddenWords >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << hiddenWords) - 1;
-    std::uint64_t relocatable = eligible ? use.asBase & ~use.asValue & present & ~hidden : 0;
-    variant.freeWords = eligible ? ~(use.asBase | use.asValue) & present & ~hidden : 0;
-    variant.baseWords = use.asBase;
-    variant.valueWords = use.asValue;
+    // Vertex fetch: the decode read the attribute and buffer tables through a 64-bit pointer in two
+    // user words; the low word is dereferenced like a walked base, the high one is a value.
+    std::uint64_t fetchBases = 0, fetchHigh = 0;
+    for (const auto& read : decodeReads) {
+        if (read.userWord < 0 || read.userWord >= 63) {
+            eligible = false;
+            continue;
+        }
+        fetchBases |= std::uint64_t{1} << read.userWord;
+        fetchHigh |= std::uint64_t{1} << (read.userWord + 1);
+    }
+    const auto valued = use.asValue | fetchHigh;
+    std::uint64_t relocatable = eligible ? (use.asBase | fetchBases) & ~valued & present & ~hidden : 0;
+    variant.freeWords = eligible ? ~(use.asBase | fetchBases | valued) & present & ~hidden : 0;
+    variant.baseWords = use.asBase | fetchBases;
+    variant.valueWords = valued;
     variant.relocationEligible = eligible;
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
     const auto covered = [&](std::uint64_t address) {
@@ -89,6 +101,9 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
     };
     if (relocatable != 0) {
         reads = use.reads;
+        for (const auto& read : decodeReads) {
+            for (std::size_t word = 0; word < read.bytes.size() / sizeof(std::uint32_t); ++word) reads.emplace_back(read.address + word * sizeof(std::uint32_t), read.userWord);
+        }
         std::sort(reads.begin(), reads.end());
         reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
         const auto drop = [&](std::int32_t origin) {
