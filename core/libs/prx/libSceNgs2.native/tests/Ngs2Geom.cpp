@@ -129,15 +129,15 @@ static void TestInvalidListener() {
         param.sound_speed = value;
         RejectListener(&param, 0);
     }
-    param = Listener();
-    param.orient_front = {};
-    RejectListener(&param, 0);
-    param = Listener();
-    param.orient_up = param.orient_front;
-    RejectListener(&param, 0);
-    param = Listener();
-    param.orient_up = {};
-    RejectListener(&param, 0);
+    // Degenerate orientations fall back to the default axes instead of being rejected.
+    for (const auto change : {+[](Ngs2GeomListenerParam& p) { p.orient_front = {}; }, +[](Ngs2GeomListenerParam& p) { p.orient_up = p.orient_front; },
+                              +[](Ngs2GeomListenerParam& p) { p.orient_up = {}; }}) {
+        param = Listener();
+        change(param);
+        Ngs2GeomListenerWork work{};
+        Require(sceNgs2GeomCalcListener(&param, &work, 0) == SCE_NGS2_OK);
+        RequireMatrix(work, {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}});
+    }
     for (const auto vector : {&Ngs2GeomListenerParam::position, &Ngs2GeomListenerParam::orient_front,
                               &Ngs2GeomListenerParam::orient_up, &Ngs2GeomListenerParam::velocity}) {
         for (const auto component : {&Ngs2GeomVector::x, &Ngs2GeomVector::y, &Ngs2GeomVector::z}) {

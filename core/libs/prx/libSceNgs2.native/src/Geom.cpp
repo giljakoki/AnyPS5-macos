@@ -25,9 +25,13 @@ int Ngs2GeomCalcListener(const Ngs2GeomListenerParam* param, Ngs2GeomListenerWor
         if (!std::isfinite(length) || length <= 0.0f) return Ngs2GeomVector{};
         return Ngs2GeomVector{v.x / length, v.y / length, v.z / length};
     };
-    const Ngs2GeomVector front = normalized(param->orient_front);
-    const Ngs2GeomVector right = normalized(cross(param->orient_up, front));
-    if (dot(front, front) == 0.0f || dot(right, right) == 0.0f) APS5_INVALID_ARG_EX;
+    // Titles pass zero or parallel orientation vectors (Dead Cells), which the hardware accepts: fall back to the
+    // default front (+z) and up (+y) axes rather than rejecting the listener.
+    Ngs2GeomVector front = normalized(param->orient_front);
+    if (dot(front, front) == 0.0f) front = {0.0f, 0.0f, 1.0f};
+    Ngs2GeomVector right = normalized(cross(param->orient_up, front));
+    if (dot(right, right) == 0.0f) right = normalized(cross(Ngs2GeomVector{0.0f, 1.0f, 0.0f}, front));
+    if (dot(right, right) == 0.0f) right = normalized(cross(Ngs2GeomVector{0.0f, 0.0f, 1.0f}, front));
     const Ngs2GeomVector up = cross(front, right);
     const Ngs2GeomVector axes[3] = {right, up, front};
     Ngs2GeomListenerWork work{};
