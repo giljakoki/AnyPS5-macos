@@ -197,7 +197,8 @@ HostDepth ResolveHostDepth(const DepthFeatures& features, const State& state) {
     // clamping on, a zero-to-one transform over [(min + max) / 2, max] writes the same depth for every z, so a
     // [-1, 1] viewport (Dead Cells) needs no unrestricted range. Clamping also turns off near/far clipping, so
     // primitives the hardware would clip beyond the far or near plane are kept at the clamped depth instead.
-    if (state.negativeOneToOne && features.depthClamp) {
+    // A shader reading the depth (POS_Z) could see values the hardware leaves unclamped, so it keeps the error.
+    if (state.negativeOneToOne && features.depthClamp && !state.posZ) {
         const float low = (host.minDepth + host.maxDepth) * 0.5f;
         const float high = host.maxDepth;
         if (std::getenv("APS5_NO_CLAMPED_GL_DEPTH") == nullptr && unit(low) && unit(high)) {
