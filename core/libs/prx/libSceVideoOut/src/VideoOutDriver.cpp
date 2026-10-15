@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UploadTrace.hpp"
+#include <array>
 #include <bit>
+#include <memory>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -529,7 +531,9 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
         if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d dequeued by the presenter, waits for vblank %llu (now %llu, GPU complete %d)", static_cast<long long>(req.flipArg), req.index, static_cast<unsigned long long>(target), static_cast<unsigned long long>(req.cfg->vblankStatus.count), req.gpuComplete ? 1 : 0);
+        req.dequeuedAt = std::chrono::steady_clock::now();
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
+        req.vblankAt = std::chrono::steady_clock::now();
         timing.Mark("vblank_wait");
         if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d vblank reached", static_cast<long long>(req.flipArg), req.index);
         req.cfg->CheckAlive();
@@ -547,39 +551,62 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             require(!req.terminal && !req.gpuComplete, "invalid GPU completion transition");
             req.gpuComplete = true;
         }
+        req.presentedAt = std::chrono::steady_clock::now();
+        timing.Mark("present");
+        if (req.cfg->Closed()) {
+            req.ReleaseLocked();
+            return;
+        }
+        CompleteFlipLocked(req);
+        timing.Mark("notify_game");
     } else {
         OnMainThread([&] { window.Ensure(req.width, req.height); });
         const auto extensions = windowExtensions(window.Handle());
         const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
         timing.Mark("window_prepare");
         if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d window ready, presenting", static_cast<long long>(req.flipArg), req.index);
+        // Completes the flip once the frame's GPU work finished: on this thread before the present
+        // returns, or later on the AGC driver's flip completer thread (the request stays alive
+        // through the context it owns), so the presenter can take the next flip meanwhile.
         const auto gpuReady = [](void* context) {
-            auto& request = *static_cast<FlipRequest*>(context);
-            std::lock_guard lock(request.cfg->mutex);
-            request.cfg->CheckAlive();
-            if (request.cfg->Closed()) return;
-            require(!request.terminal && !request.gpuComplete, "invalid GPU completion transition");
-            request.gpuComplete = true;
-            request.cfg->vblankCond.notify_all();
+            const std::unique_ptr<std::shared_ptr<FlipRequest>> owned(static_cast<std::shared_ptr<FlipRequest>*>(context));
+            auto& request = **owned;
+            {
+                std::lock_guard lock(request.cfg->mutex);
+                request.cfg->CheckAlive();
+                if (request.cfg->Closed()) {
+                    request.ReleaseLocked();
+                } else {
+                    require(!request.terminal && !request.gpuComplete, "invalid GPU completion transition");
+                    request.gpuComplete = true;
+                    VideoOutDriver::Get().CompleteFlipLocked(request);
+                }
+            }
+            request.queue->changed.NotifyAll();
         };
+        auto context = std::make_unique<std::shared_ptr<FlipRequest>>(req.shared_from_this());
         if (req.index >= 0 && !req.unregistered) {
             const auto display = DescribeVideoOutBuffer(req.buffer, req.group);
-            AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, &req);
+            {
+                std::lock_guard lock(req.cfg->mutex);
+                req.presentedAt = std::chrono::steady_clock::now();
+            }
+            AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, context.release());
         } else {
-            AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
+            {
+                std::lock_guard lock(req.cfg->mutex);
+                req.presentedAt = std::chrono::steady_clock::now();
+            }
+            AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, context.release());
         }
         timing.Mark("present");
         if (AgcDriver::Graphics::UploadTraceEnabled()) AgcDriver::Graphics::UploadTrace("flip arg=%lld buffer=%d presented", static_cast<long long>(req.flipArg), req.index);
         OnMainThread([&] { window.UpdateTitle(); });
         timing.Mark("window_title");
     }
-    std::lock_guard lock(req.cfg->mutex);
-    timing.Mark("completion_mutex_wait");
-    req.cfg->CheckAlive();
-    if (req.cfg->Closed()) {
-        req.ReleaseLocked();
-        return;
-    }
+}
+
+void VideoOutDriver::CompleteFlipLocked(FlipRequest& req) {
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
     require(req.cfg->flipStatus.count != std::numeric_limits<uint64_t>::max(), "flip counter overflow");
@@ -588,7 +615,29 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     --req.queue->reservations;
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
-    timing.Mark("notify_game");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || req.timing == nullptr) return;
+    // Per flip, from the flip packet: queued to the presenter, dequeued, vblank reached, blit queued
+    // (present called), flip reported (the frame's GPU work finished); averages over 10 s.
+    static std::array<double, 5> sums{};
+    static std::uint64_t flips = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    const auto reached = req.timing->FlipReached();
+    if (reached == std::chrono::steady_clock::time_point{}) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto since = [&](std::chrono::steady_clock::time_point at) { return at < reached ? 0.0 : std::chrono::duration<double, std::milli>(at - reached).count(); };
+    sums[0] += since(req.queuedAt);
+    sums[1] += since(req.dequeuedAt);
+    sums[2] += since(req.vblankAt);
+    sums[3] += since(req.presentedAt);
+    sums[4] += since(now);
+    ++flips;
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    const double per = 1.0 / static_cast<double>(flips);
+    std::fprintf(stderr, "[flip-timing] %llu flips over 10 s, ms after the flip packet: queued %.1f, dequeued by the presenter %.1f, vblank %.1f, present called %.1f, flip done %.1f\n", static_cast<unsigned long long>(flips), sums[0] * per, sums[1] * per, sums[2] * per, sums[3] * per, sums[4] * per);
+    sums = {};
+    flips = 0;
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {

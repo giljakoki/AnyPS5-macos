@@ -5,9 +5,88 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Completes flips off the presenter thread (APS5_NO_ASYNC_FLIP_DONE=1: the presenter waits itself).
+// The presenter queues the blit and hands the flip here; this thread waits for the frame's own
+// batches on the recorder timeline and then reports the flip, in submission order. The presenter
+// moves on to the next flip at once, so its vblank wait, acquire and blit for frame N+1 no longer
+// queue behind the GPU finishing frame N. A flip that the presenter completes itself (a fallback)
+// drains this queue first so flip events stay in order.
+class FlipCompleter {
+public:
+    struct Entry {
+        std::shared_ptr<VulkanDevice> device;
+        std::uint64_t serial;
+        void (*ready)(void*);
+        void* context;
+    };
+
+    static FlipCompleter& Get() {
+        static FlipCompleter& instance = *new FlipCompleter();
+        return instance;
+    }
+
+    void Enqueue(Entry entry) {
+        std::lock_guard lock(mutex);
+        if (!started) {
+            started = true;
+            std::thread([this] { run(); }).detach();
+        }
+        entries.push_back(std::move(entry));
+        changed.notify_all();
+    }
+
+    void Drain() {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return entries.empty() && !busy; });
+    }
+
+private:
+    void run() {
+        PinWorkerThread("flip completer");
+        for (;;) {
+            Entry entry;
+            {
+                std::unique_lock lock(mutex);
+                changed.wait(lock, [&] { return !entries.empty(); });
+                entry = std::move(entries.front());
+                entries.pop_front();
+                busy = true;
+            }
+            try {
+                entry.device->WaitRecorded(entry.serial);
+                entry.device.reset();
+                entry.ready(entry.context);
+            } catch (const ProcessShutdown&) {
+            } catch (...) {
+                Driver::Get().ReportFailure(std::current_exception());
+            }
+            std::lock_guard lock(mutex);
+            busy = false;
+            changed.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<Entry> entries;
+    bool busy = false;
+    bool started = false;
+};
+
+}
+
+void Driver::DrainFlipCompletions() {
+    FlipCompleter::Get().Drain();
+}
 
 void Driver::RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
     require(output != nullptr, "null video output");
@@ -65,6 +144,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const bool serialWait = std::getenv("APS5_NO_FLIP_SERIAL_WAIT") == nullptr;
     const std::uint64_t frameBatches = serialWait && window.timing != nullptr ? window.timing->BatchesAtFlip() : 0;
     std::uint64_t recordedBatches = 0;
+    static const bool asyncFlipDone = std::getenv("APS5_NO_ASYNC_FLIP_DONE") == nullptr;
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
@@ -132,8 +212,13 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         }
         // A presentation dropped (no swapchain image, out of date) still completes its flip only after
         // the frame's GPU work; true when the timeline wait applies (else the blit's fence is the wait).
+        bool handedOff = false;
         const auto waitFrame = [&] {
             if (frameBatches == 0 || presenting == nullptr || frameBatches > recordedBatches || !presenting->CanWaitUnlocked()) return false;
+            if (asyncFlipDone) {
+                handedOff = true;
+                return true;
+            }
             const auto start = std::chrono::steady_clock::now();
             presenting->WaitRecorded(frameBatches);
             waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -158,7 +243,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presenting->QueuePresent();
             timing.Mark("queue_present");
         }
-        gpuReady(context);
+        if (handedOff) {
+            FlipCompleter::Get().Enqueue({presenting, frameBatches, gpuReady, context});
+        } else {
+            FlipCompleter::Get().Drain();
+            gpuReady(context);
+        }
         timing.Mark("release_and_callback");
         if (profile) reportPresents(waitedMs, inFlight);
         CheckFailure();

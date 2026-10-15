@@ -28,6 +28,7 @@ void Driver::Shutdown() {
 
 void Driver::stop() {
     require(!onWorkerThread(), "worker cannot stop itself");
+    DrainFlipCompletions();
     std::lock_guard shutdownLock(shutdownMutex);
     if (stopped) return;
     LibcRequestShutdown_nid_postfix();
