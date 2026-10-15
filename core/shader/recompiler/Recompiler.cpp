@@ -901,6 +901,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
+    result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
     return result;
 }
@@ -1168,11 +1169,12 @@ namespace {
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
+    SrtRuntime traced = runtime;
+    traced.userDataUse = &capture.userDataUse;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot);
+        ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         return;
     }
-    SrtRuntime traced = runtime;
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
     auto& other = capture.readTrace.otherReads;

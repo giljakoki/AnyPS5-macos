@@ -18,6 +18,8 @@ ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers&
 struct DecodeRead {
     std::uint64_t address;
     std::vector<std::byte> bytes;
+    // The user word (index into the user data passed in) whose table pointer the read went through.
+    std::int32_t userWord = -1;
 };
 ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads = nullptr, bool staticAbi = false, std::uint32_t hiddenUserWords = 0);
 

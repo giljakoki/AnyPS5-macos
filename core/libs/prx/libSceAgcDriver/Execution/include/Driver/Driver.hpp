@@ -118,7 +118,19 @@ private:
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    // `userWords` false leaves every user-data SGPR out (APS5_PROFILE_DRAW's key churn statistics).
+    // `relocation` keys its pointer words by the contents behind them and its free words not at all
+    // (the alias key); `readable` turns false when such contents are not mapped.
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords = true, const DrawRelocation* relocation = nullptr, bool* readable = nullptr);
+    static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
+    static bool drawRelocationEnabled();
+    static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
+    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, std::span<const Graphics::DecodeRead> decodeReads, bool eligible, std::uint32_t hiddenWords, std::size_t userWords);
+    static void applyShaderDataPatches(DispatchVariant& variant);
+    std::shared_ptr<const DrawRelocation> learnDrawRelocation(std::uint64_t key, std::uint64_t alias, std::uint64_t identity);
+    void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
+    void reportDrawRelocation();
+    void explainAliasMiss(const QueueState& queue, std::uint64_t identity);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
@@ -307,6 +319,11 @@ private:
     std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> drawRelocations;
+    std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawAliases;
+    std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawRelocationLast;
+    std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
+    DrawRelocationCounters drawRelocationCounters;
     std::list<std::uint64_t> drawOrder;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;

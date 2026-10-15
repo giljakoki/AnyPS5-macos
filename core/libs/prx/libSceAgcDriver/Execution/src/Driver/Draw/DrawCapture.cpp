@@ -54,6 +54,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    stageCapture.userDataUse = capture->userDataUse;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -117,13 +118,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-            for (const auto& region : regions) {
-                variant->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-                const auto count = region.bytes.size() / sizeof(std::uint32_t);
-                const auto offset = variant->words.size();
-                variant->words.resize(offset + count);
-                std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-            }
+            const bool relocatable = stageCapture.compiled->poisonedSrtReads == 0 && std::all_of(decodeReads[i].begin(), decodeReads[i].end(), [](const Graphics::DecodeRead& read) { return read.userWord >= 0; });
+            tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i], relocatable, programs[i].hiddenUserWords, programs[i].userData.size());
             if (verifyHit && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};

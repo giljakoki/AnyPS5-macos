@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace AgcDriver::DriverDetail {
 
@@ -118,7 +119,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0 && drawCacheGovernor.Use();
+    const bool entriesAllowed = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool governed = entriesAllowed && drawCacheGovernor.Use();
+    std::uint64_t drawIdentity = 0;
+    bool relocationBypass = false;
+    if (entriesAllowed && !governed && registerKeyEnabled() && drawRelocationEnabled()) {
+        drawIdentity = drawIdentityKey(queue, *submission.shaders);
+        std::lock_guard cacheLock(drawCacheMutex);
+        const auto known = drawRelocations.find(drawIdentity);
+        if (known != drawRelocations.end() && !known->second->words.empty()) {
+            const auto trial = drawRelocationTrials.find(drawIdentity);
+            relocationBypass = trial == drawRelocationTrials.end() || trial->second.idle == 0;
+            if (relocationBypass) ++drawRelocationCounters.bypassed;
+        }
+    }
+    const bool useDrawEntries = governed || relocationBypass;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -137,8 +152,53 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         } else {
             ++drawEntryCounters.absent;
         }
+        // APS5_PROFILE_DRAW: whether a draw without an entry differs from an earlier draw only in
+        // its user-data SGPRs (per-draw constant pointers), the churn a key over them cannot hit.
+        if (profile) {
+            static std::unordered_set<std::uint64_t> structures;
+            if (structures.size() > 65536) structures.clear();
+            const bool seen = !structures.insert(drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), false)).second;
+            if (seen && entry == nullptr) ++drawEntryCounters.absentUserDataOnly;
+        }
+    }
+    std::uint64_t drawAlias = 0;
+    std::shared_ptr<const DrawRelocation> relocation;
+    std::vector<DrawUserPatch> userPatches;
+    if (registerKey && entry == nullptr && drawRelocationEnabled()) {
+        if (drawIdentity == 0) drawIdentity = drawIdentityKey(queue, *submission.shaders);
+        {
+            std::lock_guard cacheLock(drawCacheMutex);
+            const auto known = drawRelocations.find(drawIdentity);
+            if (known != drawRelocations.end() && !known->second->words.empty()) {
+                auto& trial = drawRelocationTrials[drawIdentity];
+                if (trial.idle != 0) --trial.idle;
+                else relocation = known->second;
+            }
+        }
+        if (relocation != nullptr) {
+            bool readable = true;
+            const auto alias = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), true, relocation.get(), &readable);
+            if (readable) drawAlias = alias == 0 ? 1 : alias;
+            std::lock_guard cacheLock(drawCacheMutex);
+            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
+            else ++drawRelocationCounters.unreadable;
+            if (profile && drawAlias != 0 && decode == nullptr) explainAliasMiss(queue, drawIdentity);
+            auto& trial = drawRelocationTrials[drawIdentity];
+            ++trial.lookups;
+            if (decode != nullptr) ++trial.hits;
+            if (trial.lookups >= DrawRelocationTrial::Window) {
+                if (trial.hits * DrawRelocationTrial::MinimumHitShare < trial.lookups) trial.idle = DrawRelocationTrial::IdleDraws;
+                trial.lookups = trial.hits = 0;
+            }
+        }
+    }
+    if (!userPatches.empty() && verifyDrawRecipe()) {
+        auto current = std::make_shared<DrawDecode>(*decode);
+        for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
+        decode = std::move(current);
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
+        userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);
         ++drawEntryCounters.absent;
@@ -159,6 +219,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     } scratchRelease{scratch};
     auto& programs = scratch.programs;
     programs.assign(decode->programs.begin(), decode->programs.end());
+    for (const auto& patch : userPatches) programs[patch.program].userData[patch.index] = patch.value;
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -245,7 +306,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
-    if (useDrawEntries) drawCacheGovernor.Note(drawHit);
+    if (governed) drawCacheGovernor.Note(drawHit);
+    const auto relocatedDecode = decode;
+    if (!userPatches.empty()) {
+        if (drawHit) {
+            for (auto& variant : matched) {
+                if (variant != nullptr) applyShaderDataPatches(*variant);
+            }
+        } else {
+            auto current = std::make_shared<DrawDecode>(*decode);
+            for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
+            decode = std::move(current);
+        }
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (drawHit) ++drawRelocationCounters.hits;
+    }
 
     if (registerKey) {
 
@@ -306,6 +381,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
+    if (drawIdentity != 0 && useDrawEntries && !drawHit) {
+        std::shared_ptr<const DrawRelocation> learned;
+        {
+            std::lock_guard cacheLock(drawCacheMutex);
+            learned = learnDrawRelocation(drawKey, drawAlias, drawIdentity);
+        }
+        if (learned != nullptr && learned != relocation && !learned->words.empty()) {
+            bool readable = true;
+            const auto alias = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), true, learned.get(), &readable);
+            if (readable) {
+                std::lock_guard cacheLock(drawCacheMutex);
+                learnDrawRelocation(drawKey, alias == 0 ? 1 : alias, drawIdentity);
+            }
+        }
+    }
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
