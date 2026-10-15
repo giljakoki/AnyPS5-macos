@@ -1,7 +1,9 @@
 #include "Ngs2Test.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -323,7 +325,7 @@ static void TestCustomFilter() {
     const auto voice = Voice(rack);
     Control(voice, SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_SETUP,
             Ngs2SamplerVoiceSetupParam{{}, {SCE_NGS2_WAVEFORM_TYPE_PCM_I16L, 1, 48000, 0, 0, 0}});
-    const std::vector<std::int16_t> pcm(Grain, 16384);
+    const std::vector<std::int16_t> pcm(Grain * 3, 16384);
     const Ngs2WaveformBlock block{0, pcm.size() * sizeof(std::int16_t), 0, 0, static_cast<std::uint32_t>(pcm.size()), 0, 0};
     Control(voice, SCE_NGS2_CUSTOM_SAMPLER_VOICE_PARAM_ADD_WAVEFORM_BLOCKS,
             Ngs2SamplerVoiceWaveformBlocksParam{{}, pcm.data(), 0, 1, &block});
@@ -342,6 +344,21 @@ static void TestCustomFilter() {
     const Ngs2RenderBufferInfo renderInfo{out.data(), out.size() * sizeof(float), SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 1};
     Require(sceNgs2SystemRender(system, &renderInfo, 1) == SCE_NGS2_OK);
     Require(out[0] > 0.0f && out[0] < 0.2f && out.back() > out[0]);
+
+    // Direct coefficients (type 0): a pure gain of 0.5, then 1.0, scales the steady input by exactly that much.
+    Ngs2CustomVoiceFilterParam direct{};
+    direct.type = 0;
+    direct.param.direct.i0 = 0.5f;
+    Control(voice, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER, direct);
+    Require(sceNgs2SystemRender(system, &renderInfo, 1) == SCE_NGS2_OK);
+    const float half = out.back();
+    Require(half > 0.0f && std::abs(out.front() - half) < 1e-6f);
+    direct.param.direct.i0 = 1.0f;
+    Control(voice, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER, direct);
+    Require(sceNgs2SystemRender(system, &renderInfo, 1) == SCE_NGS2_OK);
+    Require(std::abs(out.back() - 2.0f * half) < 1e-6f);
+    direct.param.direct.i0 = std::numeric_limits<float>::quiet_NaN();
+    Require(ControlThrows<std::invalid_argument>(voice, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER, direct));
     Require(sceNgs2RackDestroy(rack, nullptr) == SCE_NGS2_OK);
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
 }

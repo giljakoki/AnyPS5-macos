@@ -187,6 +187,7 @@ int Ngs2DestroyRack(Ngs2Rack& rack, Ngs2ContextBufferInfo* outBufferInfo);
 int Ngs2ReleaseBuffer(const Ngs2BufferAllocator& allocator, Ngs2ContextBufferInfo bufferInfo, Ngs2ContextBufferInfo* outBufferInfo);
 void Ngs2SetupAtrac9(Ngs2Voice& voice, const Ngs2WaveformFormat& format);
 void Ngs2SetFilter(Ngs2Voice& voice, const Ngs2SamplerVoiceFilterParam& param);
+void Ngs2SetDirectFilter(Ngs2Voice& voice, std::uint32_t index, std::uint64_t channelMask, const float (&feedForward)[3], const float (&feedBack)[2]);
 std::size_t Ngs2Atrac9BlockBytes(const Ngs2Voice& voice, const Ngs2WaveformBlock& block);
 void Ngs2RestartAtrac9(Ngs2Voice& voice);
 void Ngs2ConsumeAtrac9(Ngs2Voice& voice, std::uint32_t grain, std::uint32_t systemRate);

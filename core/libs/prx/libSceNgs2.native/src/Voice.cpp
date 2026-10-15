@@ -286,6 +286,30 @@ void Ngs2SetFilter(Ngs2Voice& voice, const Ngs2SamplerVoiceFilterParam& param) {
     filter.a2 = (1.0 - alpha) * inverseA0;
 }
 
+void Ngs2SetDirectFilter(Ngs2Voice& voice, std::uint32_t index, std::uint64_t channelMask, const float (&feedForward)[3], const float (&feedBack)[2]) {
+    if (index >= voice.rack->maxFilters) APS5_INVALID_ARG_EX;
+    for (const float c : feedForward) {
+        if (!std::isfinite(c)) APS5_INVALID_ARG_EX;
+    }
+    for (const float c : feedBack) {
+        if (!std::isfinite(c)) APS5_INVALID_ARG_EX;
+    }
+    if (voice.filters.size() <= index) voice.filters.resize(index + 1);
+    auto& filter = voice.filters[index];
+    filter.enabled = true;
+    filter.bypassMask = channelMask;
+    filter.history.assign(voice.channels, {});
+    filter.b0 = feedForward[0];
+    filter.b1 = feedForward[1];
+    filter.b2 = feedForward[2];
+    // The render step subtracts the feedback terms. The title's sign convention for o1/o2 is not documented here:
+    // take them as subtracted coefficients, and flip them only when that filter is unstable and the flipped one is not.
+    const auto stable = [](double a1, double a2) { return std::abs(a2) < 1.0 && std::abs(a1) < 1.0 + a2; };
+    const bool flip = !stable(feedBack[0], feedBack[1]) && stable(-feedBack[0], -feedBack[1]);
+    filter.a1 = flip ? -feedBack[0] : feedBack[0];
+    filter.a2 = flip ? -feedBack[1] : feedBack[1];
+}
+
 static void ApplySamplerParam(Ngs2Voice& voice, const Ngs2VoiceParamHeader& param) {
     switch (param.id) {
         case SCE_NGS2_SAMPLER_VOICE_PARAM_SETUP:
