@@ -23,6 +23,9 @@
 #endif
 
 #if defined(__APPLE__)
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -30,6 +33,7 @@
 #include <new>
 #include <unordered_map>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 #endif
 
@@ -317,6 +321,133 @@ private:
 
 const bool g_opened = (Watch::Get(), true);
 #elif defined(__APPLE__)
+// Whether a watched page's bytes differ from the copy taken at its last collection.
+bool PageDiffers(std::uintptr_t page, const std::uint8_t* shadow, std::size_t pageBytes) {
+    const auto* current = reinterpret_cast<const std::uint64_t*>(page);
+    const auto* previous = reinterpret_cast<const std::uint64_t*>(shadow);
+    const auto words = pageBytes / sizeof(std::uint64_t);
+    for (std::size_t block = 0; block < words; block += 64) {
+        std::uint64_t difference = 0;
+        for (std::size_t word = block; word < block + 64; ++word) difference |= current[word] ^ previous[word];
+        if (difference != 0) return true;
+    }
+    return false;
+}
+
+// The shadow compares of one large collect, shared with helper threads. A collect over a texture
+// surface compares every page of it with its shadow (a megabyte and more), which is bound by one
+// core's memory bandwidth and sits on the queue worker's draw path whenever a cached draw proves
+// its textures at a new ordering point. The caller compares chunks itself from the start and the
+// helpers take chunks once awake, so a collect never waits for a helper to wake; the results are
+// the same page by page as a serial compare. APS5_WATCH_COMPARE_HELPERS=n sets the helper count
+// (0 compares on the calling thread as before), APS5_WATCH_COMPARE_MIN_PAGES the smallest range
+// shared (64 pages by default). Helpers spin 300 us after a job before they sleep, the gap between
+// the collects of a busy queue worker.
+class CompareCrew {
+public:
+    struct Candidate {
+        std::uintptr_t page;
+        const std::uint8_t* shadow;
+    };
+
+    static CompareCrew& Get() {
+        static CompareCrew& crew = *new CompareCrew();
+        return crew;
+    }
+
+    static std::size_t MinPages() {
+        static const std::size_t pages = [] {
+            const char* text = std::getenv("APS5_WATCH_COMPARE_MIN_PAGES");
+            return text != nullptr ? std::max<std::size_t>(std::strtoull(text, nullptr, 10), 1) : std::size_t{64};
+        }();
+        return pages;
+    }
+
+    static std::size_t ConfiguredHelpers() {
+        static const std::size_t count = [] {
+            if (const char* text = std::getenv("APS5_WATCH_COMPARE_HELPERS")) return std::min<std::size_t>(std::strtoull(text, nullptr, 10), 8);
+            const auto cores = std::thread::hardware_concurrency();
+            return std::size_t{cores >= 8 ? 3u : cores >= 4 ? 1u : 0u};
+        }();
+        return count;
+    }
+
+    // Fills `differing` (one entry per candidate) with whether the page differs from its shadow.
+    void Compare(const std::vector<Candidate>& candidates, std::vector<std::uint8_t>& differing, std::size_t pageBytes) {
+        differing.assign(candidates.size(), 0);
+        Job job{candidates.data(), differing.data(), candidates.size(), pageBytes, (candidates.size() + ChunkPages - 1) / ChunkPages};
+        bool shared = false;
+        {
+            std::unique_lock lock(mutex, std::try_to_lock);
+            if (lock.owns_lock() && open == nullptr) {
+                open = &job;
+                serial.fetch_add(1, std::memory_order_release);
+                shared = true;
+            }
+        }
+        if (!shared) {
+            run(job);
+            return;
+        }
+        wake.notify_all();
+        run(job);
+        {
+            std::lock_guard lock(mutex);
+            open = nullptr;
+        }
+        while (job.busy.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    }
+
+private:
+    static constexpr std::size_t ChunkPages = 16;
+
+    struct Job {
+        const Candidate* candidates;
+        std::uint8_t* differing;
+        std::size_t count;
+        std::size_t pageBytes;
+        std::size_t chunks;
+        std::atomic<std::size_t> next{0};
+        std::atomic<std::uint32_t> busy{0};
+    };
+
+    CompareCrew() {
+        for (std::size_t index = 0; index < ConfiguredHelpers(); ++index) std::thread([this] { serve(); }).detach();
+    }
+
+    static void run(Job& job) {
+        for (auto chunk = job.next.fetch_add(1, std::memory_order_relaxed); chunk < job.chunks; chunk = job.next.fetch_add(1, std::memory_order_relaxed)) {
+            const auto first = chunk * ChunkPages;
+            const auto last = std::min(job.count, first + ChunkPages);
+            for (auto index = first; index < last; ++index) job.differing[index] = PageDiffers(job.candidates[index].page, job.candidates[index].shadow, job.pageBytes) ? 1 : 0;
+        }
+    }
+
+    void serve() {
+        std::uint64_t seen = 0;
+        for (;;) {
+            const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+            while (serial.load(std::memory_order_acquire) == seen && std::chrono::steady_clock::now() < spinUntil) std::this_thread::yield();
+            Job* job = nullptr;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return serial.load(std::memory_order_relaxed) != seen; });
+                seen = serial.load(std::memory_order_relaxed);
+                job = open;
+                if (job != nullptr) job->busy.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (job == nullptr) continue;
+            run(*job);
+            job->busy.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    Job* open = nullptr;
+    std::atomic<std::uint64_t> serial{0};
+};
+
 class Watch {
 public:
     static Watch& Get() {
@@ -396,44 +527,69 @@ public:
         {
             const std::lock_guard lock(_lock);
             if (take != Take::Fresh && !covers(begin, end)) return false;
-            auto it = _segments.upper_bound(begin);
-            if (it != _segments.begin()) --it;
-            Leaf* leaf = nullptr;
-            std::uintptr_t leafNumber = ~std::uintptr_t{0};
-            for (; it != _segments.end() && it->first < end; ++it) {
-                const auto first = std::max(begin, it->first);
-                const auto last = std::min(end, it->second.end);
-                const std::uint8_t initial = Written | Fresh | Materialized | it->second.protection;
-                for (auto page = first; page < last; page += _page) {
-                    const auto number = page / _page;
-                    if ((number >> LeafShift) != leafNumber) {
-                        leafNumber = number >> LeafShift;
-                        const auto found = _leaves.find(leafNumber);
-                        leaf = found != _leaves.end() ? found->second.get() : nullptr;
-                    }
-                    const auto index = number & (LeafPages - 1);
-                    std::uint8_t state = leaf != nullptr && (leaf->states[index] & Materialized) != 0 ? leaf->states[index] : initial;
-                    const bool fresh = (state & Fresh) != 0;
-                    if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) continue;
-                    const bool compared = (state & Comparable) == Comparable;
-                    const auto shadow = leaf != nullptr ? leaf->shadows[index] : NoShadow;
-                    if ((state & Written) == 0 && (!compared || shadow == NoShadow || !differs(page, _shadows.At(shadow)))) continue;
-                    if (leaf == nullptr) leaf = materializeLeaf(leafNumber);
-                    if ((leaf->states[index] & Materialized) == 0) ++leaf->materialized;
-                    state &= static_cast<std::uint8_t>(~Fresh);
-                    if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
-                    else runs.emplace_back(page, page + _page);
-                    const bool hostWrite = std::any_of(_hostWrites.begin(), _hostWrites.end(), [&](const auto& write) { return page >= write.first && page < write.second; });
-                    if (!hostWrite) {
-                        if (compared) {
-                            if (leaf->shadows[index] == NoShadow) leaf->shadows[index] = _shadows.Allocate(_page);
-                            std::memcpy(_shadows.At(leaf->shadows[index]), reinterpret_cast<const void*>(page), _page);
+            // A large range's shadow compares run first, shared out (CompareCrew), and the walk that
+            // acts on them consumes their results in the same page order: the planning walk changes
+            // nothing, so both walks take the compare branch for the same pages.
+            const bool shared = CompareCrew::ConfiguredHelpers() != 0 && (end - begin) / _page >= CompareCrew::MinPages();
+            thread_local std::vector<CompareCrew::Candidate> candidates;
+            thread_local std::vector<std::uint8_t> differing;
+            std::size_t consumed = 0;
+            const auto walk = [&](bool planning) {
+                auto it = _segments.upper_bound(begin);
+                if (it != _segments.begin()) --it;
+                Leaf* leaf = nullptr;
+                std::uintptr_t leafNumber = ~std::uintptr_t{0};
+                for (; it != _segments.end() && it->first < end; ++it) {
+                    const auto first = std::max(begin, it->first);
+                    const auto last = std::min(end, it->second.end);
+                    const std::uint8_t initial = Written | Fresh | Materialized | it->second.protection;
+                    for (auto page = first; page < last; page += _page) {
+                        const auto number = page / _page;
+                        if ((number >> LeafShift) != leafNumber) {
+                            leafNumber = number >> LeafShift;
+                            const auto found = _leaves.find(leafNumber);
+                            leaf = found != _leaves.end() ? found->second.get() : nullptr;
                         }
-                        state &= static_cast<std::uint8_t>(~Written);
+                        const auto index = number & (LeafPages - 1);
+                        std::uint8_t state = leaf != nullptr && (leaf->states[index] & Materialized) != 0 ? leaf->states[index] : initial;
+                        const bool fresh = (state & Fresh) != 0;
+                        if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) continue;
+                        const bool compared = (state & Comparable) == Comparable;
+                        const auto shadow = leaf != nullptr ? leaf->shadows[index] : NoShadow;
+                        if ((state & Written) == 0) {
+                            if (!compared || shadow == NoShadow) continue;
+                            if (planning) {
+                                candidates.push_back({page, _shadows.At(shadow)});
+                                continue;
+                            }
+                            const bool changed = shared ? differing[consumed++] != 0 : PageDiffers(page, _shadows.At(shadow), _page);
+                            if (!changed) continue;
+                        } else if (planning) {
+                            continue;
+                        }
+                        if (leaf == nullptr) leaf = materializeLeaf(leafNumber);
+                        if ((leaf->states[index] & Materialized) == 0) ++leaf->materialized;
+                        state &= static_cast<std::uint8_t>(~Fresh);
+                        if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
+                        else runs.emplace_back(page, page + _page);
+                        const bool hostWrite = std::any_of(_hostWrites.begin(), _hostWrites.end(), [&](const auto& write) { return page >= write.first && page < write.second; });
+                        if (!hostWrite) {
+                            if (compared) {
+                                if (leaf->shadows[index] == NoShadow) leaf->shadows[index] = _shadows.Allocate(_page);
+                                std::memcpy(_shadows.At(leaf->shadows[index]), reinterpret_cast<const void*>(page), _page);
+                            }
+                            state &= static_cast<std::uint8_t>(~Written);
+                        }
+                        leaf->states[index] = state;
                     }
-                    leaf->states[index] = state;
                 }
+            };
+            if (shared) {
+                candidates.clear();
+                walk(true);
+                CompareCrew::Get().Compare(candidates, differing, _page);
             }
+            walk(false);
         }
         for (const auto& [first, last] : runs) written(context, first, last);
         return true;
@@ -549,18 +705,6 @@ private:
 
     Watch() {
         _available = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
-    }
-
-    bool differs(std::uintptr_t page, const std::uint8_t* shadow) const {
-        const auto* current = reinterpret_cast<const std::uint64_t*>(page);
-        const auto* previous = reinterpret_cast<const std::uint64_t*>(shadow);
-        const auto words = _page / sizeof(std::uint64_t);
-        for (std::size_t block = 0; block < words; block += 64) {
-            std::uint64_t difference = 0;
-            for (std::size_t word = block; word < block + 64; ++word) difference |= current[word] ^ previous[word];
-            if (difference != 0) return true;
-        }
-        return false;
     }
 
     std::uintptr_t pageStart(std::uintptr_t address) const {

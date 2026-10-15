@@ -307,11 +307,57 @@ void CheckReservation() {
     Require(elapsed < std::chrono::seconds(2), "registering a large reservation costs time per page");
 }
 
+
+// A range past the shared-compare threshold (APS5_WATCH_COMPARE_MIN_PAGES) is compared by the
+// helper crew: every changed page, and only those, is reported, from any thread, including pages
+// changed in the first and last chunk, and partial collects of it agree.
+void CheckLarge() {
+    constexpr std::size_t Pages = 1024;
+    Region region(Pages);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    std::memset(region.base, 7, region.bytes);
+    Require(region.Collect() == All(Pages), "a never-collected large range is not reported in full");
+    Require(region.Collect().empty(), "an unchanged large range is reported");
+    for (int round = 0; round < 64; ++round) {
+        std::set<std::size_t> expected;
+        for (std::size_t index : {std::size_t{0}, std::size_t{15}, std::size_t{16}, Pages - 1, static_cast<std::size_t>(round) * 13 % Pages, static_cast<std::size_t>(round) * 977 % Pages}) {
+            region.base[index * region.page + (static_cast<std::size_t>(round) * 61) % region.page] ^= 0x5a;
+            expected.insert(index);
+        }
+        std::set<std::size_t> pages;
+        if (round % 2 == 0) pages = region.Collect();
+        else std::thread([&] { pages = region.Collect(); }).join();
+        Require(pages == expected, "a large collect reports other pages than the changed ones");
+        Require(region.Collect().empty(), "a large collect leaves a reported page reported again");
+    }
+    region.base[700 * region.page] ^= 1;
+    Require(region.Collect(&GuestWriteWatchCollect_nid_postfix, 0, 512).empty(), "a partial collect reports a page outside it");
+    Require(region.Collect(&GuestWriteWatchCollect_nid_postfix, 512, 512) == std::set<std::size_t>{700}, "a partial large collect misses its changed page");
+    std::vector<std::thread> threads;
+    std::atomic<bool> wrong{false};
+    for (int thread = 0; thread < 4; ++thread) {
+        threads.emplace_back([&, thread] {
+            for (int round = 0; round < 50; ++round) {
+                const auto pages = region.Collect(&GuestWriteWatchCollect_nid_postfix, static_cast<std::size_t>(thread) * 256, 256);
+                if (!pages.empty()) wrong = true;
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    Require(!wrong, "concurrent large collects of an unchanged range report pages");
+    // The cost of an unchanged collect of the whole range (compare with APS5_WATCH_COMPARE_HELPERS=0).
+    constexpr int Rounds = 200;
+    const auto start = std::chrono::steady_clock::now();
+    for (int round = 0; round < Rounds; ++round) Require(region.Collect().empty(), "an unchanged large range is reported while timed");
+    const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / Rounds;
+    std::printf("unchanged collect of %zu KiB: %.1f us\n", region.bytes >> 10, us);
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection, threads, vector or reservation");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection, threads, vector, reservation or large");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -323,6 +369,7 @@ int main(int argc, char** argv) {
         else if (mode == "threads") CheckThreads();
         else if (mode == "vector") CheckVector();
         else if (mode == "reservation") CheckReservation();
+        else if (mode == "large") CheckLarge();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
