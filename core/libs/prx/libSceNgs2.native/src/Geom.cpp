@@ -10,15 +10,34 @@ int Ngs2GeomCalcListener(const Ngs2GeomListenerParam* param, Ngs2GeomListenerWor
     if (param == nullptr) APS5_INVALID_ARG_EX;
     if (outWork == nullptr) return SCE_NGS2_ERROR_INVALID_OUT_ADDRESS;
     if (flags != 0) throw std::runtime_error("NGS2: listener coordinate flags are unsupported");
-    if (param->position.x != 0.0f || param->position.y != 0.0f || param->position.z != 0.0f)
-        throw std::runtime_error("NGS2: listener translation is unsupported");
-    if (param->orient_front.x != 0.0f || param->orient_front.y != 0.0f || param->orient_front.z != 1.0f ||
-        param->orient_up.x != 0.0f || param->orient_up.y != 1.0f || param->orient_up.z != 0.0f)
-        throw std::runtime_error("NGS2: non-default listener orientation is unsupported");
-    if (!std::isfinite(param->velocity.x) || !std::isfinite(param->velocity.y) || !std::isfinite(param->velocity.z)) APS5_INVALID_ARG_EX;
+    for (const Ngs2GeomVector* v : {&param->position, &param->orient_front, &param->orient_up, &param->velocity}) {
+        if (!std::isfinite(v->x) || !std::isfinite(v->y) || !std::isfinite(v->z)) APS5_INVALID_ARG_EX;
+    }
     if (!std::isfinite(param->sound_speed) || param->sound_speed <= 0.0f) APS5_INVALID_ARG_EX;
+    // World-to-listener transform: rows are the listener's right, up and front axes, the last column moves
+    // the listener to the origin. The default listener (front +z, up +y, at the origin) gives the identity.
+    const auto dot = [](const Ngs2GeomVector& a, const Ngs2GeomVector& b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+    const auto cross = [](const Ngs2GeomVector& a, const Ngs2GeomVector& b) {
+        return Ngs2GeomVector{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+    };
+    const auto normalized = [&](Ngs2GeomVector v) {
+        const float length = std::sqrt(dot(v, v));
+        if (!std::isfinite(length) || length <= 0.0f) return Ngs2GeomVector{};
+        return Ngs2GeomVector{v.x / length, v.y / length, v.z / length};
+    };
+    const Ngs2GeomVector front = normalized(param->orient_front);
+    const Ngs2GeomVector right = normalized(cross(param->orient_up, front));
+    if (dot(front, front) == 0.0f || dot(right, right) == 0.0f) APS5_INVALID_ARG_EX;
+    const Ngs2GeomVector up = cross(front, right);
+    const Ngs2GeomVector axes[3] = {right, up, front};
     Ngs2GeomListenerWork work{};
-    for (std::size_t i = 0; i < 4; i++) work.matrix[i][i] = 1.0f;
+    for (std::size_t i = 0; i < 3; i++) {
+        work.matrix[i][0] = axes[i].x;
+        work.matrix[i][1] = axes[i].y;
+        work.matrix[i][2] = axes[i].z;
+        work.matrix[i][3] = -dot(axes[i], param->position);
+    }
+    work.matrix[3][3] = 1.0f;
     work.velocity = param->velocity;
     work.sound_speed = param->sound_speed;
     *outWork = work;

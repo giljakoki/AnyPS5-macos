@@ -108,21 +108,17 @@ static void RejectListener(const Ngs2GeomListenerParam* param, std::uint32_t fla
 static void TestUnsupportedListener() {
     auto param = Listener();
     for (const auto flags : {1u, 2u, 0xffffffffu}) RejectListener(&param, flags);
-    for (const auto vector : {&Ngs2GeomListenerParam::position, &Ngs2GeomListenerParam::orient_front, &Ngs2GeomListenerParam::orient_up}) {
-        for (const auto component : {&Ngs2GeomVector::x, &Ngs2GeomVector::y, &Ngs2GeomVector::z}) {
-            for (const float value : {-1.0f, 0.0f, 1.0f, 2.0f, std::numeric_limits<float>::min(), std::numeric_limits<float>::max()}) {
-                param = Listener();
-                auto& field = (param.*vector).*component;
-                if (field == value) continue;
-                field = value;
-                RejectListener(&param, 0);
-            }
-            param = Listener();
-            auto& field = (param.*vector).*component;
-            field = std::nextafter(field, 2.0f);
-            RejectListener(&param, 0);
-        }
-    }
+}
+
+static void TestMovedListener() {
+    // A listener at (1, 2, 3) facing +x with +y up: right is -z, so world +x lands on the listener's front axis.
+    auto param = Listener();
+    param.position = {1.0f, 2.0f, 3.0f};
+    param.orient_front = {2.0f, 0.0f, 0.0f};
+    param.orient_up = {0.0f, 1.0f, 0.0f};
+    Ngs2GeomListenerWork work{};
+    Require(sceNgs2GeomCalcListener(&param, &work, 0) == SCE_NGS2_OK);
+    RequireMatrix(work, {{0, 0, -1, 3}, {0, 1, 0, -2}, {1, 0, 0, -1}, {0, 0, 0, 1}});
 }
 
 static void TestInvalidListener() {
@@ -160,6 +156,7 @@ int main() {
     TestResetSourceParam();
     TestDefaultListener();
     TestUnsupportedListener();
+    TestMovedListener();
     TestInvalidListener();
     return 0;
 }
