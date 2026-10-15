@@ -2648,9 +2648,17 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
-    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 5'000'000'000ULL, VK_NULL_HANDLE, state->acquireFence, &index);
+    // No free image (every one queued for display, or a hidden window that hands out about one image
+    // per second) drops this presentation instead of blocking the presenter, and with it the flip, for
+    // up to a display period or longer (upstream #4684). APS5_NO_ACQUIRE_DROP=1 waits as before.
+    static const bool acquireWaits = std::getenv("APS5_NO_ACQUIRE_DROP") != nullptr;
+    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, acquireWaits ? 5'000'000'000ULL : 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         state->extent = {0, 0};
+        return false;
+    }
+    if (!acquireWaits && (acquired == VK_NOT_READY || acquired == VK_TIMEOUT)) {
+        ++presentCounters.acquireDrops;
         return false;
     }
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");

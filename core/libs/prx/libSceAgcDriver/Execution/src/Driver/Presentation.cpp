@@ -55,6 +55,16 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool lockedQueue = std::getenv("APS5_PRESENT_SUBMIT_LOCKED") != nullptr || !Graphics::QueueSubmitter::Enabled();
+    // The flip completes once the frame's own GPU work has (d9632d552): the recorder batches up to the
+    // flip packet, waited for on the timeline semaphore without the mutex. Waiting for the blit's fence
+    // instead also waited for every batch of the next frame the worker submitted between the flip
+    // packet and the blit (about 15 in PPSA36082, most of a frame of GPU time), so the title's
+    // WAIT_FLIP_DONE ran the frames serially behind the GPU. The blit is queued before the flip
+    // completes, so later work cannot overwrite the image it reads; it trails on the GPU (retired at
+    // the next presentation). APS5_NO_FLIP_SERIAL_WAIT=1 waits for the blit's fence as before.
+    static const bool serialWait = std::getenv("APS5_NO_FLIP_SERIAL_WAIT") == nullptr;
+    const std::uint64_t frameBatches = serialWait && window.timing != nullptr ? window.timing->BatchesAtFlip() : 0;
+    std::uint64_t recordedBatches = 0;
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
@@ -76,6 +86,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presenting->Resize(drawableWidth, drawableHeight);
             timing.Mark("resize");
             presentable = presenting->Presentable();
+            std::uint64_t unsignaled = 0;
+            presenting->FlipBatches(recordedBatches, unsignaled);
             if (buffer != nullptr) require(buffer->width == window.width && buffer->height == window.height, "display buffer extent differs from output");
         }
 
@@ -118,11 +130,22 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = false;
             }
         }
+        // A presentation dropped (no swapchain image, out of date) still completes its flip only after
+        // the frame's GPU work; true when the timeline wait applies (else the blit's fence is the wait).
+        const auto waitFrame = [&] {
+            if (frameBatches == 0 || presenting == nullptr || frameBatches > recordedBatches || !presenting->CanWaitUnlocked()) return false;
+            const auto start = std::chrono::steady_clock::now();
+            presenting->WaitRecorded(frameBatches);
+            waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            timing.Mark("frame_serial_wait");
+            return true;
+        };
+        if (!presentable && !syncFlip) waitFrame();
         if (queueUnlocked) {
             presenting->QueuePresent();
             timing.Mark("queue_present");
         }
-        if (trailing) {
+        if (trailing && !waitFrame()) {
             waitedMs += presenting->FinishPresent();
             timing.Mark("render_fence_wait");
         }
@@ -165,7 +188,7 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     const auto flips = flipsCounted.load() - previousFlips;
     const double perFlip = flips != 0 ? 1.0 / static_cast<double>(flips) : 0.0;
     const auto serial = flipSerial.load();
-    AgcDriver::ProfilePrint_nid_no_patch( "[present] %llu presents over 10 s (%zu may trail on the GPU); %s p50 %.2f ms, p90 %.2f ms, max %.2f ms over %zu; per present: GPU busy %.1f ms, idle gaps %.1f ms (%llu batches without a completion record); per flip: %.1f batches recorded (%.1f unsignaled at the flip); per present: %.1f batches ahead of the blit, %.1f after it; after the flip packet: last submit %.1f ms, blit submit %.1f ms; in-place reads overwritten before execution: %llu of %llu checked\n", static_cast<unsigned long long>(presents), inFlight, inFlight != 0 ? "inflight_wait" : "render_fence_wait", percentile(0.5), percentile(0.9), waits.empty() ? 0.0 : waits.back(), waits.size(), (counts.gpuBusyMs - previous.gpuBusyMs) * perPresent, (counts.gpuGapMs - previous.gpuGapMs) * perPresent, static_cast<unsigned long long>(counts.gpuUnread - previous.gpuUnread), static_cast<double>(serial - windowSerial) * perFlip, static_cast<double>(flipBatchesUnsignaled.load() - previousUnsignaled) * perFlip, static_cast<double>(counts.batchesAheadOfBlit - previous.batchesAheadOfBlit) * perPresent, static_cast<double>(counts.batchesAfterFlip - previous.batchesAfterFlip) * perPresent, (counts.lastSubmitAfterFlipMs - previous.lastSubmitAfterFlipMs) * perPresent, (counts.blitSubmitAfterFlipMs - previous.blitSubmitAfterFlipMs) * perPresent, static_cast<unsigned long long>(counts.readsOverwritten - previous.readsOverwritten), static_cast<unsigned long long>(counts.readsChecked - previous.readsChecked));
+    AgcDriver::ProfilePrint_nid_no_patch( "[present] %llu presents over 10 s (%llu dropped: no free swapchain image; %zu may trail on the GPU); %s p50 %.2f ms, p90 %.2f ms, max %.2f ms over %zu; per present: GPU busy %.1f ms, idle gaps %.1f ms (%llu batches without a completion record); per flip: %.1f batches recorded (%.1f unsignaled at the flip); per present: %.1f batches ahead of the blit, %.1f after it; after the flip packet: last submit %.1f ms, blit submit %.1f ms; in-place reads overwritten before execution: %llu of %llu checked\n", static_cast<unsigned long long>(presents), static_cast<unsigned long long>(counts.acquireDrops - previous.acquireDrops), inFlight, inFlight != 0 ? "inflight_wait" : "render_fence_wait", percentile(0.5), percentile(0.9), waits.empty() ? 0.0 : waits.back(), waits.size(), (counts.gpuBusyMs - previous.gpuBusyMs) * perPresent, (counts.gpuGapMs - previous.gpuGapMs) * perPresent, static_cast<unsigned long long>(counts.gpuUnread - previous.gpuUnread), static_cast<double>(serial - windowSerial) * perFlip, static_cast<double>(flipBatchesUnsignaled.load() - previousUnsignaled) * perFlip, static_cast<double>(counts.batchesAheadOfBlit - previous.batchesAheadOfBlit) * perPresent, static_cast<double>(counts.batchesAfterFlip - previous.batchesAfterFlip) * perPresent, (counts.lastSubmitAfterFlipMs - previous.lastSubmitAfterFlipMs) * perPresent, (counts.blitSubmitAfterFlipMs - previous.blitSubmitAfterFlipMs) * perPresent, static_cast<unsigned long long>(counts.readsOverwritten - previous.readsOverwritten), static_cast<unsigned long long>(counts.readsChecked - previous.readsChecked));
     previous = counts;
     previousFlips = flipsCounted.load();
     previousUnsignaled = flipBatchesUnsignaled.load();
