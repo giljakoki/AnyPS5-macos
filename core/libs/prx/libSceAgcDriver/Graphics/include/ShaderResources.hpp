@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
+#include <atomic>
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
 #include <chrono>
@@ -110,6 +111,13 @@ private:
     Stats stats;
 };
 
+// APS5_PROFILE_DRAW: draws whose snapshot descriptor set was the template's last one again, and
+// those that wrote a new one (PrepareDrawBindings; the [draws] lookup/record split line).
+struct DrawBindingsReuseCounts {
+    std::atomic<std::uint64_t> reused{0}, written{0};
+};
+DrawBindingsReuseCounts& DrawBindingsReuse();
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -143,6 +151,8 @@ public:
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // The allocations the snapshots stand for, in order (PrepareDrawBindings' reuse compare).
+        std::vector<std::size_t> selected;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -510,6 +520,10 @@ private:
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
+    // The last draw's snapshot set (PrepareDrawBindings): a draw selecting the very same snapshot
+    // buffers binds it again instead of writing a new descriptor set.
+    mutable std::mutex bindingsMutex;
+    mutable std::weak_ptr<DrawBindings> lastBindings;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;

@@ -3906,6 +3906,11 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+DrawBindingsReuseCounts& DrawBindingsReuse() {
+    static DrawBindingsReuseCounts counts;
+    return counts;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
@@ -3955,6 +3960,32 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    // The same snapshot buffers as the last draw of this template (ReusableDrawSnapshot hits, none
+    // moved by words): its descriptor set, never written after its creation, says the same.
+    // APS5_NO_DRAW_BINDINGS_REUSE=1 writes a set for every draw as before.
+    static const bool reuse = std::getenv("APS5_NO_DRAW_BINDINGS_REUSE") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (reuse) {
+        std::shared_ptr<DrawBindings> last;
+        {
+            std::lock_guard lock(bindingsMutex);
+            last = lastBindings.lock();
+        }
+        const auto same = [&] {
+            if (last == nullptr || last->selected.size() != selected.size() || last->snapshots.size() != result->snapshots.size()) return false;
+            if (!std::equal(selected.begin(), selected.end(), last->selected.begin())) return false;
+            for (std::size_t index = 0; index < result->snapshots.size(); ++index) {
+                if (result->snapshots[index].address != last->snapshots[index].address || result->snapshots[index].buffer != last->snapshots[index].buffer) return false;
+            }
+            return true;
+        };
+        if (same()) {
+            if (profile) DrawBindingsReuse().reused.fetch_add(1, std::memory_order_relaxed);
+            recorder.Keep(last);
+            return last;
+        }
+        if (profile) DrawBindingsReuse().written.fetch_add(1, std::memory_order_relaxed);
+    }
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::map<VkDescriptorType, std::uint32_t> counts;
     for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
@@ -3983,6 +4014,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (reuse) {
+        result->selected.assign(selected.begin(), selected.end());
+        std::lock_guard lock(bindingsMutex);
+        lastBindings = result;
+    }
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
