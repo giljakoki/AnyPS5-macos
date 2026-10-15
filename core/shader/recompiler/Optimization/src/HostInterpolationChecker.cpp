@@ -438,6 +438,156 @@ bool unhookUnobservedPhiReads(IrProgram& program) {
     return !unobserved.empty();
 }
 
+// A raw I/J VGPR the shader overwrites under EXEC in an if/else that a wave-mask s_cbranch_execz
+// may skip: v = phi(skipped: v, ran: select(c, x, v)). On the skipped edge c is false in every
+// lane, so the phi equals select(c, phi(skipped: any, ran: x), v), which the complementary-select
+// rewrite below can then see through.
+bool carriesBarycentricDeep(const IrValue* value, std::vector<const IrValue*>& visited, std::uint32_t depth = 0) {
+    value = lookThrough(value);
+    if (isBarycentric(*value)) return true;
+    if (depth > 16 || std::find(visited.begin(), visited.end(), value) != visited.end()) return false;
+    visited.push_back(value);
+    if (value->Opcode() == IrOpcode::SelectU32) return carriesBarycentricDeep(value->Argument(1), visited, depth + 1) || carriesBarycentricDeep(value->Argument(2), visited, depth + 1);
+    if (!value->IsPhi()) return false;
+    for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+        if (value->Argument(index) != nullptr && carriesBarycentricDeep(value->Argument(index), visited, depth + 1)) return true;
+    }
+    return false;
+}
+
+const IrValue* negated(const IrValue* value) {
+    value = value->Resolve();
+    return value->Opcode() == IrOpcode::LogicalNot ? value->Argument(0)->Resolve() : nullptr;
+}
+
+const BlockInfo* infoOf(const IrProgram& program, const IrBlock* block) {
+    const auto& blocks = program.Blocks();
+    const auto& info = program.Metadata().blockInfo;
+    for (std::size_t i = 0; i < blocks.size() && i < info.size(); ++i) {
+        if (blocks[i].get() == block) return &info[i];
+    }
+    return nullptr;
+}
+
+// Whether `condition` is false in every lane that reaches `to` straight from `from`'s wave-mask branch.
+bool falseInEveryLane(const IrProgram& program, const IrBlock* from, const IrBlock* to, const IrValue* condition) {
+    const auto* source = infoOf(program, from);
+    const auto* target = infoOf(program, to);
+    if (source == nullptr || target == nullptr || source->condition == nullptr || source->laneLocalBranch) return false;
+    const auto& term = source->terminator;
+    if (term.kind != TerminatorKind::ConditionalBranch || term.trueBlock == term.falseBlock) return false;
+    condition = condition->Resolve();
+    switch (term.condition) {
+        case BranchCondition::ExecZero:
+        case BranchCondition::VccZero:
+            return term.trueBlock == target->id && negated(source->condition) == condition;
+        case BranchCondition::ExecNonZero:
+        case BranchCondition::VccNonZero:
+            return term.falseBlock == target->id && source->condition->Resolve() == condition;
+        default:
+            return false;
+    }
+}
+
+bool splitSkippedSelectPhis(IrProgram& program) {
+    bool changed = false;
+    for (const auto& block : program.Blocks()) {
+        std::vector<IrValue*> phis;
+        IrValue* firstOther = nullptr;
+        for (IrValue* inst : block->Instructions()) {
+            if (!inst->IsPhi()) {
+                firstOther = inst;
+                break;
+            }
+            phis.push_back(inst);
+        }
+        for (IrValue* phi : phis) {
+            if (phi->Type() != IrType::U32 || phi->ArgumentCount() != 2u || phi->PhiBlockCount() != 2u || !phi->HasUses()) continue;
+            for (std::size_t skipped = 0; skipped < 2u; ++skipped) {
+                IrValue* kept = phi->Argument(skipped)->Resolve();
+                IrValue* select = phi->Argument(1u - skipped)->Resolve();
+                IrBlock* from = phi->PhiBlock(skipped);
+                IrBlock* ran = phi->PhiBlock(1u - skipped);
+                if (select->Opcode() != IrOpcode::SelectU32 || select->Argument(2)->Resolve() != kept) continue;
+                if (ran->Predecessors().size() != 1u || ran->Predecessors().front() != from) continue;
+                if (!falseInEveryLane(program, from, block.get(), select->Argument(0))) continue;
+                std::vector<const IrValue*> visited;
+                if (!carriesBarycentricDeep(kept, visited)) continue;
+                auto& zero = program.CreateValue(IrOpcode::Void, IrType::U32);
+                zero.SetImmediateU32(0u);
+                auto& taken = program.CreateValue(IrOpcode::Phi, IrType::U32);
+                taken.AddPhiOperand(from, &zero);
+                taken.AddPhiOperand(ran, select->Argument(1));
+                block->InsertInstructionBefore(phi, &taken);
+                auto& merged = program.CreateValue(IrOpcode::SelectU32, IrType::U32);
+                merged.AddArgument(select->Argument(0));
+                merged.AddArgument(&taken);
+                merged.AddArgument(kept);
+                phi->ReplaceAllUsesWith(&merged);
+                if (firstOther != nullptr) {
+                    block->InsertInstructionBefore(firstOther, &merged);
+                } else {
+                    block->AppendInstruction(&merged);
+                }
+                changed = true;
+                break;
+            }
+        }
+    }
+    return changed;
+}
+
+// LogicalAnd(own bit of ballot(true), x) is x for every lane that executed the ballot.
+const IrValue* withoutActiveLane(const IrValue* value) {
+    value = value->Resolve();
+    while (value->Opcode() == IrOpcode::LogicalAnd) {
+        if (keepsOnlyIdleLanes(value->Argument(0))) {
+            value = value->Argument(1)->Resolve();
+        } else if (keepsOnlyIdleLanes(value->Argument(1))) {
+            value = value->Argument(0)->Resolve();
+        } else {
+            break;
+        }
+    }
+    return value;
+}
+
+bool complementary(const IrValue* left, const IrValue* right) {
+    left = withoutActiveLane(left);
+    right = withoutActiveLane(right);
+    return negated(left) == right || negated(right) == left;
+}
+
+// select(p, u, select(!p, v, w)) is select(p, u, v); select(p, select(!p, v, w), u) is select(p, w, u).
+bool foldComplementarySelects(IrProgram& program) {
+    bool changed = false;
+    for (const auto& block : program.Blocks()) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::SelectU32) continue;
+            for (std::size_t operand = 1; operand <= 2u; ++operand) {
+                const IrValue* inner = inst->Argument(operand)->Resolve();
+                if (inner->Opcode() != IrOpcode::SelectU32 || !complementary(inst->Argument(0), inner->Argument(0))) continue;
+                std::vector<const IrValue*> visited;
+                if (!carriesBarycentricDeep(inner, visited)) continue;
+                inst->ReplaceArgument(operand, inner->Argument(operand == 2u ? 1u : 2u));
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+bool resolveSkippedBarycentricSelects(IrProgram& program) {
+    bool changed = false;
+    for (int round = 0; round < 8; ++round) {
+        const bool split = splitSkippedSelectPhis(program);
+        const bool folded = foldComplementarySelects(program);
+        if (!split && !folded) break;
+        changed = true;
+    }
+    return changed;
+}
+
 }
 
 bool BarycentricMaskedZero() {
@@ -474,6 +624,7 @@ bool HostInterpolationChecker::Lower(IrProgram& program, const ShaderPixelInputI
     if (MaskedSelectEliminator{}.Eliminate(program).removedSelects != 0u) DeadCodeEliminator{}.Eliminate(program);
     if (unhookUnobservedPhiReads(program)) DeadCodeEliminator{}.Eliminate(program);
     if (takeExportedSelects(program)) DeadCodeEliminator{}.Eliminate(program);
+    if (resolveSkippedBarycentricSelects(program)) DeadCodeEliminator{}.Eliminate(program);
     if (BarycentricMaskedZero() && zeroMaskedBarycentrics(program)) DeadCodeEliminator{}.Eliminate(program);
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {

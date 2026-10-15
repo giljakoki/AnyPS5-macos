@@ -1646,6 +1646,14 @@ void verifyStagesWithoutSubgroups() {
         0xbe850381u, 0x7d880affu, 0x00000064u, 0xbe803c6au, 0xbf880001u, 0xbe850387u, 0x887e007eu, 0x7e020205u,
         0xf80008cfu, 0x01010101u, 0xbf810000u,
     };
+    // Outer Wilds (PPSA08102) vertex shape: s_mov_b32 s5, 1; v_cmp_gt_u32 vcc, 0x64, v5;
+    // s_and_saveexec_b64 s[0:1], vcc; s_cbranch_execz join; v_cmp_lt_u32_e64 vcc, 3, v5;
+    // s_mov_b32 s5, 7; join: s_or_b64 exec, exec, s[0:1]; v_mov_b32 v2, s5;
+    // v_cndmask_b32 v1, 0, v2, vcc; exp pos0 v1 x4 done. The region's SGPR and VCC are read after the join.
+    const std::vector<std::uint32_t> scalarLeak64{
+        0xbe850381u, 0x7d880affu, 0x00000064u, 0xbe80246au, 0xbf880003u, 0xd4c1006au, 0x02020a83u, 0xbe850387u,
+        0x88fe007eu, 0x7e040205u, 0x02020480u, 0xf80008cfu, 0x01010101u, 0xbf810000u,
+    };
     const std::vector<std::uint32_t> waterfall{
         0xbe80037eu, 0x7e020505u, 0x7d840a01u, 0xbe823c6au, 0x7e020201u, 0x897e027eu, 0xbf89fffau, 0xbefe0300u,
         0xf80008cfu, 0x01010101u, 0xbf810000u,
@@ -1683,7 +1691,16 @@ void verifyStagesWithoutSubgroups() {
     }
     require(subgroupWords(prepared(counted, 32u, 32u, ~0u)) != 0u, "stages without subgroups: s_bcnt1 of EXEC on a device with vertex subgroups lost its subgroup operations");
     expectFailure([&] { static_cast<void>(prepared(dpp, 32u, 32u, withoutVertex)); }, refused, "stages without subgroups: a DPP row shift was accepted by the one-lane wave");
-    expectFailure([&] { static_cast<void>(prepared(scalarLeak, 32u, 32u, withoutVertex)); }, "a wave-mask branch whose region leaves a value that the skipped path does not have", "stages without subgroups: an execz region writing an SGPR read after the join was accepted");
+    if (oneLaneFallback) {
+        const auto leaked = prepared(scalarLeak, 32u, 32u, withoutVertex);
+        require(!leaked.empty() && subgroupWords(leaked) == 0u, "stages without subgroups: an execz region writing an SGPR read after the join did not run as a one-lane wave without subgroup operations");
+        const auto leaked64 = prepared(scalarLeak64, 64u, 32u, withoutVertex);
+        require(!leaked64.empty() && subgroupWords(leaked64) == 0u, "stages without subgroups: a wave64 execz region writing an SGPR and VCC read after the join did not run as a one-lane wave without subgroup operations");
+    } else {
+        expectFailure([&] { static_cast<void>(prepared(scalarLeak, 32u, 32u, withoutVertex)); }, "a wave-mask branch whose region leaves a value that the skipped path does not have", "stages without subgroups: an execz region writing an SGPR read after the join was accepted");
+        expectFailure([&] { static_cast<void>(prepared(scalarLeak64, 64u, 32u, withoutVertex)); }, "a wave-mask branch whose region leaves a value that the skipped path does not have", "stages without subgroups: a wave64 execz region writing an SGPR and VCC read after the join was accepted");
+    }
+    require(subgroupWords(prepared(scalarLeak, 32u, 32u, ~0u)) != 0u, "stages without subgroups: an execz region writing an SGPR on a device with vertex subgroups lost its subgroup operations");
     const auto perLane = prepared(waterfall, 32u, 32u, withoutVertex);
     require(!perLane.empty() && subgroupWords(perLane) == 0u, "stages without subgroups: a waterfall loop of v_readfirstlane, v_cmp_eq, s_and_saveexec and s_xor exec over a masked write kept subgroup operations");
     const auto relative = prepared(relativeWaterfall, 64u, 32u, withoutVertex);

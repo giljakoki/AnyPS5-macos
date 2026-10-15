@@ -705,6 +705,14 @@ void Lowering::lowerWaveMaskBranches() {
     for (std::size_t header = info.size(); header-- > 0;) {
         auto& block = info[header];
         if (block.terminator.kind != TerminatorKind::ConditionalBranch || !IsWaveMaskBranch(block) || block.condition == nullptr) continue;
+        // A one-lane wave (each invocation its own wave, as rewriteOneLaneWave models it): a test of
+        // EXEC or VCC being zero or not over the wave is the invocation's own bit, so the branch is
+        // exactly lane-local. Values the region leaves (SGPRs, SCC, VCC, unmasked effects) belong to
+        // a wave with an active lane, which is this invocation, so no merge value needs proving.
+        if (lanes == 1u) {
+            block.laneLocalBranch = true;
+            continue;
+        }
         IrValue* condition = block.condition->Resolve();
         if (condition->HasImmediate() || uniform.contains(condition)) {
             block.laneLocalBranch = true;
