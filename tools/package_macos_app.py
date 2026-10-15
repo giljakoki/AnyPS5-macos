@@ -26,6 +26,7 @@ folder and download0 exists, and the title's saves are written. The shader cache
 ~/Library/Caches/<bundle id> and the output to ~/Library/Logs/AnyPS5."""
 import argparse
 import json
+import os
 import plistlib
 import shutil
 import subprocess
@@ -108,6 +109,31 @@ def copy_game(game, app0):
     shutil.copytree(game, app0, dirs_exist_ok=True)
 
 
+def cap_unity_video_out(app0, width):
+    """Unity titles fix their PS5 output size in boot.config (platform-ps5-video-out-width=3840 renders 4K).
+    On a Mac that is the biggest cost there is, so cap it (1920 = 1080p). Returns the files changed.
+    The bundle's files are APFS clones, so rewriting one leaves the dump untouched."""
+    changed = []
+    if width <= 0:
+        return changed
+    key = "platform-ps5-video-out-width="
+    for config in sorted(app0.glob("**/boot.config")):
+        lines = config.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+        edited = False
+        for index, line in enumerate(lines):
+            if not line.startswith(key):
+                continue
+            value = line[len(key):].strip()
+            if value.isdigit() and int(value) > width:
+                lines[index] = f"{key}{width}" + ("\n" if line.endswith("\n") else "")
+                edited = True
+        if edited:
+            config.unlink()
+            config.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+            changed.append(config)
+    return changed
+
+
 def fill(executable, relinked, game, libs, vulkan, input_config, bundle):
     contents = bundle / "Contents"
     macos = contents / "MacOS"
@@ -121,6 +147,8 @@ def fill(executable, relinked, game, libs, vulkan, input_config, bundle):
         copy_game(game, app0)
     if (relinked / "app0").is_dir():
         shutil.copytree(relinked / "app0", app0, dirs_exist_ok=True)
+    for config in cap_unity_video_out(app0, int(os.environ.get("ANYPS5_UNITY_VIDEO_OUT_WIDTH", "1920"))):
+        print(f"capped Unity output width in {config.relative_to(app0)}")
     title_id, name, version = title_metadata(app0)
     identifier = "org.anyps5." + "".join(character for character in title_id.lower() if character.isalnum())
 
