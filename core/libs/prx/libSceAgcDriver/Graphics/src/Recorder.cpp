@@ -2877,6 +2877,38 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     pool.bytes += bytes;
 }
 
+std::size_t Recorder::UploadChunkBytes() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_SNAPSHOT_RING_CHUNK_KIB");
+        const auto kib = text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull;
+        return static_cast<std::size_t>(std::max<unsigned long long>(kib, 64ull) * 1024ull);
+    }();
+    return bytes;
+}
+
+std::size_t Recorder::DefaultSnapshotRingMaxBytes() {
+    static const std::size_t bytes = [] {
+        if (std::getenv("APS5_NO_SNAPSHOT_RING") != nullptr) return std::size_t{0};
+        const char* text = std::getenv("APS5_SNAPSHOT_RING_MAX_KIB");
+        const auto kib = text != nullptr ? std::strtoull(text, nullptr, 10) : 16ull;
+        return std::min(static_cast<std::size_t>(kib * 1024ull), UploadChunkBytes());
+    }();
+    return bytes;
+}
+
+Recorder::UploadSlice Recorder::UploadSnapshot(std::size_t bytes, std::size_t alignment) {
+    const auto chunkBytes = UploadChunkBytes();
+    Require(bytes != 0 && bytes <= chunkBytes, "an upload slice does not fit an upload chunk");
+    alignment = std::max<std::size_t>(alignment, 16);
+    auto offset = (uploadUsed + alignment - 1) / alignment * alignment;
+    if (uploadChunk == nullptr || offset + bytes > chunkBytes) {
+        uploadChunk = std::make_shared<Buffer>(context, chunkBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        offset = 0;
+    }
+    uploadUsed = offset + bytes;
+    return {uploadChunk, offset, uploadChunk->Bytes().data() + offset};
+}
+
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));

@@ -1483,8 +1483,9 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         const auto commands = snapshotRecorder.Commands();
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         const auto copy = snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-        VkBufferCopy region{0, 0, elementBytes};
+        VkBufferCopy region{first->snapshots[0].offset, 0, elementBytes};
         copy(commands, first->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+        region.srcOffset = second->snapshots[0].offset;
         region.dstOffset = elementBytes;
         copy(commands, second->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
@@ -1658,7 +1659,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
         const auto check = [&] {
             const auto bindings = resources.PrepareDrawBindings(regionRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "the read-only misaligned draw input was not snapshotted");
-            const auto contents = bindings->snapshots.front().buffer->Bytes();
+            const auto contents = bindings->snapshots.front().Data();
             Require(bindings->snapshots.front().address == view - adjustment && contents.size() == adjustment + elementBytes, "the draw snapshot does not start at the aligned offset below the view");
             Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's patched offset into the draw snapshot misses the view's bytes");
         };
@@ -1742,9 +1743,9 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's shader offset is not its distance from the binding");
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
-        const auto outerContents = bindings->snapshots[0].buffer->Bytes();
+        const auto outerContents = bindings->snapshots[0].Data();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
-        const auto contents = bindings->snapshots[1].buffer->Bytes();
+        const auto contents = bindings->snapshots[1].Data();
         Require(contents.size() >= adjustment + elementBytes, "a draw snapshot ends before the bytes the shader reads");
         Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's offset into a draw snapshot misses the view's bytes");
         snapshotRecorder.Sync();
@@ -1823,9 +1824,11 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
         const auto original = updates.calls.front();
         Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
+        std::vector<std::weak_ptr<ShaderResources::DrawBindings>> drawn;
         for (std::size_t allocation = 0; allocation < 2; ++allocation) {
             const ShaderResources::MovedBuffer moved{allocation, 0, 16, {5, 6, 7, 8}};
             const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            drawn.push_back(draw);
             Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
             Require(updates.calls.size() == allocation + 2 && updates.copies == 0, "draw descriptors copied GPU memory or needed multiple updates");
             const auto& actual = updates.calls.back();
@@ -1841,6 +1844,24 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
             }
         }
         snapshots.Sync();
+        snapshots.FlushDeferredReleases();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::any_of(drawn.begin(), drawn.end(), [](const auto& draw) { return !draw.expired(); }) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // The completed draws' sets return to the template: the next draw rewrites only the buffer
+        // bindings its snapshot or the set's last one touched (allocation 0 or 1, by release order).
+        if (std::getenv("APS5_NO_TEMPLATE_SNAPSHOT_SETS") == nullptr) {
+            const ShaderResources::MovedBuffer moved{0, 0, 16, {9, 10, 11, 12}};
+            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            Require(draw != nullptr && draw->snapshots.size() == 1 && updates.calls.size() == 4, "a returned snapshot set was not written once");
+            const auto& actual = updates.calls.back();
+            Require(actual.images.empty() && !actual.buffers.empty() && actual.buffers.size() <= 2 && actual.buffers.count({2u, 0u}) == 1, "a returned snapshot set rewrote descriptors no snapshot touched");
+            for (const auto& [key, after] : actual.buffers) {
+                const auto& before = original.buffers.at(key);
+                const auto expected = key.first == 2u ? draw->snapshots.front().buffer->Handle() : before.buffer;
+                Require(after.buffer == expected && after.offset == before.offset && after.range == before.range, "a returned snapshot set kept a stale snapshot or lost a template buffer");
+            }
+            snapshots.Sync();
+        }
     }
     recorder.Activate();
 }
@@ -1900,6 +1921,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         DescriptorCache cache(snapshotContext);
         snapshotContext.descriptorCache = &cache;
         Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.SetSnapshotRingMaxBytes(0); // the snapshot cache itself under test
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
         const auto snapshot = [&](std::byte expected) {
@@ -1994,6 +2016,7 @@ void drawSnapshotPatchTests(const Device& device) {
     DescriptorCache cache(snapshotContext);
     snapshotContext.descriptorCache = &cache;
     Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.SetSnapshotRingMaxBytes(0); // the snapshot cache itself under test
     snapshotRecorder.Activate();
     {
         ShaderResources resources(snapshotContext, compute);
@@ -2129,6 +2152,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         DescriptorCache cache(snapshotContext);
         snapshotContext.descriptorCache = &cache;
         Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.SetSnapshotRingMaxBytes(0); // the snapshot cache itself under test
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);

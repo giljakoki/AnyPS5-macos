@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -146,7 +147,27 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            // The snapshot's bytes within `buffer`: a whole buffer of its own, or a slice of the
+            // recorder's upload ring (Recorder::UploadSnapshot).
+            std::size_t offset = 0;
+            std::size_t bytes = 0;
+            std::span<std::byte> Data() const;
         };
+        // A template's own snapshot sets (APS5_NO_TEMPLATE_SNAPSHOT_SETS=1 disables): a set whose
+        // draw completed returns here with every descriptor but its snapshot elements equal to the
+        // template's, so the next draw rewrites only the buffer bindings its snapshots touch.
+        struct SnapshotSets {
+            std::mutex mutex;
+            DescriptorCache* cache = nullptr;
+            VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+            struct Free {
+                DescriptorCache::SetAllocation allocation;
+                std::vector<std::size_t> selected;
+            };
+            std::vector<Free> free;
+            ~SnapshotSets();
+        };
+        std::weak_ptr<SnapshotSets> home;
         DescriptorCache* cache = nullptr;
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation allocation;
@@ -524,6 +545,7 @@ private:
     // buffers binds it again instead of writing a new descriptor set.
     mutable std::mutex bindingsMutex;
     mutable std::weak_ptr<DrawBindings> lastBindings;
+    mutable std::shared_ptr<DrawBindings::SnapshotSets> snapshotSets;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;

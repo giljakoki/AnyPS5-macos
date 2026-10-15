@@ -215,6 +215,23 @@ public:
     static constexpr std::size_t DrawInputEntries = 16384;
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // Per-draw snapshot upload ring: a slice of `bytes` at an `alignment`-aligned offset in the
+    // recorder's current host-visible upload chunk (APS5_SNAPSHOT_RING_CHUNK_KIB, default 1 MiB).
+    // A chunk's bytes are written once: a full chunk is dropped and a fresh one taken from the
+    // buffer pool, and every slice's holder keeps its chunk alive until the batch that read it
+    // completed, so no slice is overwritten while the GPU may still read it.
+    struct UploadSlice {
+        std::shared_ptr<Buffer> buffer;
+        std::size_t offset = 0;
+        std::byte* data = nullptr;
+    };
+    UploadSlice UploadSnapshot(std::size_t bytes, std::size_t alignment);
+    static std::size_t UploadChunkBytes();
+    // Snapshots up to this size go to the upload ring instead of the snapshot cache: default
+    // APS5_SNAPSHOT_RING_MAX_KIB (16), 0 with APS5_NO_SNAPSHOT_RING=1.
+    std::size_t SnapshotRingMaxBytes() const { return snapshotRingMaxBytes; }
+    void SetSnapshotRingMaxBytes(std::size_t bytes) { snapshotRingMaxBytes = std::min(bytes, UploadChunkBytes()); }
+    static std::size_t DefaultSnapshotRingMaxBytes();
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
@@ -944,6 +961,9 @@ private:
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    std::shared_ptr<Buffer> uploadChunk;
+    std::size_t uploadUsed = 0;
+    std::size_t snapshotRingMaxBytes = DefaultSnapshotRingMaxBytes();
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };
