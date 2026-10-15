@@ -192,6 +192,21 @@ HostDepth ResolveHostDepth(const DepthFeatures& features, const State& state) {
         host.maxDepth = 1.0f;
         return host;
     }
+    // OpenGL-style clip space (negativeOneToOne) maps NDC z in [-1, 1] through the viewport to
+    // z * (max - min) / 2 + (max + min) / 2, and the hardware then clamps to the depth clamp range. With depth
+    // clamping on, a zero-to-one transform over [(min + max) / 2, max] writes the same depth for every z, so a
+    // [-1, 1] viewport (Dead Cells) needs no unrestricted range. Clamping also turns off near/far clipping, so
+    // primitives the hardware would clip beyond the far or near plane are kept at the clamped depth instead.
+    if (state.negativeOneToOne && features.depthClamp) {
+        const float low = (host.minDepth + host.maxDepth) * 0.5f;
+        const float high = host.maxDepth;
+        if (std::getenv("APS5_NO_CLAMPED_GL_DEPTH") == nullptr && unit(low) && unit(high)) {
+            host.path = HostDepthPath::ClampedZeroToOne;
+            host.minDepth = low;
+            host.maxDepth = high;
+            return host;
+        }
+    }
     throw std::runtime_error("AGC graphics: viewport depth outside [0, 1] requires VK_EXT_depth_range_unrestricted, which the device lacks, and the draw observes depth (remapping it is not implemented): " + DepthDiagnostic(features, state));
 }
 
@@ -199,6 +214,10 @@ std::optional<State> HostDepthState(const Context& context, const State& state) 
     const auto host = ResolveHostDepth(DepthFeaturesOf(context), state);
     if (host.minDepth == state.viewport.minDepth && host.maxDepth == state.viewport.maxDepth && host.minDepthBounds == state.minDepthBounds && host.maxDepthBounds == state.maxDepthBounds) return std::nullopt;
     auto resolved = state;
+    if (host.path == HostDepthPath::ClampedZeroToOne) {
+        resolved.negativeOneToOne = false;
+        resolved.depthClamp = true;
+    }
     resolved.viewport.minDepth = host.minDepth;
     resolved.viewport.maxDepth = host.maxDepth;
     resolved.minDepthBounds = host.minDepthBounds;
