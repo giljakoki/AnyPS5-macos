@@ -113,9 +113,10 @@ private:
 };
 
 // APS5_PROFILE_DRAW: draws whose snapshot descriptor set was the template's last one again, and
-// those that wrote a new one (PrepareDrawBindings; the [draws] lookup/record split line).
+// those that wrote a new one (PrepareDrawBindings; the [draws] lookup/record split line), of them
+// the writes into a set its template got back from a completed draw (only its snapshot bindings).
 struct DrawBindingsReuseCounts {
-    std::atomic<std::uint64_t> reused{0}, written{0};
+    std::atomic<std::uint64_t> reused{0}, written{0}, returned{0};
 };
 DrawBindingsReuseCounts& DrawBindingsReuse();
 

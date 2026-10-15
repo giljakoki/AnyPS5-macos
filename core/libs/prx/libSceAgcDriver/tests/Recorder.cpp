@@ -1959,6 +1959,126 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+// APS5 draw bindings benchmark (--draw-bindings-benchmark): many draws of one template whose small
+// read-only inputs change every draw, recorded across many batches that stay in flight, as the
+// pipelined committer does. Prints the cost per PrepareDrawBindings with the snapshot ring on and
+// off (APS5_NO_TEMPLATE_SNAPSHOT_SETS=1 in the environment compares the template-owned sets), checks
+// every snapshot holds its draw's bytes, and fails when a draw costs more than the budget.
+int drawBindingsBenchmark(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "skipped, host imports or write watching unavailable\n";
+        return 77;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "skipped, the block is not host imported\n";
+        return 77;
+    }
+    // Three read-only guest buffers (constants, per-object data, bones) and a sampler array, like a
+    // typical game draw.
+    constexpr std::size_t inputs = 3;
+    constexpr std::array<std::size_t, inputs> inputBytes{256, 1024, 4096};
+    ShaderRecompiler::RecompileResult program;
+    for (std::size_t input = 0; input < inputs; ++input) {
+        const auto element = address + 4096 + input * 8192;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = static_cast<std::uint32_t>(input);
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(inputBytes[input]), 0x31000000u};
+        binding.bufferWritten = {false};
+        program.bindings.push_back(binding);
+    }
+    ShaderRecompiler::DescriptorBinding sampler{};
+    sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+    sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
+    sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
+    sampler.count = 2;
+    sampler.guestDescriptor.resize(8);
+    sampler.samplerDepthCompare = {false, false};
+    program.bindings.push_back(sampler);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const auto draws = [] {
+        const char* text = std::getenv("APS5_BENCH_DRAWS");
+        return text != nullptr ? std::max<std::size_t>(std::strtoull(text, nullptr, 10), 64) : std::size_t{20000};
+    }();
+    constexpr std::size_t drawsPerBatch = 32;
+    const auto run = [&](bool ring) {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.SetSnapshotRingMaxBytes(ring ? Recorder::DefaultSnapshotRingMaxBytes() : 0);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        double preparedUs = 0;
+        double worstUs = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        for (std::size_t draw = 0; draw < draws; ++draw) {
+            // Every draw's inputs differ (the game rewrites its constants between draws).
+            const auto value = static_cast<std::uint8_t>(draw * 7u + 1u);
+            for (std::size_t input = 0; input < inputs; ++input) {
+                auto* element = reinterpret_cast<std::uint8_t*>(address + 4096 + input * 8192);
+                element[0] = value;
+                element[inputBytes[input] - 1] = value;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+            preparedUs += us;
+            worstUs = std::max(worstUs, us);
+            Require(bindings != nullptr && bindings->snapshots.size() == inputs, "a benchmark draw's inputs were not snapshotted");
+            for (std::size_t input = 0; input < inputs; ++input) {
+                const auto contents = bindings->snapshots[input].Data();
+                Require(contents.size() == inputBytes[input] && contents.front() == std::byte{value} && contents.back() == std::byte{value}, "a benchmark draw snapshot does not hold its draw's bytes");
+            }
+            if (draw % drawsPerBatch == drawsPerBatch - 1) {
+                snapshotRecorder.Submit();
+                snapshotRecorder.Reap();
+                // The committer's unlock: completed batches go to the release thread.
+                snapshotRecorder.FlushDeferredReleases();
+            }
+        }
+        const auto totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        const auto inFlight = snapshotRecorder.InFlightBatches();
+        snapshotRecorder.Sync();
+        const auto perDraw = preparedUs / static_cast<double>(draws);
+        std::cout << "draw bindings benchmark (" << (ring ? "snapshot ring" : "snapshot cache") << ", template-owned sets " << (std::getenv("APS5_NO_TEMPLATE_SNAPSHOT_SETS") == nullptr ? "on" : "off") << "): " << draws << " draws in " << draws / drawsPerBatch << " batches, " << perDraw << " us per draw (worst " << worstUs << " us), " << totalMs << " ms in total, " << inFlight << " batches in flight at the end, " << AgcDriver::Graphics::DrawBindingsReuse().returned.exchange(0) << " sets written back into their template's returned set (counted with APS5_PROFILE_DRAW)\n";
+        return perDraw;
+    };
+    const auto cacheUs = run(false);
+    const auto ringUs = run(true);
+    // The ring copies three small inputs: it must stay cheaper than the snapshot cache it replaces
+    // (a generous budget, so a slow machine does not fail it, but a blocking path would).
+    Require(ringUs <= std::max(cacheUs * 1.5, 25.0), "the snapshot ring made draw bindings slower than the snapshot cache");
+    return 0;
+}
+
 void drawSnapshotPatchTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
@@ -6522,6 +6642,7 @@ int main(int argc, char** argv) {
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-bindings-benchmark") return drawBindingsBenchmark(device);
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";

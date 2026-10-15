@@ -430,8 +430,8 @@ void reportDrawSplits() {
         std::snprintf(part, sizeof(part), " %s %.2f (%llu)", DrawSplitNames[i], static_cast<double>(ns) / 1e3 / static_cast<double>(count), static_cast<unsigned long long>(count));
         line += part;
     }
-    char reuse[128];
-    std::snprintf(reuse, sizeof(reuse), "; snapshot descriptor sets reused %llu, written %llu", static_cast<unsigned long long>(DrawBindingsReuse().reused.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(DrawBindingsReuse().written.exchange(0, std::memory_order_relaxed)));
+    char reuse[160];
+    std::snprintf(reuse, sizeof(reuse), "; snapshot descriptor sets reused %llu, written %llu (%llu into a set returned to its template)", static_cast<unsigned long long>(DrawBindingsReuse().reused.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(DrawBindingsReuse().written.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(DrawBindingsReuse().returned.exchange(0, std::memory_order_relaxed)));
     line += reuse;
     std::fprintf(stderr, "%s\n", line.c_str());
 }

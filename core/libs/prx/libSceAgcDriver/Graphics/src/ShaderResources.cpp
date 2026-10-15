@@ -4047,6 +4047,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             result->allocation = sets.free.back().allocation;
             previous = std::move(sets.free.back().selected);
             sets.free.pop_back();
+            if (profile) DrawBindingsReuse().returned.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (result->allocation.set == VK_NULL_HANDLE) {
