@@ -886,6 +886,22 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     return result;
 }
 
+namespace {
+
+// Three swapchain images where the surface allows (MoltenVK: 2 to 3). With FIFO and two, the next
+// acquire waits until the previous presentation was displayed, i.e. until its blit, queued behind
+// the next frame's batches, finished on the GPU: the presenter then ran a frame or more behind the
+// flips. APS5_NO_TRIPLE_SWAPCHAIN=1 keeps the surface's minimum.
+std::uint32_t SwapchainImages(const VkSurfaceCapabilitiesKHR& surface) {
+    static const bool minimum = std::getenv("APS5_NO_TRIPLE_SWAPCHAIN") != nullptr;
+    if (minimum) return surface.minImageCount;
+    std::uint32_t count = std::max<std::uint32_t>(surface.minImageCount, 3);
+    if (surface.maxImageCount != 0) count = std::min(count, surface.maxImageCount);
+    return count;
+}
+
+}
+
 VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(window, false) {}
 
 VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
@@ -1665,7 +1681,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
-        swapchain.minImageCount = surface.minImageCount;
+        swapchain.minImageCount = SwapchainImages(surface);
         swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
@@ -2380,7 +2396,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && (surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = state->surface;
-    create.minImageCount = surface.minImageCount;
+    create.minImageCount = SwapchainImages(surface);
     create.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
     create.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     create.imageExtent = {width, height};
@@ -2682,9 +2698,17 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
-    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 5'000'000'000ULL, VK_NULL_HANDLE, state->acquireFence, &index);
+    // No free image (every one queued for display, or a hidden window that hands out about one image
+    // per second) drops this presentation instead of blocking the presenter, and with it the flip, for
+    // up to a display period or longer (upstream #4684). APS5_NO_ACQUIRE_DROP=1 waits as before.
+    static const bool acquireWaits = std::getenv("APS5_NO_ACQUIRE_DROP") != nullptr;
+    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, acquireWaits ? 5'000'000'000ULL : 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         state->extent = {0, 0};
+        return false;
+    }
+    if (!acquireWaits && (acquired == VK_NOT_READY || acquired == VK_TIMEOUT)) {
+        ++presentCounters.acquireDrops;
         return false;
     }
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
