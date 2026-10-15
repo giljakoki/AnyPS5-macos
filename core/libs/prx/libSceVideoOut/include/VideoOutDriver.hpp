@@ -182,6 +182,9 @@ struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this
 
     std::shared_ptr<AgcDriver::FrameTiming> timing;
     std::chrono::steady_clock::time_point queuedAt;
+    // APS5_PROFILE_DRAW's [flip-timing] line: when the presenter dequeued the flip, reached its
+    // vblank and returned from the presentation (blit queued).
+    std::chrono::steady_clock::time_point dequeuedAt, vblankAt, presentedAt;
 
     ~FlipRequest() override;
     void GpuFinished() override;
@@ -204,6 +207,9 @@ class VideoOutDriver {
 public:
     static VideoOutDriver& Get();
     void SignalFlipLocked(FlipRequest& req);
+    // Under req.cfg->mutex, once the frame's GPU work finished and its presentation was queued:
+    // reports the flip and ends the request (the presenter or the AGC driver's flip completer).
+    void CompleteFlipLocked(FlipRequest& req);
     [[nodiscard]] bool EarlyFlipEvents() const;
 
     VideoOutDriver();

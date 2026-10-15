@@ -105,13 +105,17 @@ void QueueSubmitter::Enqueue(VkCommandBuffer commands, VkFence fence, VkSemaphor
         std::lock_guard lock(mutex);
         Check(error, "vkQueueSubmit recorder (submit thread)");
         jobs.push_back({commands, fence, timeline, value, signal});
+        ++enqueued;
     }
     work.notify_one();
 }
 
 void QueueSubmitter::Drain() {
     std::unique_lock lock(mutex);
-    drained.wait(lock, [&] { return jobs.empty(); });
+    // APS5_NO_DRAIN_TICKET=1: wait for an empty queue as before.
+    static const bool untilEmpty = std::getenv("APS5_NO_DRAIN_TICKET") != nullptr;
+    const auto target = enqueued;
+    drained.wait(lock, [&] { return untilEmpty ? jobs.empty() : completed >= target; });
     Check(error, "vkQueueSubmit recorder (submit thread)");
 }
 
@@ -150,6 +154,7 @@ void QueueSubmitter::run() {
         threadSubmissions.fetch_add(1, std::memory_order_relaxed);
         lock.lock();
         jobs.pop_front();
+        ++completed;
         if (result != VK_SUCCESS && error == VK_SUCCESS) {
             error = result;
             std::fprintf(stderr, "[gpu] vkQueueSubmit on the submit thread failed (%d)\n", static_cast<int>(result));
