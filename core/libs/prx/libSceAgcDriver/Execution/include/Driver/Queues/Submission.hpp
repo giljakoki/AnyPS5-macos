@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SUBMISSION_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SUBMISSION_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <atomic>
@@ -50,7 +51,7 @@ struct QueueWorker {
 
     std::atomic<std::uint64_t> queued{0};
     std::unordered_map<std::uint64_t, std::uint32_t> unfinishedWrites;
-    std::thread thread;
+    HostThread thread;
 };
 
 }

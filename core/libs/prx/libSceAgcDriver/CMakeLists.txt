@@ -1179,7 +1179,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_host_depth_range_restricted agc_driver_host_depth_range_restricted_no_gpl agc_driver_host_depth_range_restricted_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    foreach(pipelinedTest IN ITEMS agc_driver agc_driver_pm4 agc_driver_host_depth_range agc_driver_rect_list_barycentric_emulation agc_driver_pipelined_dma agc_driver_pipelined_order)
+    foreach(pipelinedTest IN ITEMS agc_driver agc_driver_pm4 agc_driver_host_depth_range agc_driver_rect_list_barycentric_emulation agc_driver_pipelined_dma agc_driver_pipelined_order agc_driver_pipelined_fill agc_driver_pipelined_predication_read agc_driver_pipelined_predicated_label_order)
         foreach(pipelinedMode IN ITEMS drained ordered)
             set(pipelinedEnvironment "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=1")
             if(pipelinedMode STREQUAL "ordered")

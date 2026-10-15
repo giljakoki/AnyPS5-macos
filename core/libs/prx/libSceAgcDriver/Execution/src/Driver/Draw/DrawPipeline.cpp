@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
@@ -7,6 +8,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
@@ -89,6 +93,34 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+// APS5_PIPELINE_SPIN_US: how long the idle committer polls for the next item before it sleeps (50 us).
+std::chrono::microseconds spinBeforeSleep() {
+    static const auto spin = [] {
+        const char* text = std::getenv("APS5_PIPELINE_SPIN_US");
+        return std::chrono::microseconds(text != nullptr ? std::strtoull(text, nullptr, 10) : 50);
+    }();
+    return spin;
+}
+
+void cpuRelax() {
+#if defined(__aarch64__)
+    __builtin_arm_isb(15);
+#elif defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#endif
+}
+
+// The worker and the committer hold the mutex for a few hundred nanoseconds at a time, but a
+// contended std::mutex waits in the kernel (__psynch_mutexwait on macOS): a short spin takes most
+// collisions without the round trip.
+std::unique_lock<std::mutex> acquire(std::mutex& mutex) {
+    for (int spin = 0; spin < 128; ++spin) {
+        if (mutex.try_lock()) return std::unique_lock<std::mutex>(mutex, std::adopt_lock);
+        cpuRelax();
+    }
+    return std::unique_lock<std::mutex>(mutex);
+}
+
 }
 
 DrawPipeline& DrawPipeline::Queue0() {
@@ -101,7 +133,7 @@ std::size_t DrawPipeline::Depth() {
         const char* text = std::getenv("APS5_PIPELINED_DRAWS");
         if (text == nullptr || std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr || std::getenv("APS5_DRAW_DRAIN") != nullptr || std::getenv("APS5_DRAIN_ALL") != nullptr || std::getenv("APS5_NO_WORDWISE_CAPTURE") != nullptr) return std::size_t{0};
         const auto value = std::strtoull(text, nullptr, 10);
-        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{8} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
+        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{64} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
     return depth;
 }
@@ -151,7 +183,7 @@ void DrawPipeline::rethrowFailure() {
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, Kind kind) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    std::unique_lock lock(mutex);
+    auto lock = acquire(mutex);
     rethrowFailure();
     if (items.size() >= Depth()) {
         // The committer takes the GPU lock for every item: waiting for room while holding it never ends.
@@ -165,14 +197,36 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
+    for (const auto& [begin, limit] : writes) {
+        if (begin < writesBegin.load(std::memory_order_relaxed)) writesBegin.store(begin, std::memory_order_release);
+        if (limit > writesEnd.load(std::memory_order_relaxed)) writesEnd.store(limit, std::memory_order_release);
+    }
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, EpochToken().load(std::memory_order_relaxed)});
     outstanding.fetch_add(1, std::memory_order_release);
-    if (!thread.joinable()) thread = std::thread([this] { run(); });
-    if (committerWaiting) wake.notify_one();
-    if (!profile && enqueued % 256 != 0) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastFootprintCheck >= std::chrono::seconds(1)) checkFootprint(now);
-    if (profile && now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (!started) {
+        // A 64 MiB stack: a std::thread gets 512 KiB on macOS, too little for a draw commit.
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setstacksize(&attributes, 64u << 20u);
+        pthread_t committer;
+        const int created = pthread_create(&committer, &attributes, [](void* pipeline) -> void* {
+            static_cast<DrawPipeline*>(pipeline)->run();
+            return nullptr;
+        }, this);
+        pthread_attr_destroy(&attributes);
+        if (created != 0) throw std::runtime_error("draw pipeline: cannot start the committer thread");
+        pthread_detach(committer);
+        started = true;
+    }
+    // Notified after the unlock: woken under it, the committer would only wait again for the mutex.
+    const bool wakeCommitter = committerWaiting;
+    if (profile || enqueued % 256 == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastFootprintCheck >= std::chrono::seconds(1)) checkFootprint(now);
+        if (profile && now - lastReport >= std::chrono::seconds(10)) report(now);
+    }
+    lock.unlock();
+    if (wakeCommitter) wake.notify_one();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -216,8 +270,15 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         Kind kind = Kind::Draw;
         std::uint64_t epoch = 0;
+        if (const auto spin = spinBeforeSleep(); spin.count() != 0 && outstanding.load(std::memory_order_acquire) == 0) {
+            const auto until = std::chrono::steady_clock::now() + spin;
+            for (std::uint32_t polls = 1; outstanding.load(std::memory_order_acquire) == 0; ++polls) {
+                cpuRelax();
+                if ((polls & 63u) == 0 && std::chrono::steady_clock::now() >= until) break;
+            }
+        }
         {
-            std::unique_lock lock(mutex);
+            auto lock = acquire(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty(); });
             committerWaiting = false;
@@ -243,8 +304,12 @@ void DrawPipeline::run() {
         }
         Graphics::PresentTrace::Committing() = false;
         const auto spent = elapsedNs(start);
-        std::lock_guard lock(mutex);
+        auto lock = acquire(mutex);
         items.pop_front();
+        if (items.empty()) {
+            writesBegin.store(std::numeric_limits<std::uint64_t>::max(), std::memory_order_release);
+            writesEnd.store(0, std::memory_order_release);
+        }
         ++commits;
         commitNs += spent;
         ++kindCommits[static_cast<std::size_t>(kind)];
@@ -252,7 +317,9 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0) idle.notify_all();
+        const bool wakeIdle = idleWaiters != 0;
+        lock.unlock();
+        if (wakeIdle) idle.notify_all();
     }
 }
 
@@ -288,7 +355,8 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
-    std::lock_guard lock(mutex);
+    if (address >= writesEnd.load(std::memory_order_acquire) || end <= writesBegin.load(std::memory_order_acquire)) return false;
+    const auto lock = acquire(mutex);
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
             if (address < limit && begin < end) return true;

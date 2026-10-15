@@ -321,7 +321,8 @@ void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::spa
 
 bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
     static const bool ordered = DrawPipeline::Ordered("APS5_PIPELINE_DRAIN_LABELS");
-    if (!ordered || DrawPipeline::OrderedSuspended() || !DeferLabels() || (opcode != 0x49 && opcode != 0x37)) return false;
+    // Behind a deferred label (worker side), a queued one would land ahead of it.
+    if (!ordered || DrawPipeline::OrderedSuspended() || !DeferLabels() || (opcode != 0x49 && opcode != 0x37) || !deferredLabels().labels.empty()) return false;
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     const bool endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
     const auto label = Pm4::DecodeLabelWrite(packet);

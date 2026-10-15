@@ -140,7 +140,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto range = DecodePatternFillRange(userData, packet);
         if (!range) return false;
         if (range->invocations == 0) return true;
-        if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(range->control, 8)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
+        if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && (DrawPipeline::Queue0().Overlaps(range->control, 8) || DrawPipeline::Queue0().Overlaps(range->source, 4))) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         inputLock.lock();
         recordLabelsForPacket(localDevice.get(), queueId);

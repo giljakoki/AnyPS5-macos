@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -36,6 +37,7 @@ public:
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, Kind kind = Kind::Draw);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
+    std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
 
@@ -58,11 +60,15 @@ private:
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    // The span of every queued item's write ranges (widened at Enqueue, reset when the queue empties,
+    // both under the mutex), read without it: a range outside the span overlaps no queued write.
+    std::atomic<std::uint64_t> writesBegin{std::numeric_limits<std::uint64_t>::max()};
+    std::atomic<std::uint64_t> writesEnd{0};
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
-    std::thread thread;
+    bool started = false;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
