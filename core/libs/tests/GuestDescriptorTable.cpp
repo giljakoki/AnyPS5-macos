@@ -46,6 +46,14 @@ int main() {
     Require(close_nid_postfix(host) != 0);
     Require(::fcntl(host, F_GETFD) >= 0);
 
+    // A guest close of a standard stream (Outer Wilds calls sceKernelClose(0)) is refused and leaves it open,
+    // so the number can never be handed to a host allocation.
+    for (int stream = 0; stream < 3; ++stream) {
+        Require(sceKernelClose(stream) == ErrorEbadf);
+        Require(::fcntl(stream, F_GETFD) >= 0);
+    }
+
+
     // Guest double close returns EBADF and must not close a host descriptor
     // that was handed the freed number in the meantime.
     const int guest = sceKernelOpen(file.c_str(), SCE_KERNEL_O_RDONLY, 0);
