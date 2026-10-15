@@ -333,8 +333,17 @@ public:
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    // Refresh's proved-unchanged answer for an image over untracked memory (its present-level
+    // proof that guest memory still equals its content, no store over it since, no other image
+    // pending over it), without the refresh: true exactly when Refresh would return at once.
+    bool ProvedUnchangedUntracked();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
+    // Present compares a refresh or proof waited for (count, nanoseconds; cumulative).
+    static std::pair<std::uint64_t, std::uint64_t> PresentCompareWaits();
+    // Present compares run by the caller instead of waited for, and refreshes that uploaded on the
+    // GPU behind a pending write instead of waiting for it (cumulative).
+    static std::pair<std::uint64_t, std::uint64_t> CompareShortcuts();
     static std::uint64_t Uploads();
     struct PresentCompare;
     static void StartPresentCompares();
@@ -501,6 +510,8 @@ private:
     void quiesceCompare();
     bool takePresentCompare(std::uint64_t present, std::uint64_t forget);
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    // Set by compareUntracked when a pending GPU write answered the compare (every block written).
+    mutable bool gpuWrittenCompare = false;
     struct UntrackedProof {
         std::uint64_t present = 0;
         std::uint64_t forget = 0;

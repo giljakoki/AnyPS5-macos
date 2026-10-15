@@ -33,6 +33,7 @@
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <execinfo.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #else
@@ -277,6 +278,16 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
         frames[i] = module.first != 0 && address >= module.first && address - module.first < module.second ? address - module.first : 0;
     }
     return captured;
+#elif defined(__APPLE__)
+    // Frame-pointer walk (Darwin keeps frame pointers): frame 0 is the caller, as before, then
+    // its callers, so the [hooksync] line names the driver code that made the access.
+    static_cast<void>(skip);
+    void* raw[16];
+    const int wanted = static_cast<int>(std::min<std::size_t>(frames.size() + 1, std::size(raw)));
+    const int captured = backtrace(raw, wanted);
+    std::size_t used = 0;
+    for (int i = 1; i < captured && used < frames.size(); ++i) frames[used++] = ModuleOffset(raw[i]);
+    return used;
 #else
     static_cast<void>(skip);
     frames[0] = ModuleOffset(__builtin_return_address(0));
