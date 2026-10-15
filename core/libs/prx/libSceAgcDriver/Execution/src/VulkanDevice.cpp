@@ -3472,7 +3472,7 @@ enum RecipeMiss : std::size_t { MissNoRecipe, MissDevice, MissTemplateGone, Miss
 constexpr std::array<const char*, RecipeMissCount> RecipeMissNames{"no recipe", "device", "template gone", "objects gone", "not recordable"};
 // The draw rows name the miss reasons of DrawWithRecipe (a target or a pipeline gone is the
 // objects-gone slot).
-constexpr std::array<const char*, RecipeMissCount> DrawRecipeMissNames{"no recipe", "device", "template gone", "targets gone", "not recordable"};
+constexpr std::array<const char*, RecipeMissCount> DrawRecipeMissNames{"no recipe", "device", "template gone or rebase refused", "targets gone", "not recordable"};
 constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofPath::Count)> ProofPathNames{"fast", "T1 refreshed", "full"};
 constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofFailure::Count)> ProofFailureNames{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
 
@@ -3496,6 +3496,8 @@ RecipeCounters& Recipes() {
     static RecipeCounters& counters = *new RecipeCounters();
     return counters;
 }
+
+std::atomic<std::uint64_t> drawRecipeHitsTotal{0}, drawRecipeRebasedTotal{0}, drawRecipeMovedTotal{0}, drawRecipeRebasedReported{0}, drawRecipeMovedReported{0};
 
 void reportRecipes() {
     auto& recipes = Recipes();
@@ -3528,6 +3530,8 @@ void reportRecipes() {
         const auto recordUs = perHit(counters.recordNs);
         AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced));
     }
+    const auto rebased = drawRecipeRebasedTotal.load(std::memory_order_relaxed), moved = drawRecipeMovedTotal.load(std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[recipe] draw hits (10 s) rebased from relocated stages %llu, binding moved buffers %llu\n", static_cast<unsigned long long>(rebased - drawRecipeRebasedReported.exchange(rebased)), static_cast<unsigned long long>(moved - drawRecipeMovedReported.exchange(moved)));
 }
 
 // The phases of one device call (APS5_PROFILE_DRAW): this call's rows (formatted only for a slow
@@ -3676,12 +3680,16 @@ void VulkanDevice::NoteRecipe(RecipeEvent event, RecipeKind kind) {
     (event == RecipeEvent::Restart ? counters.restarts : counters.attaches).fetch_add(1, std::memory_order_relaxed);
 }
 
+VulkanDevice::DrawRecipeTotals VulkanDevice::DrawRecipeHitTotals() {
+    return {drawRecipeHitsTotal.load(std::memory_order_relaxed), drawRecipeRebasedTotal.load(std::memory_order_relaxed), drawRecipeMovedTotal.load(std::memory_order_relaxed)};
+}
+
 void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck miss) {
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
     counters.precheckMisses[miss == DrawRecipePrecheck::NoRecipe ? MissNoRecipe : MissDevice].fetch_add(1, std::memory_order_relaxed);
 }
 
-RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe) {
+RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, bool rebased) {
     PerformanceTimer timing("Vulkan.DrawFromRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
@@ -3692,13 +3700,14 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         return RecipeOutcome::Rebuild;
     }
     const auto context = graphicsContext();
-    const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe);
+    const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe, rebased);
     if (!outcome.recorded) {
         switch (outcome.miss) {
             case Graphics::DrawRecipeMiss::NotRecordable: counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed); break;
             case Graphics::DrawRecipeMiss::TargetGone:
             case Graphics::DrawRecipeMiss::ObjectsGone: counters.precheckMisses[MissObjectsGone].fetch_add(1, std::memory_order_relaxed); break;
-            case Graphics::DrawRecipeMiss::TemplateGone: counters.precheckMisses[MissTemplateGone].fetch_add(1, std::memory_order_relaxed); break;
+            case Graphics::DrawRecipeMiss::TemplateGone:
+            case Graphics::DrawRecipeMiss::Rebased: counters.precheckMisses[MissTemplateGone].fetch_add(1, std::memory_order_relaxed); break;
             case Graphics::DrawRecipeMiss::Proof: counters.rebuilds[static_cast<std::size_t>(outcome.proof.failure)].fetch_add(1, std::memory_order_relaxed); break;
             default: break;
         }
@@ -3706,6 +3715,9 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
     }
     counters.proofPaths[static_cast<std::size_t>(outcome.proof.path)].fetch_add(1, std::memory_order_relaxed);
     counters.hits.fetch_add(1, std::memory_order_relaxed);
+    drawRecipeHitsTotal.fetch_add(1, std::memory_order_relaxed);
+    if (rebased) drawRecipeRebasedTotal.fetch_add(1, std::memory_order_relaxed);
+    if (outcome.moved) drawRecipeMovedTotal.fetch_add(1, std::memory_order_relaxed);
     if (profile) {
         counters.proofNs.fetch_add(static_cast<std::uint64_t>(outcome.proofUs * 1000.0), std::memory_order_relaxed);
         counters.recordNs.fetch_add(static_cast<std::uint64_t>(outcome.recordUs * 1000.0), std::memory_order_relaxed);

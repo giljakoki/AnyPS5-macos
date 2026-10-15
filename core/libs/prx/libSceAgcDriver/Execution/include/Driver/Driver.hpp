@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
+#include <unordered_set>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -123,8 +124,10 @@ private:
     void accountDrawVariant(const DispatchVariant& variant, bool added);
     void insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode);
     void eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected);
-    std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
-    void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
+    std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::shared_ptr<DrawEntry>& home, const std::vector<std::shared_ptr<DispatchVariant>>& stages, bool& rebased);
+    void attachDrawRecipe(std::uint64_t key, const std::shared_ptr<DrawEntry>& home, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, bool rebased, std::uint64_t identity);
+    static bool relocatedRecipes();
+    static bool recipeGovernorBypass();
     void reportDrawCache(DrawEntryCounters& counters);
     // `userWords` false leaves every user-data SGPR out (APS5_PROFILE_DRAW's key churn statistics).
     // `relocation` keys its pointer words by the contents behind them and its free words not at all
@@ -210,7 +213,7 @@ private:
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
-    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey);
+    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeHome, bool rebased, std::uint64_t identity);
     bool enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     bool enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
     void commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
@@ -342,6 +345,9 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawAliases;
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawRelocationLast;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
+    // Shader-set identities (drawIdentityKey) with a draw recipe attached: their draws keep the
+    // draw cache while the governor pauses it (APS5_NO_RECIPE_GOVERNOR_BYPASS=1: they do not).
+    std::unordered_set<std::uint64_t> drawRecipeIdentities;
     DrawRelocationCounters drawRelocationCounters;
     std::list<std::uint64_t> drawOrder;
     std::mutex drawCacheMutex;

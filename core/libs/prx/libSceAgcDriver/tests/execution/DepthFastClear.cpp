@@ -35,7 +35,7 @@ std::byte* const Tiled = reinterpret_cast<std::byte*>((reinterpret_cast<std::uin
 
 // The harness's draw into the tiled target; with `replay` it is recorded from that recipe
 // (`replayed`: whether it was). Returns the covered pixels (R = 255), read back from guest memory.
-std::uint32_t DrawTiled(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& compiled, const Surface& surface, bool depthWrite, std::shared_ptr<const AgcDriver::DrawRecipe>* recipeOut, const std::shared_ptr<const AgcDriver::DrawRecipe>* replay, bool* replayed) {
+std::uint32_t DrawTiled(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& compiled, const Surface& surface, bool depthWrite, std::shared_ptr<const AgcDriver::DrawRecipe>* recipeOut, const std::shared_ptr<const AgcDriver::DrawRecipe>* replay, bool* replayed, bool rebased = false) {
     using AgcDriver::Graphics::ColorTargetLayout;
     using AgcDriver::Graphics::ColorTileMode;
     using AgcDriver::Graphics::StorageTexture;
@@ -76,7 +76,7 @@ std::uint32_t DrawTiled(AgcDriver::VulkanDevice& device, const DepthFastClearHar
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(DepthFastClearHarness::Triangles().size()), 0, 1, 0, false};
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        if (replay != nullptr) *replayed = device.DrawFromRecipe(state, draw, shaders, {}, *replay) == AgcDriver::RecipeOutcome::Recorded;
+        if (replay != nullptr) *replayed = device.DrawFromRecipe(state, draw, shaders, {}, *replay, rebased) == AgcDriver::RecipeOutcome::Recorded;
         else device.Draw(state, draw, shaders, {}, recipeOut);
     }
     device.WaitIdle();
@@ -126,6 +126,10 @@ void DepthRecipeDraws(AgcDriver::VulkanDevice& device) {
     AgcDriver::Graphics::NoteDepthMetadataFill(surface.htile, HtileBytes, 0u);
     replayed = false;
     Require(DrawTiled(device, shaders, surface, true, nullptr, &recipe, &replayed) == Covered && replayed, "a draw recorded from the depth recipe after a fast clear did not see the cleared depth (or the recipe missed)");
+    // A rebased hit (a relocated draw's stages): the template's content key is compared with the
+    // stages' and the push constants come from the stages; the same stages are a hit.
+    replayed = false;
+    Require(DrawTiled(device, shaders, surface, true, nullptr, &recipe, &replayed, true) == 0u && replayed, "a rebased draw recorded from the depth recipe passed LESS against the 0.5 written before it (or the recipe missed)");
     std::puts("depth recipe draws passed");
 }
 

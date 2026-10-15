@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
@@ -178,6 +179,18 @@ void MovedFreeWordHitsTheCache(const std::string& mode) {
     }
     const auto hits = counters.hits - start.hits, inserts = counters.inserts - start.inserts;
     Require(hits == values.size() - 1 && inserts == 1, mode + ": draws that differ in a user word the shader only reads at run time made " + std::to_string(hits) + " hits and " + std::to_string(inserts) + " inserts, expected " + std::to_string(values.size() - 1) + " and 1");
+    // Relocated hits replay the donor's recipe rebased: each draw's own forwarded word reaches the
+    // shader (the red checks above and below), and the values repeat so recipes are hit.
+    const auto recipesBefore = AgcDriver::VulkanDevice::DrawRecipeHitTotals();
+    for (int round = 0; round < 2; ++round) {
+        for (const auto& [value, red] : values) {
+            Submit(DrawWith(FreePixelCode.data(), 1, {{0x00c, std::bit_cast<std::uint32_t>(value)}}));
+            Require(Red() + 1u >= red && Red() <= red + 1u, mode + ": the repeated draw of user word " + std::to_string(value) + " drew red " + std::to_string(Red()) + ", expected " + std::to_string(red));
+        }
+    }
+    const auto recipesAfter = AgcDriver::VulkanDevice::DrawRecipeHitTotals();
+    std::cout << mode << ": repeated free-word draws made " << recipesAfter.hits - recipesBefore.hits << " recipe hits (" << recipesAfter.rebased - recipesBefore.rebased << " rebased)\n";
+    if (std::getenv("APS5_EXPECT_RELOCATED_RECIPES") != nullptr) Require(recipesAfter.rebased > recipesBefore.rebased, mode + ": no relocated draw was recorded from a recipe");
 }
 
 struct FetchTables {

@@ -138,6 +138,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             relocationBypass = trial == drawRelocationTrials.end() || trial->second.idle == 0;
             if (relocationBypass) ++drawRelocationCounters.bypassed;
         }
+        if (!relocationBypass && recipeGovernorBypass() && drawRecipeIdentities.contains(drawIdentity)) relocationBypass = true;
+    } else if (entriesAllowed && !governed && registerKeyEnabled() && recipeGovernorBypass() && Graphics::DrawRecipes()) {
+        drawIdentity = drawIdentityKey(queue, *submission.shaders);
+        std::lock_guard cacheLock(drawCacheMutex);
+        relocationBypass = drawRecipeIdentities.contains(drawIdentity);
     }
     const bool useDrawEntries = governed || relocationBypass;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
@@ -387,7 +392,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
-    if (drawIdentity != 0 && useDrawEntries && !drawHit) {
+    if (drawIdentity != 0 && useDrawEntries && !drawHit && drawRelocationEnabled()) {
         std::shared_ptr<const DrawRelocation> learned;
         {
             std::lock_guard cacheLock(drawCacheMutex);
@@ -563,16 +568,37 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    // A relocated hit's stages stand for the cached variants they were copied from, and its
+    // recipes live on the donor entry (relocatedRecipes); its recipe hits are rebased.
+    bool rebased = false;
+    std::shared_ptr<DrawEntry> recipeHome;
     if (registerKey && !drawParameters.indirect && !meshEmulated && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
-        for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            auto variant = drawHit ? matched[i] : fresh[i];
+            if (variant != nullptr && drawHit) {
+                if (auto origin = variant->origin.lock()) {
+                    variant = std::move(origin);
+                    rebased = true;
+                }
+            }
+            recipeStages.push_back(std::move(variant));
+        }
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
+        if (drawHit && entry != nullptr) {
+            auto donor = entry->donor.lock();
+            if (donor != nullptr) rebased = true;
+            recipeHome = donor != nullptr ? std::move(donor) : entry;
+        }
+        if (rebased && !relocatedRecipes()) recipeStages.clear();
     }
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
-        recipe = findDrawRecipe(drawKey, recipeStages);
+        recipe = findDrawRecipe(drawKey, recipeHome, recipeStages, rebased);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
+    // The shader set's identity, kept with an attached recipe for the governor bypass.
+    if (recipe == nullptr && !recipeStages.empty() && drawIdentity == 0 && recipeGovernorBypass()) drawIdentity = drawIdentityKey(queue, *submission.shaders);
     if (recipe == nullptr && !meshEmulated) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
@@ -603,12 +629,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         // The commit owns everything its stages point at: heldResults holds the stages' materialized
         // programs (this draw's push constants among them), which the scratch would free at return.
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, pins = std::move(pins), programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeHome = std::move(recipeHome), rebased, drawIdentity, commitQueue, commitPacket, epoch, pins = std::move(pins), programs = std::move(programs), results = std::move(results), heldResults = std::move(heldResults), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             const Graphics::PinnedDrawInputs::Scope pinScope(pins.get());
             try {
-                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeHome, rebased, drawIdentity);
             } catch (const std::exception& error) {
                 if (!SkipFailedWork()) {
                     ReportFailure(std::current_exception());
@@ -630,7 +656,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, rebased) == RecipeOutcome::Recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();
@@ -647,12 +673,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeHome, recipeStages, std::move(built), rebased, drawIdentity);
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeHome, bool rebased, std::uint64_t identity) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -666,12 +692,12 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) return;
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, rebased) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeHome, recipeStages, std::move(built), rebased, identity);
 }
 
 }

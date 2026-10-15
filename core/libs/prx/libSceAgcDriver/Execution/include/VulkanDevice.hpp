@@ -295,6 +295,12 @@ public:
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
+    // Draw recipe hits since start, and those that were rebased (relocated stages) or bound moved
+    // buffers (cumulative; the [recipe] draw line prints them per 10 s too).
+    struct DrawRecipeTotals {
+        std::uint64_t hits = 0, rebased = 0, moved = 0;
+    };
+    static DrawRecipeTotals DrawRecipeHitTotals();
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
@@ -303,7 +309,7 @@ public:
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
-    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe);
+    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, bool rebased = false);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect
     // draw's records can be read by the GPU (Graphics::Draw) or must be resolved on the CPU.
     struct IndirectDrawSupport {

@@ -48,6 +48,8 @@ struct DispatchVariant {
     std::uint64_t baseWords = 0, valueWords = 0;
     bool relocationEligible = false;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
+    // A relocated copy's cached variant (relocateDrawEntry): draw recipes match stages by it.
+    std::weak_ptr<DispatchVariant> origin;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;

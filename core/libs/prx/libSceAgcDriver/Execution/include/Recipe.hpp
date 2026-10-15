@@ -84,6 +84,9 @@ struct DrawRecipe {
     std::optional<Graphics::State> masked;
     std::uint64_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
+    // Built by a draw whose template hit moved read-only buffers or data words (MovedRecipes):
+    // every hit binds the buffers its stages moved, as Draw does.
+    bool movedBuffers = false;
 };
 
 }

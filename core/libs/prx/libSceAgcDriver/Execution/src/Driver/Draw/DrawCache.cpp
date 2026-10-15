@@ -124,9 +124,27 @@ bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry&) {
     });
 }
 
-std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages) {
+// Relocated recipes (APS5_NO_RELOCATED_RECIPE=1 turns them off): a draw-cache hit through a
+// relocated entry (moved user-data pointers) finds and attaches recipes on the donor entry, its
+// stages matched by the cached variants they were copied from; such a hit is rebased (its push
+// constants, data words and moved buffers re-derived, the template's content key compared).
+bool Driver::relocatedRecipes() {
+    static const bool disabled = std::getenv("APS5_NO_RELOCATED_RECIPE") != nullptr;
+    return !disabled;
+}
+
+// While the draw-cache governor pauses entries, the draws of a shader set with a recipe keep them
+// (APS5_NO_RECIPE_GOVERNOR_BYPASS=1: they are paused with the rest).
+bool Driver::recipeGovernorBypass() {
+    static const bool disabled = std::getenv("APS5_NO_RECIPE_GOVERNOR_BYPASS") != nullptr;
+    return !disabled;
+}
+
+std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::shared_ptr<DrawEntry>& home, const std::vector<std::shared_ptr<DispatchVariant>>& stages, bool& rebased) {
     std::shared_ptr<const std::vector<DrawRecipeRecord>> records;
-    {
+    if (home != nullptr) {
+        records = home->recipes.load();
+    } else {
         std::lock_guard cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
         if (found == drawCache.end()) return nullptr;
@@ -134,22 +152,31 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     }
     if (records == nullptr) return nullptr;
     for (const auto& record : *records) {
-        if (record.Matches(stages)) return record.recipe;
+        if (!record.Matches(stages)) continue;
+        rebased = rebased || record.rebased;
+        return record.recipe;
     }
     return nullptr;
 }
 
-void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe) {
-    std::shared_ptr<DrawEntry> entry;
+void Driver::attachDrawRecipe(std::uint64_t key, const std::shared_ptr<DrawEntry>& home, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, bool rebased, std::uint64_t identity) {
+    std::shared_ptr<DrawEntry> entry = home;
     {
         std::lock_guard cacheLock(drawCacheMutex);
-        const auto found = drawCache.find(key);
-        if (found == drawCache.end()) return;
-        entry = found->second;
+        if (entry == nullptr) {
+            const auto found = drawCache.find(key);
+            if (found == drawCache.end()) return;
+            entry = found->second;
+        }
+        if (identity != 0 && recipeGovernorBypass()) {
+            if (drawRecipeIdentities.size() >= 65536) drawRecipeIdentities.clear();
+            drawRecipeIdentities.insert(identity);
+        }
     }
+    // Two committers may attach to one entry at once (a lost record is a later miss, never wrong).
     const auto old = entry->recipes.load();
     auto records = std::make_shared<std::vector<DrawRecipeRecord>>();
-    records->push_back({std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe)});
+    records->push_back({std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe), rebased});
     if (old != nullptr) {
         for (const auto& record : *old) {
             if (record.Matches(stages) || record.Expired() || records->size() >= dispatchVariants()) continue;

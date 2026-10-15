@@ -108,7 +108,7 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
 // template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
 // resource cache and kept by the batch).
-enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Count };
+enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Rebased, Count };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
     bool recorded = false;
@@ -117,6 +117,8 @@ struct DrawRecipeOutcome {
     // APS5_PROFILE_DRAW: the proof's and the record's time.
     double proofUs = 0;
     double recordUs = 0;
+    // The hit bound buffers its stages moved against the template (MovedRecipes).
+    bool moved = false;
 };
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
@@ -124,7 +126,15 @@ struct DrawRecipeOutcome {
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing.
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
+// `rebased`: the hit's stages are relocated copies of the recipe's (or the recipe was built from
+// such copies), so the template's content key is compared with the stages' and the push constants
+// are assembled from the stages; a key that differs is a Rebased miss. The read-only buffers the
+// stages moved (ShaderResources::MovedReadOnlyBuffers) are bound as snapshots like Draw's; a stage
+// set the template cannot serve that way is a Rebased miss too.
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, bool rebased = false);
+// Whether a recorded draw whose template hit moved read-only buffers (or data words) builds a
+// recipe, its hits re-deriving the moved buffers (APS5_NO_MOVED_RECIPE=1: only unmoved ones).
+bool MovedRecipes();
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 // Whether draws with a depth attachment build recipes too (APS5_NO_DEPTH_RECIPE unset).

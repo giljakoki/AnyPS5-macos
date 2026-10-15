@@ -1070,13 +1070,18 @@ bool DrawRecipes() {
 
 // Whether draws with a depth attachment build recipes too (APS5_NO_DEPTH_RECIPE unset): a hit looks
 // the depth surface's view up as Draw does and misses when it is not the recipe's.
+bool MovedRecipes() {
+    static const bool noMovedRecipe = std::getenv("APS5_NO_MOVED_RECIPE") != nullptr;
+    return !noMovedRecipe;
+}
+
 bool DepthRecipes() {
     static const bool noDepthRecipe = std::getenv("APS5_NO_DEPTH_RECIPE") != nullptr;
     return !noDepthRecipe;
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "rebased"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -2850,7 +2855,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (!state.depth || DepthRecipes()) && resolved.moved.empty() && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (!state.depth || DepthRecipes()) && (resolved.moved.empty() || MovedRecipes()) && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2869,6 +2874,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
             recipe->masked = masked;
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
+            recipe->movedBuffers = !resolved.moved.empty();
             *recipeOut = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
@@ -3125,7 +3131,7 @@ void Draw(const Context& context, const State& guestState, const Pm4::DrawParame
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState, const Pm4::DrawParameters& guestDraw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState, const Pm4::DrawParameters& guestDraw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, bool rebased) {
     const auto hostState = HostDepthState(context, guestState);
     const State& state = hostState ? *hostState : guestState;
     const Pm4::DrawParameters draw = CompleteRectangles(state, guestDraw);
@@ -3194,6 +3200,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
+    // A rebased hit's stages are not the recipe's: the template must be the one their content
+    // key names (what resolveDrawResources would look up).
+    if (rebased) {
+        static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        if (DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, inputs.indexBytes, !trimKey) != recipe.key) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Rebased);
+        }
+    }
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = resources->ProveCurrent(shaders, &result.proof);
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
@@ -3203,6 +3218,18 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
         recorder->Keep(std::move(resources));
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
+    }
+    // The buffers this hit's stages moved against the template (Draw's MovedReadOnlyBuffers after
+    // the proof): needed when the recipe's own draw moved any, or the stages are rebased.
+    std::vector<ShaderResources::MovedBuffer> moved;
+    if (recipe.movedBuffers || rebased) {
+        auto found = resources->MovedReadOnlyBuffers(shaders, *recorder);
+        if (!found.has_value()) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Rebased);
+        }
+        moved = std::move(*found);
+        result.moved = !moved.empty();
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (PresentTrace::Enabled()) {
@@ -3233,7 +3260,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& guestState
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
-    record.pushBytes = &recipe.pushBytes;
+    record.moved = moved;
+    // A rebased hit's push constants are its stages' (a relocated copy patches forwarded words).
+    record.pushBytes = rebased ? nullptr : &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
     if (profile) {

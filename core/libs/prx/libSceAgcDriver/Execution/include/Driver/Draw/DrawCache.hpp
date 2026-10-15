@@ -91,6 +91,9 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::shared_ptr<const DrawRecipe> recipe;
+    // Built by a draw whose stages were relocated copies (moved user-data pointers): its push
+    // constants and data words are that draw's, so every hit re-derives them (rebased hit).
+    bool rebased = false;
     bool Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const;
     bool Expired() const;
 };
@@ -102,6 +105,8 @@ struct DrawEntry {
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
+    // A relocated copy's donor (relocateDrawEntry): recipes of relocated hits live on the donor.
+    std::weak_ptr<DrawEntry> donor;
     std::uint64_t touched = 0;
     std::list<std::uint64_t>::iterator order;
 };
