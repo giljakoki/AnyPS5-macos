@@ -11,9 +11,29 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// How long every queue must stay idle before queue 0 stores the pending GPU results into guest
+// memory (StoreIdleResults). Storing at the first idle moment wrote every render target back after
+// each batch gap of a frame (Outer Wilds: 27 write-backs, 430 MiB per present) although the next
+// batch draws into them again; a target that stays idle this long is stored as before. A CPU read
+// that has a sync point (a label, a pending-write overlap, a flip) still flushes at once.
+// APS5_IDLE_STORE_DELAY_MS=<ms> sets it, APS5_NO_IDLE_STORE_DELAY=1 stores at the first idle moment.
+std::chrono::milliseconds IdleStoreDelay() {
+    static const std::chrono::milliseconds delay = [] {
+        if (std::getenv("APS5_NO_IDLE_STORE_DELAY") != nullptr) return std::chrono::milliseconds(0);
+        if (const char* value = std::getenv("APS5_IDLE_STORE_DELAY_MS")) return std::chrono::milliseconds(std::max(std::atoi(value), 0));
+        return std::chrono::milliseconds(100);
+    }();
+    return delay;
+}
+
+}
 
 FrameTiming* Driver::frameTiming() {
     if (!APS5_ENABLE_TIMING_LOG) return nullptr;
@@ -133,6 +153,14 @@ void Driver::run(std::uint32_t id) noexcept {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
                         const bool storeIdleResults = id == 0 && allQueuesIdle() && !completionsPending();
+                        if (storeIdleResults && IdleStoreDelay().count() > 0) {
+                            // Wait for the queues to stay idle: new work (or a completion to poll)
+                            // ends the wait without storing, the pending results stay on the GPU.
+                            if (changed.wait_for(lock, IdleStoreDelay(), [&] { return ready() || !allQueuesIdle() || completionsPending(); })) {
+                                if (ready()) break;
+                                continue;
+                            }
+                        }
                         lock.unlock();
                         if (storeIdleResults) {
                             if (const auto localDevice = device.Load()) {

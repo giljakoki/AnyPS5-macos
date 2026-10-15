@@ -269,23 +269,29 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     return plan;
 }
 
+namespace Detail {
+// Branch-free so the compiler vectorizes it: a skipped restart index counts as 0 and as no index.
+template <typename Index>
+std::optional<std::uint32_t> HighestIndexOf(std::span<const std::byte> indices, bool skipRestart) {
+    const auto count = indices.size() / sizeof(Index);
+    const Index restart = static_cast<Index>(~Index{0});
+    Index highest = 0;
+    std::size_t kept = 0;
+    for (std::size_t position = 0; position < count; ++position) {
+        Index value;
+        std::memcpy(&value, indices.data() + position * sizeof(Index), sizeof(Index));
+        const bool keep = !skipRestart || value != restart;
+        highest = std::max<Index>(highest, keep ? value : Index{0});
+        kept += keep ? 1u : 0u;
+    }
+    if (kept == 0) return std::nullopt;
+    return static_cast<std::uint32_t>(highest);
+}
+}
+
 inline std::optional<std::uint32_t> HighestDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
     Require(indexSize == 2 || indexSize == 4, "unsupported index size");
-    const auto restartIndex = indexSize == 2 ? 0xffffu : 0xffffffffu;
-    std::optional<std::uint32_t> highest;
-    for (std::size_t offset = 0; offset + indexSize <= indices.size(); offset += indexSize) {
-        std::uint32_t index = 0;
-        if (indexSize == 2) {
-            std::uint16_t value = 0;
-            std::memcpy(&value, indices.data() + offset, sizeof(value));
-            index = value;
-        } else {
-            std::memcpy(&index, indices.data() + offset, sizeof(index));
-        }
-        if (skipRestart && index == restartIndex) continue;
-        highest = std::max(highest.value_or(0u), index);
-    }
-    return highest;
+    return indexSize == 2 ? Detail::HighestIndexOf<std::uint16_t>(indices, skipRestart) : Detail::HighestIndexOf<std::uint32_t>(indices, skipRestart);
 }
 
 inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> indices, std::uint32_t indexSize) {

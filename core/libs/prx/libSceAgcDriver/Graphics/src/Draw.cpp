@@ -391,8 +391,8 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 
 // APS5_PROFILE_DRAW: per-draw phase timers in microseconds (a recorded draw's phases are far below
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
-enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
-constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+enum DrawPhase : std::size_t { PhaseValidate, PhaseIndex, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
+constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "index", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -1155,6 +1155,39 @@ struct DrawInputs {
     std::vector<InPlaceBinding> inPlace;
 };
 
+// The highest index of an in-place (host-imported) index range, remembered per queue worker while
+// write tracking proves the range unchanged: Unity titles draw tens of thousands of sub-ranges of the
+// same index buffers per second, and scanning each one every draw dominated the draw's index phase.
+// APS5_NO_INDEX_MEMO=1 scans every draw.
+std::optional<std::uint32_t> memoizedHighestIndex(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t indexSize, bool skipRestart) {
+    static const bool enabled = std::getenv("APS5_NO_INDEX_MEMO") == nullptr;
+    if (!enabled) return HighestDrawIndex(bytes, indexSize, skipRestart);
+    struct Entry {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t registry = 0;
+        std::uint32_t indexSize = 0;
+        bool skipRestart = false;
+        std::optional<std::uint32_t> highest;
+    };
+    constexpr std::size_t Slots = 1024;
+    thread_local std::vector<Entry> entries(Slots);
+    // The range was flushed and checked for pending GPU writes by InPlaceDrawInput; collecting it
+    // stamps any CPU write since the last collect, so an equal generation proves equal bytes.
+    const auto generation = GuestMemory::CollectWrites(address, bytes.size());
+    if (generation == 0) return HighestDrawIndex(bytes, indexSize, skipRestart);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto& entry = entries[((address >> 1u) ^ (bytes.size() * 0x9e3779b97f4a7c15ull >> 40u)) % Slots];
+    if (entry.address == address && entry.bytes == bytes.size() && entry.indexSize == indexSize && entry.skipRestart == skipRestart && entry.registry == registry
+        && GuestMemory::UnchangedSince(address, bytes.size(), entry.generation)) {
+        return entry.highest;
+    }
+    const auto highest = HighestDrawIndex(bytes, indexSize, skipRestart);
+    entry = {address, bytes.size(), generation, registry, indexSize, skipRestart, highest};
+    return highest;
+}
+
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
     auto zero = std::make_shared<Buffer>(context, DecodeVertexFormat(attribute).bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
@@ -1239,8 +1272,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else if (recheckIndices) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
-        if (!copy.reused) {
-            const auto bytes = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+        if (import != nullptr) {
+            const std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes));
+            highest = memoizedHighestIndex(draw.indexAddress, bytes, draw.indexSize, skipRestart);
+        } else if (!copy.reused) {
+            const auto bytes = copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             highest = HighestDrawIndex(bytes, draw.indexSize, skipRestart);
             if (import == nullptr) KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
@@ -1270,6 +1306,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+    timer.phase(PhaseIndex);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;

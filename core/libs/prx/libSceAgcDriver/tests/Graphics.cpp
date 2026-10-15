@@ -5047,6 +5047,19 @@ void highestDrawIndexTests() {
     Require(HighestDrawIndex(bytesOf(restartOnly), 2, false) == 0xffff, "a 16-bit all-ones index without restart was skipped");
     Require(HighestDrawIndex(bytesOf(narrow).first(4), 2, true) == 7 && HighestDrawIndex(bytesOf(narrow).first(2), 2, true) == 0, "the scan read past its index range");
     expectFailure([&] { HighestDrawIndex(bytesOf(narrow), 1, false); }, "unsupported index size");
+    // Long ranges take the vectorized body and its tail: the maximum at every position is found.
+    std::vector<std::uint16_t> longNarrow(1003);
+    std::vector<std::uint32_t> longWide(1003);
+    for (std::size_t at : {std::size_t{0}, std::size_t{17}, std::size_t{511}, std::size_t{1002}}) {
+        for (std::size_t i = 0; i < longNarrow.size(); ++i) {
+            longNarrow[i] = i % 5 == 0 ? 0xffff : static_cast<std::uint16_t>(i % 300);
+            longWide[i] = i % 5 == 0 ? 0xffffffffu : static_cast<std::uint32_t>(i % 300);
+        }
+        longNarrow[at] = 0xfffe;
+        longWide[at] = 0x12345678u;
+        Require(HighestDrawIndex(bytesOf(longNarrow), 2, true) == 0xfffe && HighestDrawIndex(bytesOf(longWide), 4, true) == 0x12345678u, "a long index range lost its maximum");
+        Require(HighestDrawIndex(bytesOf(longNarrow), 2, false) == 0xffff && HighestDrawIndex(bytesOf(longWide), 4, false) == 0xffffffffu, "a long index range without restart skipped all-ones");
+    }
 }
 
 void storeAtFlipTests() {
