@@ -2151,6 +2151,10 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
+    std::atomic<std::uint64_t> imageProofs{0};
+    std::atomic<std::uint64_t> fullWalkNanoseconds{0};
+    std::atomic<std::uint64_t> importNanoseconds{0};
+    std::atomic<std::uint64_t> reportedNanoseconds[3]{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -2244,6 +2248,11 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu (%llu over untracked memory), full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.untrackedFast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    // Since the last line: the full walks' and the imported-region step's share of the time, and the
+    // untracked elements proved by their image's own proof (UntrackedImageProof).
+    const auto since = [&](std::size_t slot, const std::atomic<std::uint64_t>& total) { const auto now = total.load(std::memory_order_relaxed); return static_cast<double>(now - profile.reportedNanoseconds[slot].exchange(now, std::memory_order_relaxed)) / 1e6; };
+    const double allMs = since(0, profile.nanoseconds), fullMs = since(1, profile.fullWalkNanoseconds), importMs = since(2, profile.importNanoseconds);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate split (10 s): %.1f ms in total, full walks %.1f ms, imported regions and staging %.1f ms; untracked elements proved by their image's proof %llu (cumulative)\n", allMs, fullMs, importMs, static_cast<unsigned long long>(profile.imageProofs.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -2272,6 +2281,16 @@ void ShaderResources::captureValidation() {
     lookupLog().clear();
     const auto proof = currentSnapshotProof();
     untrackedValidation = {proof.present, proof.now, proof.forget, proof.writes, proof.usable};
+}
+
+// An untracked element whose object is a storage image the template-level proof no longer covers
+// (a new present, or a recorded GPU write over the surface since the last full walk) is proved by
+// the image's own proof instead: exactly the answer its lookup's Refresh would give (see
+// StorageTexture::ProvedUnchangedUntracked), so the full walk would return the same object.
+// APS5_NO_UNTRACKED_IMAGE_PROOF=1 leaves those elements to the full walk as before.
+bool untrackedImageProof() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_IMAGE_PROOF") != nullptr;
+    return !disabled;
 }
 
 bool untrackedFastRevalidate() {
@@ -2308,6 +2327,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     const auto proof = currentSnapshotProof();
     const bool untrackedHolds = untrackedFastRevalidate() && proof.usable && untrackedValidation.usable && untrackedValidation.present == proof.present && proof.now - untrackedValidation.at < snapshotProofLifetime() && untrackedValidation.forget == proof.forget;
     const auto untrackedProven = [&](std::uint64_t address, std::size_t bytes) { return untrackedHolds && !GuestMemory::DriverWroteOver(address, bytes, untrackedValidation.writes); };
+    const auto imageProven = [&](const StorageTexture* image, std::uint64_t address, std::size_t bytes) {
+        if (!untrackedImageProof() || image == nullptr) return false;
+        const auto base = image->Descriptor().baseAddress;
+        if (address < base || address + bytes > base + image->GuestBytes()) return false;
+        if (!const_cast<StorageTexture*>(image)->ProvedUnchangedUntracked()) return false;
+        if (BuildProfiled()) Revalidations().imageProofs.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
     bool anyUntracked = false;
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
@@ -2342,7 +2369,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         const bool untracked = surface.collected == 0;
-        if (untracked && !untrackedProven(address, bytes)) return fail(FastFail::Collect);
+        if (untracked && !untrackedProven(address, bytes) && !imageProven(surface.source, address, bytes)) return fail(FastFail::Collect);
         anyUntracked = anyUntracked || untracked;
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -2396,7 +2423,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         const bool untracked = GuestMemory::CollectWrites(address, bytes) == 0;
-        if (untracked && !untrackedProven(address, bytes)) return fail(FastFail::Collect);
+        if (untracked && !untrackedProven(address, bytes) && !imageProven(image, address, bytes)) return fail(FastFail::Collect);
         anyUntracked = anyUntracked || untracked;
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
@@ -2685,7 +2712,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
-        if (!fullWalk()) {
+        const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool walked = fullWalk();
+        if (profile) Revalidations().fullWalkNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
+        if (!walked) {
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;
@@ -2735,6 +2765,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    const auto importStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct ImportTime {
+        bool on;
+        std::chrono::steady_clock::time_point start;
+        ~ImportTime() {
+            if (on) Revalidations().importNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        }
+    } importTime{profile, importStart};
     if (EpochRevalidate()) {
         if (!directRegions.empty() && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;

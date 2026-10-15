@@ -2152,6 +2152,13 @@ bool StorageTexture::untrackedRefreshProved() {
     return true;
 }
 
+bool StorageTexture::ProvedUnchangedUntracked() {
+    if (!refreshProof.untracked || std::any_of(imageStale.begin(), imageStale.end(), [](bool stale) { return stale; }) || !untrackedRefreshProved()) return false;
+    NoteProved();
+    refreshesProved.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool StorageTexture::refreshProved() {
     if (refreshProof.untracked) return untrackedRefreshProved();
     if (refreshProof.generation == 0) return false;

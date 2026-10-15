@@ -333,6 +333,10 @@ public:
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    // Refresh's proved-unchanged answer for an image over untracked memory (its present-level
+    // proof that guest memory still equals its content, no store over it since, no other image
+    // pending over it), without the refresh: true exactly when Refresh would return at once.
+    bool ProvedUnchangedUntracked();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     static std::uint64_t Uploads();
