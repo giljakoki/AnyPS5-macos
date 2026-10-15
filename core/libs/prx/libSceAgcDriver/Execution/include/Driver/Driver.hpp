@@ -130,6 +130,7 @@ private:
     std::shared_ptr<const DrawRelocation> learnDrawRelocation(std::uint64_t key, std::uint64_t alias, std::uint64_t identity);
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
     void reportDrawRelocation();
+    void explainAliasMiss(const QueueState& queue, std::uint64_t identity);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
@@ -320,6 +321,7 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> drawRelocations;
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawAliases;
+    std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawRelocationLast;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
     std::list<std::uint64_t> drawOrder;

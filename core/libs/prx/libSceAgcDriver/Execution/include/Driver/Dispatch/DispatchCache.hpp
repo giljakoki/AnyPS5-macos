@@ -45,6 +45,8 @@ struct DispatchVariant {
     // (slot, value) a relocated copy still has to patch into its result.
     std::vector<std::int8_t> runBases;
     std::uint64_t relocatableWords = 0, freeWords = 0;
+    std::uint64_t baseWords = 0, valueWords = 0;
+    bool relocationEligible = false;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 

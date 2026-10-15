@@ -80,6 +80,9 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
     const std::uint64_t hidden = hiddenWords >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << hiddenWords) - 1;
     std::uint64_t relocatable = eligible ? use.asBase & ~use.asValue & present & ~hidden : 0;
     variant.freeWords = eligible ? ~(use.asBase | use.asValue) & present & ~hidden : 0;
+    variant.baseWords = use.asBase;
+    variant.valueWords = use.asValue;
+    variant.relocationEligible = eligible;
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
     const auto covered = [&](std::uint64_t address) {
         return std::any_of(regions.begin(), regions.end(), [&](const ShaderRecompiler::MemoryRegion& region) { return address >= region.guestAddress && address - region.guestAddress + sizeof(std::uint32_t) <= region.bytes.size(); });
@@ -104,28 +107,36 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
         if (found == reads.end() || found->first != address || found->second < 0 || found->second >= 64) return -1;
         return (relocatable >> found->second & 1u) != 0 ? static_cast<std::int8_t>(found->second) : std::int8_t{-1};
     };
+    // A captured region keeps its shape: it moves whole with the one pointer every word of it was
+    // read through, or not at all (its pointers are not relocatable then).
+    std::vector<std::int8_t> bases(regions.size(), -1);
+    for (bool mixed = relocatable != 0; mixed;) {
+        mixed = false;
+        for (std::size_t r = 0; r < regions.size(); ++r) {
+            const auto count = regions[r].bytes.size() / sizeof(std::uint32_t);
+            const auto first = count != 0 ? origin(regions[r].guestAddress) : std::int8_t{-1};
+            bases[r] = first;
+            for (std::size_t word = 1; word < count; ++word) {
+                const auto other = origin(regions[r].guestAddress + word * sizeof(std::uint32_t));
+                if (other == first) continue;
+                if (first >= 0) relocatable &= ~(std::uint64_t{1} << first);
+                if (other >= 0) relocatable &= ~(std::uint64_t{1} << other);
+                mixed = true;
+                break;
+            }
+            if (mixed) break;
+        }
+    }
     variant.relocatableWords = relocatable;
-    for (const auto& region : regions) {
+    for (std::size_t r = 0; r < regions.size(); ++r) {
+        const auto& region = regions[r];
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
         const auto offset = variant.words.size();
         variant.words.resize(offset + count);
         std::memcpy(variant.words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-        if (relocatable == 0) {
-            variant.runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-            continue;
-        }
-        std::size_t start = 0;
-        auto current = count != 0 ? origin(region.guestAddress) : std::int8_t{-1};
-        for (std::size_t word = 1; word <= count; ++word) {
-            const auto next = word < count ? origin(region.guestAddress + word * sizeof(std::uint32_t)) : std::int8_t{-2};
-            if (next == current) continue;
-            variant.runs.emplace_back(region.guestAddress + start * sizeof(std::uint32_t), region.guestAddress + word * sizeof(std::uint32_t));
-            variant.runBases.push_back(current);
-            start = word;
-            current = next;
-        }
+        variant.runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+        if (relocatable != 0) variant.runBases.push_back(bases[r]);
     }
-    if (relocatable == 0) variant.runBases.clear();
 }
 
 std::shared_ptr<const DrawRelocation> Driver::learnDrawRelocation(std::uint64_t key, std::uint64_t alias, std::uint64_t identity) {
@@ -184,11 +195,14 @@ std::shared_ptr<const DrawRelocation> Driver::learnDrawRelocation(std::uint64_t 
         if (drawRelocations.size() >= MaxRelocations && known == drawRelocations.end()) {
             drawRelocations.clear();
             drawRelocationTrials.clear();
+            drawRelocationLast.clear();
         }
         result = shape;
         drawRelocations[identity] = std::move(shape);
         ++drawRelocationCounters.learned;
     }
+    if (drawRelocationLast.size() >= MaxRelocations && !drawRelocationLast.contains(identity)) drawRelocationLast.clear();
+    drawRelocationLast[identity] = inserted->second;
     if (alias != 0) {
         if (drawAliases.size() >= MaxAliases) drawRelocationCounters.evicted += dropEveryOther(drawAliases);
         drawAliases[alias] = inserted->second;
@@ -216,7 +230,13 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             if (current != program.userData[index]) moves.push_back({i, index, program.userData[index], current});
         }
     }
-    if (moves.empty()) return;
+    if (moves.empty()) {
+        ++counters.same;
+        patches.clear();
+        entry = donor;
+        decode = donor->decode;
+        return;
+    }
     ++counters.donors;
     auto relocated = std::make_shared<DrawEntry>();
     relocated->decode = donor->decode;
@@ -290,9 +310,42 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     variant.shaderDataPatches.clear();
 }
 
+void Driver::explainAliasMiss(const QueueState& queue, std::uint64_t identity) {
+    auto& counters = drawRelocationCounters;
+    const auto last = drawRelocationLast.find(identity);
+    if (last == drawRelocationLast.end() || last->second->decode == nullptr || last->second->stages.size() != last->second->decode->programs.size()) {
+        ++counters.missNoLast;
+        return;
+    }
+    const auto& entry = *last->second;
+    bool words = false;
+    for (std::size_t i = 0; i < entry.decode->programs.size(); ++i) {
+        const auto& program = entry.decode->programs[i];
+        for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size(); ++index) {
+            if (readUserData(queue.shader, program.userDataBase + index - program.hiddenUserWords) == program.userData[index]) continue;
+            if (index >= 64 || entry.stages[i].empty()) {
+                ++counters.wordBeyond;
+                words = true;
+                continue;
+            }
+            const auto& variant = *entry.stages[i].front();
+            const auto bit = std::uint64_t{1} << index;
+            if (((variant.freeWords | variant.relocatableWords) & bit) != 0) continue;
+            words = true;
+            if (!variant.relocationEligible) ++counters.wordIneligible;
+            else if ((variant.valueWords & bit) != 0) ++counters.wordValue;
+            else if ((variant.baseWords & bit) != 0) ++counters.wordDroppedBase;
+            else ++counters.wordOther;
+        }
+    }
+    if (words) ++counters.missWords;
+    else ++counters.missContent;
+}
+
 void Driver::reportDrawRelocation() {
     auto& counters = drawRelocationCounters;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] (10 s) %llu alias lookups: %llu donors with moved user words, %llu variants refused, %llu hits through a relocated entry; %llu shader sets (re)learned, %zu held, %zu aliases held (%llu dropped at the limit)\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), static_cast<unsigned long long>(counters.learned), drawRelocations.size(), drawAliases.size(), static_cast<unsigned long long>(counters.evicted));
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] (10 s) %llu alias lookups (%llu more not built: contents unmapped; %llu draws past the governor's pause): %llu donors with moved user words, %llu with the same words, %llu variants refused, %llu hits through a relocated entry; misses against the set's last entry: %llu only pointer/free words moved (contents differ), %llu a moved word not relocatable (words: %llu ineligible stage, %llu used as a value, %llu dereferenced but dropped, %llu other, %llu past 64 or uncached), %llu no last entry; %llu shader sets (re)learned, %zu held, %zu aliases held (%llu dropped at the limit)\n", count(counters.lookups), count(counters.unreadable), count(counters.bypassed), count(counters.donors), count(counters.same), count(counters.refused), count(counters.hits), count(counters.missContent), count(counters.missWords), count(counters.wordIneligible), count(counters.wordValue), count(counters.wordDroppedBase), count(counters.wordOther), count(counters.wordBeyond), count(counters.missNoLast), count(counters.learned), drawRelocations.size(), drawAliases.size(), count(counters.evicted));
     counters = {};
 }
 

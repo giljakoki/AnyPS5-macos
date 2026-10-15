@@ -159,7 +159,9 @@ struct DrawRelocationTrial {
 };
 
 struct DrawRelocationCounters {
-    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0, evicted = 0, learned = 0;
+    std::uint64_t lookups = 0, donors = 0, same = 0, refused = 0, hits = 0, evicted = 0, learned = 0, unreadable = 0, bypassed = 0;
+    // APS5_PROFILE_DRAW: why an alias lookup found no donor, against the shader set's last entry.
+    std::uint64_t missContent = 0, missWords = 0, missNoLast = 0, wordBeyond = 0, wordIneligible = 0, wordValue = 0, wordDroppedBase = 0, wordOther = 0;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
