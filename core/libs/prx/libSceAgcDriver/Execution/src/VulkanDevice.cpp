@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PresentTrace.hpp"
 #include "BdaAbi.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -2637,6 +2638,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     std::shared_ptr<Graphics::StorageTexture> resident;
     VkFilter filter = VK_FILTER_LINEAR;
     bool convert = false;
+    const char* presentHow = "guest";
     if (!NoResidentPresent()) {
         bool pending = false;
         resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert);
@@ -2646,11 +2648,15 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         }
         if (!pending && resident != nullptr) {
             ++livePresents;
+            presentHow = "live";
         } else if (!pending) {
             ++notPending;
+            presentHow = "guest-not-pending";
         } else if (resident == nullptr) {
             ++unsuitable;
+            presentHow = "guest-unsuitable";
         } else {
+            presentHow = "resident";
             // 64 KiB blocks the CPU wrote since the image last matched guest memory would be shown
             // stale (the write-back keeps the CPU's bytes for them): Refresh merges them into the
             // image first, as a sampled texture of the image would (see cachedTexture). The uncached
@@ -2660,6 +2666,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
             if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->Generation()) || (buffer.dccAddress != 0 && ResidentKeysMoved(*resident))) {
                 resident->Refresh();
                 ++refreshedPresents;
+                presentHow = "resident-refreshed";
             }
             ++residentPresents;
         }
@@ -2683,6 +2690,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         lastReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[flip] %llu presents from the resident image (%llu refreshed first), %llu from a live image, through guest memory: %llu not pending, %llu unsuitable (%llu shown as their DCC clear colour); %llu GPU frame dumps\n", static_cast<unsigned long long>(residentPresents), static_cast<unsigned long long>(refreshedPresents), static_cast<unsigned long long>(livePresents), static_cast<unsigned long long>(notPending), static_cast<unsigned long long>(unsuitable), static_cast<unsigned long long>(clearPresents), static_cast<unsigned long long>(gpuDumps));
     }
+    Graphics::PresentTrace::Present(dumpFrame ? state->nextDumpIndex : -1, buffer.address, resident.get(), resident ? resident->Generation() : 0, cleared ? "clear" : presentHow);
     CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0));
     VkClearColorValue uniform{};
     if (cleared) {

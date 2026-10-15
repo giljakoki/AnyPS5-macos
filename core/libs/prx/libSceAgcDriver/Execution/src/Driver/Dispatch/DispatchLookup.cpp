@@ -75,6 +75,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     if (same) {
                         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
                         PendingView pending;
+                        drainQueuedWritesOver(variant->captured);
                         pending.Load();
                         same = validateCaptured(address, submission.queue, variant->captured, *variant->compiled, false, pending);
                     }

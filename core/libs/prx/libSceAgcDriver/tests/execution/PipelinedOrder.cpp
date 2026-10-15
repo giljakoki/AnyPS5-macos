@@ -1,0 +1,259 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "VulkanTestDevice.hpp"
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <initializer_list>
+#include <iostream>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using AgcDriver::Graphics::Require;
+
+alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0xe0382000u, 0x80020005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::array<float, 4>, 3> Triangle{{{-1.0f, -1.0f, -0.5f, 1.0f}, {3.0f, -1.0f, -0.5f, 1.0f}, {-1.0f, 3.0f, -0.5f, 1.0f}}};
+alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 9> FillKernel{0xd7460004u, 0x04010c08u, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+alignas(256) std::array<std::byte, 1024> ColorMemory{};
+
+struct Header {
+    Shader shader{};
+    ShaderUserData userData{};
+};
+
+alignas(8) Header VertexHeader{};
+alignas(8) Header PixelHeader{};
+
+void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18u;
+    header.shader.header_size = sizeof(Header);
+    header.shader.shader_size = static_cast<std::uint32_t>(bytes);
+    header.shader.code = code;
+    header.shader.type = type;
+    header.shader.user_data = &header.userData;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
+
+std::uint32_t Low(std::uint64_t value) { return static_cast<std::uint32_t>(value); }
+std::uint32_t High(std::uint64_t value) { return static_cast<std::uint32_t>(value >> 32u); }
+
+void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
+    commands.push_back(0xc0000000u | (static_cast<std::uint32_t>(payload.size() - 1) << 16u) | (opcode << 8u));
+    commands.insert(commands.end(), payload);
+}
+
+// An auto draw of the triangle, or (with `indices`) an indexed draw of the vertices they name.
+void AppendDraw(std::vector<std::uint32_t>& commands, const std::uint16_t* indices = nullptr, std::uint32_t indexCount = 0) {
+    const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+    const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
+    const auto vertices = reinterpret_cast<std::uintptr_t>(Triangle.data());
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
+        {0x2d5, 0x2000},
+        {0x1b3, 0}, {0x1b4, 0}, {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
+        {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
+        {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
+        {0x206, 0x43f}, {0x204, 0}, {0x205, 0x240},
+        {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
+        {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
+        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0xc, 0}, {0xd, 0x40040},
+        {0x81, 0x80000000}, {0x82, 0x40040},
+        {0x90, 0x80000000}, {0x91, 0x40040},
+        {0x94, 0x80000000}, {0x95, 0x40040},
+        {0x318, static_cast<std::uint32_t>(color >> 8u)}, {0x390, static_cast<std::uint32_t>(color >> 40u)},
+        {0x10f, std::bit_cast<std::uint32_t>(32.0f)}, {0x110, std::bit_cast<std::uint32_t>(32.0f)},
+        {0x111, std::bit_cast<std::uint32_t>(-2.0f)}, {0x112, std::bit_cast<std::uint32_t>(2.0f)},
+        {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
+        {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
+        {0x003, 0x00010000}, {0x000, 0}, {0x00b, 0},
+    };
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 4u << 1u},
+        {0x8c, static_cast<std::uint32_t>(vertices)}, {0x8d, static_cast<std::uint32_t>((vertices >> 32u) & 0xffffu) | (16u << 16u)}, {0x8e, 3}, {0x8f, 0x01016facu},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 1u << 1u}, {0x00c, std::bit_cast<std::uint32_t>(0.5f)},
+    };
+    Append(commands, 0x79, {0x242, 4});
+    for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
+    for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
+    if (indices == nullptr) {
+        Append(commands, 0x2d, {3, 2});
+        return;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(indices);
+    Append(commands, 0x2a, {0});
+    Append(commands, 0x27, {indexCount, Low(address), High(address), indexCount, 0});
+}
+
+// The title's buffer fill kernel over the color target's bytes (the HLE fill path).
+void AppendFill(std::vector<std::uint32_t>& commands, std::uint32_t pattern) {
+    const auto kernel = reinterpret_cast<std::uintptr_t>(FillKernel.data());
+    const auto base = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+    const auto bytes = static_cast<std::uint32_t>(ColorMemory.size());
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{
+             {0x20c, Low(kernel >> 8u)}, {0x20d, High(kernel >> 8u) & 0xffu}, {0x207, 64}, {0x208, 1}, {0x209, 1}, {0x213, (8u << 1u) | 0x80u},
+             {0x240, Low(base)}, {0x241, (High(base) & 0xffffu) | (16u << 16u)}, {0x242, bytes / 16u}, {0x243, 0x4bfacu},
+             {0x244, pattern}, {0x245, pattern}, {0x246, pattern}, {0x247, pattern}}) {
+        Append(commands, 0x76, {offset, value});
+    }
+    Append(commands, 0x15, {bytes / 1024u, 1, 1, 0x41});
+}
+
+void Submit(std::vector<std::uint32_t>& commands) {
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "pipelined order: the submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+// Pixels with the draw's color: red and alpha from the pixel shader's user data (0.5).
+std::size_t DrawnPixels() {
+    std::size_t drawn = 0;
+    const auto half = [](std::byte value) { return std::to_integer<std::uint8_t>(value) == 127u || std::to_integer<std::uint8_t>(value) == 128u; };
+    for (std::size_t at = 0; at < ColorMemory.size(); at += 4) {
+        if (half(ColorMemory[at]) && half(ColorMemory[at + 3])) ++drawn;
+    }
+    return drawn;
+}
+
+std::size_t WordsEqualTo(std::uint32_t pattern) {
+    std::size_t equal = 0;
+    for (std::size_t at = 0; at < ColorMemory.size(); at += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, ColorMemory.data() + at, 4);
+        if (word == pattern) ++equal;
+    }
+    return equal;
+}
+
+// Every committed item, a fill or a label as well as a draw, runs in the collect epoch the worker
+// was in when it queued it: an epoch bump between two items gives the second a new epoch on the
+// committer, and items queued in one epoch share one.
+void CommitsFollowTheWorkersEpoch() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    if (DrawPipeline::Depth() == 0) return;
+    auto& pipeline = DrawPipeline::Queue0();
+    std::array<std::uint64_t, 3> seen{};
+    const auto queue = [&](std::size_t slot, DrawPipeline::Kind kind) {
+        pipeline.Enqueue([&seen, slot] { seen[slot] = AgcDriver::GuestMemory::CollectEpoch(); }, {}, 0, {}, kind);
+    };
+    queue(0, DrawPipeline::Kind::Fill);
+    queue(1, DrawPipeline::Kind::Label);
+    DrawPipeline::EpochToken().fetch_add(1);
+    queue(2, DrawPipeline::Kind::Fill);
+    pipeline.Drain(DrawPipeline::DrainReason::Submission);
+    if (seen[0] == 0) return;
+    Require(seen[0] == seen[1], "pipelined order: two items queued in one epoch were committed in different collect epochs");
+    Require(seen[2] != seen[1], "pipelined order: a fill queued after an epoch bump was committed in the epoch before it");
+}
+
+alignas(256) std::array<std::uint16_t, 4> Indices{};
+
+// The CPU stores new indices after the worker queued an indexed draw and before the committer
+// recorded it (this thread holds the device lock every commit takes): the draw must use the indices
+// it was queued with, as a draw recorded by the worker would have. The old indices name the
+// triangle, the new ones a degenerate triangle that draws nothing.
+void IndicesStoredWhileQueued() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    auto& pipeline = DrawPipeline::Queue0();
+    Indices = {0, 1, 2, 0};
+    ColorMemory.fill(std::byte{0});
+    std::unique_lock held(AgcDriver::GuestMemory::GpuMutex());
+    std::vector<std::uint32_t> commands;
+    AppendDraw(commands, Indices.data(), 3);
+    std::exception_ptr failure;
+    std::thread submitter([&] {
+        try {
+            Submit(commands);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    // The draw's item names the color target among its writes once the worker queued it.
+    bool queued = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!(queued = pipeline.Overlaps(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size())) && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    Indices = {0, 0, 0, 0};
+    held.unlock();
+    submitter.join();
+    if (failure != nullptr) std::rethrow_exception(failure);
+    Require(queued, "pipelined order: the indexed draw was not queued behind the held item");
+    const auto words = ColorMemory.size() / 4;
+    Require(DrawnPixels() == words, "pipelined order: an indexed draw whose indices the CPU replaced while it was queued drew " + std::to_string(DrawnPixels()) + " of " + std::to_string(words) + " pixels (it read the new indices, not those it was queued with)");
+}
+
+}
+
+int main() {
+    // The copies the index-rewrite case checks are taken in the copy mode (the default size mode only
+    // records large draws on the worker); a mode set by the caller is kept.
+    setenv("APS5_PIN_DRAW_INPUTS", "copy", 0);
+    try {
+        {
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+        }
+        CommitsFollowTheWorkersEpoch();
+        Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+        Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+        constexpr std::uint32_t Before = 0x11223344u, After = 0x5a5a5a5au;
+        const auto words = ColorMemory.size() / 4;
+
+        std::vector<std::uint32_t> fillThenDraw;
+        AppendFill(fillThenDraw, Before);
+        AppendDraw(fillThenDraw);
+        Submit(fillThenDraw);
+        const auto drawnOver = words - WordsEqualTo(Before);
+        if (drawnOver == 0) {
+            std::puts("pipelined order: the draw stored nothing over the fill on this device; ordering not checked");
+            AgcDriverShutdown_nid_postfix();
+            return VulkanTestSkipped;
+        }
+
+        // Many draws in one submission, each a fresh pipelined commit: every one must draw with its
+        // own program and user data (the commit owns them), not freed or reused ones.
+        std::vector<std::uint32_t> manyDraws;
+        for (int draw = 0; draw < 64; ++draw) AppendDraw(manyDraws);
+        ColorMemory.fill(std::byte{0});
+        Submit(manyDraws);
+        std::uint32_t firstWord = 0;
+        std::memcpy(&firstWord, ColorMemory.data(), 4);
+        Require(DrawnPixels() == words, "pipelined order: 64 draws left " + std::to_string(words - DrawnPixels()) + " of " + std::to_string(words) + " pixels without the draws' color (first pixel 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", firstWord); return std::string(text); }() + ")");
+
+        if (AgcDriver::DriverDetail::DrawPipeline::Depth() != 0) IndicesStoredWhileQueued();
+
+        // Draws, then a fill of the same bytes in the same submission: with the pipeline on, the draws
+        // are still queued when the fill packet is reached, and the fill must land after them.
+        std::vector<std::uint32_t> drawsThenFill;
+        AppendDraw(drawsThenFill);
+        AppendDraw(drawsThenFill);
+        AppendFill(drawsThenFill, After);
+        Submit(drawsThenFill);
+        const auto filled = WordsEqualTo(After);
+        Require(filled == words, "pipelined order: a fill queued after draws to the same target did not land after them (" + std::to_string(filled) + " of " + std::to_string(words) + " words hold the fill)");
+        AgcDriverShutdown_nid_postfix();
+        std::puts("pipelined order tests passed");
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        AgcDriverShutdown_nid_postfix();
+        return 1;
+    }
+}
