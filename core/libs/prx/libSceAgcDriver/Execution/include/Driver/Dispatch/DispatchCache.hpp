@@ -40,6 +40,12 @@ struct DispatchVariant {
     std::uint32_t flatBinding = NoFlatBinding;
 
     std::uint32_t pushOffset = 0;
+    // Draw relocation: the user word each run was read through (-1: none), the user words that may
+    // move as dereferenced pointers or as words the walk never read, and the shader-data dwords
+    // (slot, value) a relocated copy still has to patch into its result.
+    std::vector<std::int8_t> runBases;
+    std::uint64_t relocatableWords = 0, freeWords = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;

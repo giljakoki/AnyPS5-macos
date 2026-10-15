@@ -6,7 +6,37 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords) {
+std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry) {
+    std::uint64_t key = 0x84222325cbf29ce4ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    };
+    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        const auto low = queue.shader.find(base);
+        const auto high = queue.shader.find(base + 1);
+        if (low == queue.shader.end() || high == queue.shader.end()) {
+            mix(0);
+            continue;
+        }
+        mix(low->second);
+        mix(high->second);
+        const auto resources = queue.shader.find(base + 3);
+        mix(resources != queue.shader.end() ? resources->second : 0);
+        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        auto it = registry.upper_bound(address);
+        if (it == registry.begin()) {
+            mix(1);
+            continue;
+        }
+        --it;
+        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(address - it->first);
+    }
+    return key == 0 ? 1 : key;
+}
+
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords, const DrawRelocation* relocation, bool* readable) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
@@ -26,6 +56,13 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.second && offset < user.first + 32u; });
     };
     mix(deviceSerial);
+    if (relocation != nullptr) mix(0x9e3779b97f4a7c15ull);
+    bool contentsReadable = true;
+    const auto relocated = [&](std::uint32_t offset) -> const RelocatableUserWord* {
+        if (relocation == nullptr) return nullptr;
+        const auto found = std::lower_bound(relocation->words.begin(), relocation->words.end(), offset, [](const RelocatableUserWord& word, std::uint32_t reg) { return word.reg < reg; });
+        return found != relocation->words.end() && found->reg == offset ? &*found : nullptr;
+    };
     for (const auto& range : Graphics::DrawKeyRegisters) {
         const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
         mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
@@ -34,7 +71,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
             mix(it->first);
-            mix(it->second);
+            if (const auto* word = shader ? relocated(it->first) : nullptr) mix(word->free ? 0x46524545ull : relocatedContentKey(*word, it->second, contentsReadable));
+            else mix(it->second);
         }
     }
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
@@ -54,6 +92,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
         mix(address - it->first);
     }
+    if (readable != nullptr) *readable = contentsReadable;
     return key;
 }
 
