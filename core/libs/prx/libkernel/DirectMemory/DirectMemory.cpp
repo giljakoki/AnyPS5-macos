@@ -1,4 +1,5 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/DirectMemory/BackingFdTrap.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -314,6 +315,11 @@ public:
         }
 #elif defined(__APPLE__)
         // No memfd on macOS: an anonymous POSIX shared memory object, unlinked right away.
+        if (DirectMemoryTrap::Enabled()) {
+            file = DirectMemoryTrap::CreateBackingFile(bytes);
+            if (file < 0) throw std::system_error(errno, std::generic_category(), "create trapped direct memory backing");
+            return;
+        }
         static std::atomic<unsigned> sequence {0};
         char name[32];
         std::snprintf(name, sizeof(name), "/aps5-dm-%d-%u", static_cast<int>(::getpid()), sequence.fetch_add(1));
@@ -364,7 +370,11 @@ public:
 #ifdef _WIN32
         GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #else
-        if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
+        DirectMemoryTrap::CheckBackingFd(file, this, this->bytes);
+        if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) {
+            const int error = errno;
+            throw std::system_error(error, std::generic_category(), "map direct memory backing (fd " + std::to_string(file) + ", fd flags " + std::to_string(::fcntl(file, F_GETFD)) + ")");
+        }
 #endif
     }
 

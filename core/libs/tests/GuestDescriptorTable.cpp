@@ -15,6 +15,8 @@ int APS5_VABI sceKernelClose(int);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::int64_t APS5_VABI sceKernelLseek(int, std::int64_t, int);
 int APS5_VABI close_nid_postfix(int);
+int APS5_VABI dup_nid_postfix(int);
+int APS5_VABI dup2_nid_postfix(int, int);
 }
 
 static void Check(bool value, int line) {
@@ -56,6 +58,21 @@ int main() {
     Require(sceKernelClose(guest) == ErrorEbadf);
     Require(::fcntl(guest, F_GETFD) >= 0);
     Require(::fcntl(host, F_GETFD) >= 0);
+
+    // dup2 onto a host descriptor's number would close it underneath the host (the direct
+    // memory backing then fails to map with EBADF); dup of a host descriptor is not the guest's.
+    const int source = sceKernelOpen(file.c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(source >= 0);
+    Require(dup2_nid_postfix(source, host) == -1);
+    Require(::fcntl(host, F_GETFD) >= 0);
+    Require(::lseek(host, 0, SEEK_CUR) == 0);
+    Require(dup_nid_postfix(host) == -1);
+    Require(dup2_nid_postfix(host, source) == -1);
+    const int copy = dup_nid_postfix(source);
+    Require(copy >= 0);
+    Require(dup2_nid_postfix(source, copy) == copy);
+    Require(sceKernelClose(copy) == 0);
+    Require(sceKernelClose(source) == 0);
 
     // Guest descriptors stay clear of the low numbers host allocation uses.
     const int high = sceKernelOpen(file.c_str(), SCE_KERNEL_O_RDONLY, 0);

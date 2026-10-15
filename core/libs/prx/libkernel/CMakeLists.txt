@@ -18,6 +18,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/SyncOnAddress/src/SyncOnAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/Export.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/DirectMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/BackingFdTrap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/PosixMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/MemoryPool.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/MemoryPoolExport.cpp
@@ -1093,6 +1094,12 @@ if(BUILD_TESTING)
         target_include_directories(guest_descriptor_table_tests PRIVATE ${LIBS_INCLUDE_DIR})
         target_link_libraries(guest_descriptor_table_tests PRIVATE libkernel libc)
         add_test(NAME guest_descriptor_table COMMAND guest_descriptor_table_tests)
+        if(APPLE)
+            add_test_executable(backing_fd_trap_tests ${LIBS_INCLUDE_DIR}/tests/BackingFdTrap.cpp)
+            target_include_directories(backing_fd_trap_tests PRIVATE ${LIBS_INCLUDE_DIR})
+            target_link_libraries(backing_fd_trap_tests PRIVATE libkernel libc)
+            add_test(NAME backing_fd_trap COMMAND backing_fd_trap_tests)
+        endif()
     endif()
     if(WIN32)
         set_tests_properties(guest_file_vector PROPERTIES ENVIRONMENT_MODIFICATION

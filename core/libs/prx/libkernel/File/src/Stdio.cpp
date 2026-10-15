@@ -20,6 +20,7 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <cstring>
 #include <cstdarg>
@@ -502,7 +503,7 @@ int APS5_VABI _close_nid_postfix(int descriptor) {
 
 int APS5_VABI dup_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Duplicate(d);
-    if (d < 0) return PosixFailure(GUEST_EBADF);
+    if (d < 0 || File::GuestDescriptorRejected(d)) return PosixFailure(GUEST_EBADF);
 #ifdef _WIN32
     RejectDirectoryDuplicate(d, __func__);
     const int duplicate = WithoutParameterHandler([d] { return ::_dup(d); });
@@ -540,9 +541,16 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     if (sourceIsRandom) File::RememberRandomDevice(to);
     return to;
 #else
+    if (File::GuestDescriptorRejected(from)) return PosixFailure(GUEST_EBADF);
     if (from == to) {
         if (::fcntl(from, F_GETFL) < 0) return PosixFailure(GUEST_EBADF);
         return to;
+    }
+    // A host descriptor (direct memory backing, driver file) holds this number: dup2 would silently
+    // close it underneath the host. The guest cannot be given that number.
+    if (File::GuestDescriptorRejected(to) && ::fcntl(to, F_GETFD) >= 0) {
+        std::fprintf(stderr, "[file] dup2(%d, %d): target number belongs to a host descriptor; returning EBADF\n", from, to);
+        return PosixFailure(GUEST_EBADF);
     }
     const int result = ::dup2(from, to);
     if (result < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
