@@ -113,6 +113,8 @@ struct DrawEntryCounters {
 
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
+    // Draws without an entry whose key without user-data SGPRs an earlier draw had (APS5_PROFILE_DRAW).
+    std::uint64_t absentUserDataOnly = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace AgcDriver::DriverDetail {
 
@@ -136,6 +137,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
+        }
+        // APS5_PROFILE_DRAW: whether a draw without an entry differs from an earlier draw only in
+        // its user-data SGPRs (per-draw constant pointers), the churn a key over them cannot hit.
+        if (profile) {
+            static std::unordered_set<std::uint64_t> structures;
+            if (structures.size() > 65536) structures.clear();
+            const bool seen = !structures.insert(drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), false)).second;
+            if (seen && entry == nullptr) ++drawEntryCounters.absentUserDataOnly;
         }
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {

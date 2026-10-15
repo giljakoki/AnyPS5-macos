@@ -6,7 +6,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
@@ -14,6 +14,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         key *= 0x100000001b3ull;
     };
     const auto userEnd = [&](std::uint32_t base) {
+        if (!userWords) return base;
         if (allUserWords) return base + 32u;
         const auto resources = queue.shader.find(base - 1);
         if (resources == queue.shader.end()) return base;
