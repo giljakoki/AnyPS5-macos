@@ -100,13 +100,13 @@ class CapUnityVideoOutTest(unittest.TestCase):
             app0 = Path(directory)
             (app0 / "Media").mkdir()
             config = app0 / "Media" / "boot.config"
-            config.write_text("gfx-enable-gfx-jobs=1\nplatform-ps5-video-out-width=3840\nhdr-display-enabled=0\n", encoding="utf-8")
+            config.write_text("gfx-enable-gfx-jobs=1\nplatform-ps5-video-out-width=3840\nplatform-ps5-standardmode-video-out-width=2560\nhdr-display-enabled=0\n", encoding="utf-8")
             narrow = app0 / "Other_Data" / "boot.config"
             narrow.parent.mkdir()
             narrow.write_text("platform-ps5-video-out-width=1280\n", encoding="utf-8")
             changed = package_macos_app.cap_unity_video_out(app0, 1920)
             self.assertEqual(changed, [config])
-            self.assertEqual(config.read_text(encoding="utf-8"), "gfx-enable-gfx-jobs=1\nplatform-ps5-video-out-width=1920\nhdr-display-enabled=0\n")
+            self.assertEqual(config.read_text(encoding="utf-8"), "gfx-enable-gfx-jobs=1\nplatform-ps5-video-out-width=1920\nplatform-ps5-standardmode-video-out-width=1920\nhdr-display-enabled=0\n")
             self.assertEqual(narrow.read_text(encoding="utf-8"), "platform-ps5-video-out-width=1280\n")
             self.assertEqual(package_macos_app.cap_unity_video_out(app0, 0), [])
 
