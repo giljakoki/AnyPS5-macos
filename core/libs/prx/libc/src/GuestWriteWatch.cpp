@@ -460,6 +460,7 @@ public:
     }
 
     void Register(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
@@ -503,6 +504,7 @@ public:
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return false;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return false;
@@ -596,6 +598,7 @@ public:
     }
 
     void ProtectionChanged(std::uintptr_t begin, std::uintptr_t end, int protection) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
@@ -610,6 +613,7 @@ public:
     }
 
     void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
@@ -621,6 +625,7 @@ public:
     }
 
     void EndHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (!_available || end <= begin) return;
