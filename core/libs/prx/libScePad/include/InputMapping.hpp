@@ -8,12 +8,11 @@
 #include "SDL_mouse.h"
 
 #include "PadInputTypes.hpp"
+#include "PadState.hpp"
 
 namespace Pad {
 
-inline constexpr int MousePollIntervalMs = 33;
 inline constexpr int WheelPressDurationMs = 80;
-inline constexpr double MouseSensitivity = 1.0;
 
 inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_F11, MouseButton::None, InputControl::ToggleFullscreen},

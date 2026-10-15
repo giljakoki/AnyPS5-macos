@@ -113,8 +113,6 @@ void PadInput::setMouseMode(bool enabled) {
     int deltaY = 0;
     SDL_GetRelativeMouseState(&deltaX, &deltaY);
     mouseEnabled = enabled;
-    mouseStick = {128, 128};
-    nextMousePoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(Pad::MousePollIntervalMs);
 }
 
 PadInputState PadInput::sampleController() const {
@@ -288,19 +286,10 @@ void PadInput::Update() {
         publish();
         return;
     }
-    if (now < nextMousePoll) return;
-    nextMousePoll = now + std::chrono::milliseconds(Pad::MousePollIntervalMs);
     int deltaX = 0;
     int deltaY = 0;
     SDL_GetRelativeMouseState(&deltaX, &deltaY);
-    mouseStick = {128, 128};
-    if (deltaX != 0 || deltaY != 0) {
-        const double distance = std::hypot(deltaX, deltaY);
-        const double scale = std::clamp(distance * Pad::MouseSensitivity + 16.0, 64.0, 128.0) / distance;
-        const auto mapAxis = [scale](int delta) { return static_cast<std::uint8_t>(std::clamp(128L + std::lround(delta * scale), 0L, 255L)); };
-        mouseStick = {mapAxis(deltaX), mapAxis(deltaY)};
-    }
-    publish();
+    if (deltaX != 0 || deltaY != 0) PadAddMouseMotion_nid_postfix(deltaX, deltaY);
 }
 
 void PadInput::publish() {
@@ -342,10 +331,6 @@ void PadInput::publish() {
     }
     for (std::size_t axis = 0; axis < state.sticks.size(); ++axis) {
         if (negative[axis] || positive[axis]) state.sticks[axis] = negative[axis] == positive[axis] ? 128 : negative[axis] ? 0 : 255;
-    }
-    if (mouseEnabled) {
-        state.sticks[2] = mouseStick[0];
-        state.sticks[3] = mouseStick[1];
     }
     if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
     if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
