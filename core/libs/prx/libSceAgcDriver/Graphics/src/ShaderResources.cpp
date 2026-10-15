@@ -2274,7 +2274,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto [waits, waitNs] = StorageTexture::PresentCompareWaits();
     const auto waitsSince = waits - std::exchange(profile.reportedWaits[0], waits);
     const auto waitMs = static_cast<double>(waitNs - std::exchange(profile.reportedWaits[1], waitNs)) / 1e6;
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate split (10 s): %.1f ms in total, full walks %.1f ms (by lookup outcome, ms:%s), imported regions and staging %.1f ms; untracked elements proved by their image's proof %llu (cumulative); present compares waited for %llu in %.1f ms (any caller)\n", allMs, fullMs, kinds.c_str(), importMs, static_cast<unsigned long long>(profile.imageProofs.load()), static_cast<unsigned long long>(waitsSince), waitMs);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate split (10 s): %.1f ms in total, full walks %.1f ms (by lookup outcome, ms:%s), imported regions and staging %.1f ms; untracked elements proved by their image's proof %llu (cumulative); present compares waited for %llu in %.1f ms (any caller); cumulative: present compares run by the caller %llu, pending-write refreshes uploaded on the GPU %llu\n", allMs, fullMs, kinds.c_str(), importMs, static_cast<unsigned long long>(profile.imageProofs.load()), static_cast<unsigned long long>(waitsSince), waitMs, static_cast<unsigned long long>(StorageTexture::CompareShortcuts().first), static_cast<unsigned long long>(StorageTexture::CompareShortcuts().second));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region

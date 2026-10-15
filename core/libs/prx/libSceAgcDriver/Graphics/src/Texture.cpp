@@ -96,6 +96,8 @@ std::atomic<std::uint64_t> presentComparesStarted{0};
 std::atomic<std::uint64_t> presentComparesUsed{0};
 std::atomic<std::uint64_t> presentComparesWaited{0};
 std::atomic<std::uint64_t> presentCompareWaitNanoseconds{0};
+std::atomic<std::uint64_t> presentComparesStolen{0};
+std::atomic<std::uint64_t> pendingWriteDirectRefreshes{0};
 std::atomic<std::uint64_t> filledImagesStale{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
@@ -1665,6 +1667,7 @@ bool StorageTexture::Refresh() {
         return true;
     }
     refreshProof = {};
+    gpuWrittenCompare = false;
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -1747,7 +1750,11 @@ bool StorageTexture::Refresh() {
                 cpuBlocks[unit] = 0;
             }
             compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
-            if (compared) cpuBlocks = stampedBlocks;
+            // Blocks a pending GPU write marks written are no CPU store (compareUntracked).
+            if (compared) {
+                if (gpuWrittenCompare) cpuBlocks.assign(cpuBlocks.size(), 0);
+                else cpuBlocks = stampedBlocks;
+            }
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
@@ -1802,7 +1809,7 @@ bool StorageTexture::Refresh() {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
-        if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
+        if (!unchanged && !keysChanged && !pendingChanged && originalValid && !gpuWrittenCompare && equalsOriginal()) {
             unchanged = true;
             stamped = false;
         }
@@ -2069,6 +2076,16 @@ bool StorageTexture::takePresentCompare(std::uint64_t present, std::uint64_t for
         return false;
     }
     int state = job->state.load(std::memory_order_acquire);
+    // A job still queued (behind the other images' compares) is run here instead of waited for:
+    // the caller needs this one answer, not the queue's. APS5_NO_PRESENT_COMPARE_STEAL=1 waits.
+    static const bool steal = std::getenv("APS5_NO_PRESENT_COMPARE_STEAL") == nullptr;
+    if (steal && state == PresentCompare::Queued && job->state.compare_exchange_strong(state, PresentCompare::Running, std::memory_order_acq_rel)) {
+        presentComparesStolen.fetch_add(1, std::memory_order_relaxed);
+        job->equal = std::memcmp(job->guest, job->copy, job->bytes) == 0;
+        job->lease.clear();
+        state = PresentCompare::Done;
+        job->state.store(state, std::memory_order_release);
+    }
     if (state == PresentCompare::Queued || state == PresentCompare::Running) {
         presentComparesWaited.fetch_add(1, std::memory_order_relaxed);
         const auto waitStart = std::chrono::steady_clock::now();
@@ -2215,6 +2232,10 @@ std::uint64_t StorageTexture::Uploads() {
 
 std::pair<std::uint64_t, std::uint64_t> StorageTexture::PresentCompareWaits() {
     return {presentComparesWaited.load(std::memory_order_relaxed), presentCompareWaitNanoseconds.load(std::memory_order_relaxed)};
+}
+
+std::pair<std::uint64_t, std::uint64_t> StorageTexture::CompareShortcuts() {
+    return {presentComparesStolen.load(std::memory_order_relaxed), pendingWriteDirectRefreshes.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
@@ -2412,6 +2433,22 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         untrackedProofHits.fetch_add(1, std::memory_order_relaxed);
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
+    }
+    // A GPU write still pending over a whole host-imported surface (another image's write-back, a
+    // copy-back of staged buffer memory) changes this memory on the GPU: the compare would submit
+    // and wait for the whole open batch only to find it written. Every block is reported written
+    // instead, so Refresh uploads it on the GPU from the import, recorded behind that write
+    // (StorageTexture::upload's direct path). APS5_NO_PENDING_WRITE_DIRECT_REFRESH=1 waits.
+    static const bool directRefresh = std::getenv("APS5_NO_PENDING_WRITE_DIRECT_REFRESH") == nullptr;
+    if (directRefresh && whole && !inFlight && uploadedKeys == DccKeys::Uncompressed && descriptor.dccAddress == 0) {
+        auto* active = Recorder::Active();
+        if (active != nullptr && active->PendingWriteOverlaps(address, bytes) && HostImportFor(context, address, bytes) != nullptr) {
+            pendingWriteDirectRefreshes.fetch_add(1, std::memory_order_relaxed);
+            gpuWrittenCompare = true;
+            originalChanged();
+            std::fill(changed.begin(), changed.end(), GuestMemory::BlockWritten);
+            return true;
+        }
     }
     untrackedCompares.fetch_add(1, std::memory_order_relaxed);
     if (!inFlight) {
