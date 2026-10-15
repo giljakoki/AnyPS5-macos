@@ -280,6 +280,7 @@ struct VulkanDevice::State {
     bool sampleRateShading = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
+    bool relaxedFloat = false;
     bool float64DenormPreserve = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
@@ -1123,6 +1124,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &clockFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->shaderClock = clockFeatures.shaderSubgroupClock == VK_TRUE && clockFeatures.shaderDeviceClock == VK_TRUE;
+    }
+    if (hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+        // MoltenVK turns every NoContraction float op into an optnone helper call, which is very slow
+        // on Apple GPUs. APS5_EXACT_FLOAT=1 keeps the exact decoration.
+        VkPhysicalDeviceDriverProperties floatDriver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 floatProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &floatDriver};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &floatProperties);
+        const char* exact = std::getenv("APS5_EXACT_FLOAT");
+        state->relaxedFloat = floatDriver.driverID == VK_DRIVER_ID_MOLTENVK && !(exact != nullptr && std::string_view(exact) == "1");
+        APS5_LOG_OUT("Relaxed float driver=%d relaxedFloat=%d", static_cast<int>(floatDriver.driverID), state->relaxedFloat ? 1 : 0);
     }
     if (state->shaderClock && hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
         VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
@@ -3067,6 +3078,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
+    target.relaxedFloat = state->relaxedFloat;
     target.float64DenormPreserve = state->float64DenormPreserve;
     static const bool float64AsFloat32 = [] {
         const char* value = std::getenv("APS5_F64_AS_F32");

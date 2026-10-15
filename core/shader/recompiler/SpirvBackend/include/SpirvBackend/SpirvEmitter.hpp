@@ -22,6 +22,7 @@ struct SpirvTargetOptions {
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool float64AsFloat32 = false;
+    bool relaxedFloat = false;
     bool stageSubgroups = true;
 };
 

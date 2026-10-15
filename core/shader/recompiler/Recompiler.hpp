@@ -231,6 +231,9 @@ struct SpirvTarget {
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
     bool float64AsFloat32 = false;
+    // Device-level: the driver compiles NoContraction float ops very slowly (MoltenVK). Applied to
+    // fragment and compute stages only; vertex-like stages stay exact for depth invariance.
+    bool relaxedFloat = false;
     std::uint32_t subgroupStages = 0xffffffffu;
 };
 
