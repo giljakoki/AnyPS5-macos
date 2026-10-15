@@ -95,6 +95,7 @@ std::atomic<std::uint64_t> untrackedRefreshesProved{0};
 std::atomic<std::uint64_t> presentComparesStarted{0};
 std::atomic<std::uint64_t> presentComparesUsed{0};
 std::atomic<std::uint64_t> presentComparesWaited{0};
+std::atomic<std::uint64_t> presentCompareWaitNanoseconds{0};
 std::atomic<std::uint64_t> filledImagesStale{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
@@ -2070,7 +2071,9 @@ bool StorageTexture::takePresentCompare(std::uint64_t present, std::uint64_t for
     int state = job->state.load(std::memory_order_acquire);
     if (state == PresentCompare::Queued || state == PresentCompare::Running) {
         presentComparesWaited.fetch_add(1, std::memory_order_relaxed);
+        const auto waitStart = std::chrono::steady_clock::now();
         while ((state = job->state.load(std::memory_order_acquire)) == PresentCompare::Queued || state == PresentCompare::Running) std::this_thread::yield();
+        presentCompareWaitNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
     }
     presentCompare.reset();
     if (state != PresentCompare::Done || !job->equal || job->guest != reinterpret_cast<const std::byte*>(descriptor.baseAddress) || job->copy != original.data() || job->bytes != original.size()) return false;
@@ -2153,7 +2156,15 @@ bool StorageTexture::untrackedRefreshProved() {
 }
 
 bool StorageTexture::ProvedUnchangedUntracked() {
-    if (!refreshProof.untracked || std::any_of(imageStale.begin(), imageStale.end(), [](bool stale) { return stale; }) || !untrackedRefreshProved()) return false;
+    if (!refreshProof.untracked || std::any_of(imageStale.begin(), imageStale.end(), [](bool stale) { return stale; })) return false;
+    // A present compare already finished for this present renews the image's proof without the
+    // refresh (what Refresh's compare would take first); one still running is left to the walk.
+    static const bool takeFinished = std::getenv("APS5_NO_PROOF_TAKES_PRESENT_COMPARE") == nullptr;
+    if (takeFinished && !untrackedProofHolds() && presentCompare != nullptr && pendingBaselines.empty() && originalValid) {
+        const int state = presentCompare->state.load(std::memory_order_acquire);
+        if (state != PresentCompare::Queued && state != PresentCompare::Running) takePresentCompare(Recorder::Presents(), GuestMemory::ForgetSerial());
+    }
+    if (!untrackedRefreshProved()) return false;
     NoteProved();
     refreshesProved.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -2200,6 +2211,10 @@ void StorageTexture::takeRefreshProof(bool aliased) {
 
 std::uint64_t StorageTexture::Uploads() {
     return storageUploads.load(std::memory_order_relaxed);
+}
+
+std::pair<std::uint64_t, std::uint64_t> StorageTexture::PresentCompareWaits() {
+    return {presentComparesWaited.load(std::memory_order_relaxed), presentCompareWaitNanoseconds.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {

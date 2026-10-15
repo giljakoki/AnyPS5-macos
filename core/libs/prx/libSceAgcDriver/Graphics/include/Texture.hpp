@@ -339,6 +339,8 @@ public:
     bool ProvedUnchangedUntracked();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
+    // Present compares a refresh or proof waited for (count, nanoseconds; cumulative).
+    static std::pair<std::uint64_t, std::uint64_t> PresentCompareWaits();
     static std::uint64_t Uploads();
     struct PresentCompare;
     static void StartPresentCompares();

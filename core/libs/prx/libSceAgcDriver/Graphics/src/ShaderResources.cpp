@@ -2155,6 +2155,9 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> fullWalkNanoseconds{0};
     std::atomic<std::uint64_t> importNanoseconds{0};
     std::atomic<std::uint64_t> reportedNanoseconds[3]{};
+    std::array<std::atomic<std::uint64_t>, LookupOutcomes::Count> walkKindNanoseconds{};
+    std::array<std::uint64_t, LookupOutcomes::Count> reportedWalkKinds{};
+    std::uint64_t reportedWaits[2]{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -2252,7 +2255,26 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     // untracked elements proved by their image's own proof (UntrackedImageProof).
     const auto since = [&](std::size_t slot, const std::atomic<std::uint64_t>& total) { const auto now = total.load(std::memory_order_relaxed); return static_cast<double>(now - profile.reportedNanoseconds[slot].exchange(now, std::memory_order_relaxed)) / 1e6; };
     const double allMs = since(0, profile.nanoseconds), fullMs = since(1, profile.fullWalkNanoseconds), importMs = since(2, profile.importNanoseconds);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate split (10 s): %.1f ms in total, full walks %.1f ms, imported regions and staging %.1f ms; untracked elements proved by their image's proof %llu (cumulative)\n", allMs, fullMs, importMs, static_cast<unsigned long long>(profile.imageProofs.load()));
+    std::string kinds;
+    double attributedMs = 0;
+    for (std::size_t kind = 0; kind < LookupOutcomes::Count; ++kind) {
+        const auto now = profile.walkKindNanoseconds[kind].load(std::memory_order_relaxed);
+        const auto delta = now - std::exchange(profile.reportedWalkKinds[kind], now);
+        attributedMs += static_cast<double>(delta) / 1e6;
+        if (delta < 1000000) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %.1f", LookupOutcomes::Name(static_cast<LookupOutcomes::Kind>(kind)), static_cast<double>(delta) / 1e6);
+        kinds += text;
+    }
+    {
+        char text[64];
+        std::snprintf(text, sizeof(text), " unattributed %.1f", fullMs - attributedMs);
+        kinds += text;
+    }
+    const auto [waits, waitNs] = StorageTexture::PresentCompareWaits();
+    const auto waitsSince = waits - std::exchange(profile.reportedWaits[0], waits);
+    const auto waitMs = static_cast<double>(waitNs - std::exchange(profile.reportedWaits[1], waitNs)) / 1e6;
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate split (10 s): %.1f ms in total, full walks %.1f ms (by lookup outcome, ms:%s), imported regions and staging %.1f ms; untracked elements proved by their image's proof %llu (cumulative); present compares waited for %llu in %.1f ms (any caller)\n", allMs, fullMs, kinds.c_str(), importMs, static_cast<unsigned long long>(profile.imageProofs.load()), static_cast<unsigned long long>(waitsSince), waitMs);
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -2713,7 +2735,15 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!fast) {
         countFullWalk(reason);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        std::array<double, LookupOutcomes::Count> kindsBefore{};
+        if (profile) kindsBefore = ThreadLookupOutcomes().ms;
         const bool walked = fullWalk();
+        if (profile) {
+            const auto& after = ThreadLookupOutcomes().ms;
+            for (std::size_t kind = 0; kind < LookupOutcomes::Count; ++kind) {
+                if (after[kind] > kindsBefore[kind]) Revalidations().walkKindNanoseconds[kind].fetch_add(static_cast<std::uint64_t>((after[kind] - kindsBefore[kind]) * 1e6), std::memory_order_relaxed);
+            }
+        }
         if (profile) Revalidations().fullWalkNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
         if (!walked) {
             const auto failure = [&] {
