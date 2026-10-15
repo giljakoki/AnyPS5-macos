@@ -119,7 +119,7 @@ struct DepthFeatures {
     bool depthBounds = false;
     bool invertedBounds = false;
 };
-enum class HostDepthPath : std::uint8_t { Native, Unobserved };
+enum class HostDepthPath : std::uint8_t { Native, Unobserved, ClampedZeroToOne };
 struct HostDepth {
     HostDepthPath path = HostDepthPath::Native;
     float minDepth = 0.0f;
