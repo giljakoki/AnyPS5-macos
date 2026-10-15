@@ -20,6 +20,9 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1381,13 +1384,167 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+namespace {
+
+bool passProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
+    return profiled;
+}
+
+enum class PassEnd : std::uint8_t { Command, TargetChanged, Hazard, Forced, DeferredClear, DeferredFill, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(PassEnd::Count)> PassEndNames{"other command", "another target or state", "hazard", "forced", "deferred clear", "deferred fill"};
+// The [passes] line's split of target changes (by the open pass's and the next draw's color key
+// and depth attachment) and of hazards (by kind, and whether the next draw had the same target).
+enum class TargetChange : std::uint8_t { DepthToggled, SameColors, OtherColors, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(TargetChange::Count)> TargetChangeNames{"depth attachment toggled", "same colors otherwise", "other colors"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetChange::Count)> targetChanges{};
+constexpr std::array<const char*, 7> PassHazardNames{"none", "raw", "waw", "war", "image", "unknown read", "unknown write"};
+std::array<std::atomic<std::uint64_t>, 7> hazardsSameTarget{}, hazardsOtherTarget{};
+std::atomic<std::uint64_t> fillsDeferred{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PassEnd::Count)> passEnds{};
+std::atomic<std::uint64_t> passesBegun{0};
+std::atomic<std::uint64_t> clearsDeferred{0};
+std::atomic<std::uint64_t> clearsReplaced{0};
+std::atomic<std::uint64_t> clearsLoaded{0};
+std::atomic<std::uint64_t> clearsRecorded{0};
+using CallerCounts = std::unordered_map<std::uint64_t, std::uint64_t>;
+std::mutex callersMutex;
+CallerCounts passBreakers;
+CallerCounts clearRecorders;
+
+void noteCaller(CallerCounts& counts, const void* caller, const void* outer) {
+    const auto offset = [](const void* address) -> std::uint64_t {
+        Dl_info info{};
+        if (address == nullptr || dladdr(address, &info) == 0 || info.dli_fbase == nullptr) return reinterpret_cast<std::uintptr_t>(address) & 0xffffffffull;
+        return (reinterpret_cast<std::uintptr_t>(address) - reinterpret_cast<std::uintptr_t>(info.dli_fbase)) & 0xffffffffull;
+    };
+    std::lock_guard lock(callersMutex);
+    ++counts[offset(caller) | (offset(outer) << 32u)];
+}
+
+void notePassEnd(PassEnd why, const void* caller = nullptr, const void* outer = nullptr) {
+    if (!passProfiled()) return;
+    passEnds[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+    if (caller != nullptr) noteCaller(passBreakers, caller, outer);
+}
+
+std::string topCallers(CallerCounts& counts) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> callers;
+    {
+        std::lock_guard lock(callersMutex);
+        callers.assign(counts.begin(), counts.end());
+        counts.clear();
+    }
+    std::sort(callers.begin(), callers.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string top;
+    for (std::size_t i = 0; i < callers.size() && i < 10; ++i) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " 0x%llx<0x%llx x%llu", static_cast<unsigned long long>(callers[i].first & 0xffffffffull), static_cast<unsigned long long>(callers[i].first >> 32u), static_cast<unsigned long long>(callers[i].second));
+        top += text;
+    }
+    return top;
+}
+
+void reportPassEnds() {
+    std::string line;
+    for (std::size_t i = 0; i < passEnds.size(); ++i) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 0 ? "" : ",", PassEndNames[i], static_cast<unsigned long long>(passEnds[i].exchange(0, std::memory_order_relaxed)));
+        line += text;
+    }
+    const auto breakers = topCallers(passBreakers);
+    AgcDriver::ProfilePrint_nid_no_patch("[passes] %llu render passes begun (10 s); ended by: %s; ending commands (offset of the caller<its caller in their modules):%s\n", static_cast<unsigned long long>(passesBegun.exchange(0, std::memory_order_relaxed)), line.c_str(), breakers.c_str());
+    std::string changes, hazards;
+    for (std::size_t i = 0; i < targetChanges.size(); ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 0 ? "" : ",", TargetChangeNames[i], static_cast<unsigned long long>(targetChanges[i].exchange(0, std::memory_order_relaxed)));
+        changes += text;
+    }
+    for (std::size_t i = 1; i < PassHazardNames.size(); ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %s %llu/%llu", i == 1 ? "" : ",", PassHazardNames[i], static_cast<unsigned long long>(hazardsSameTarget[i].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(hazardsOtherTarget[i].exchange(0, std::memory_order_relaxed)));
+        hazards += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[passes] target changes (incl. those with a hazard):%s; hazards by kind, same target/another target:%s; %llu fills deferred past an open pass\n", changes.c_str(), hazards.c_str(), static_cast<unsigned long long>(fillsDeferred.exchange(0, std::memory_order_relaxed)));
+    const auto deferred = clearsDeferred.exchange(0, std::memory_order_relaxed);
+    if (deferred == 0) return;
+    const auto recorders = topCallers(clearRecorders);
+    AgcDriver::ProfilePrint_nid_no_patch("[passes] %llu clears deferred: %llu loaded by a pass, %llu replaced by a later clear, %llu recorded at another command (offset of the caller<its caller):%s\n", static_cast<unsigned long long>(deferred), static_cast<unsigned long long>(clearsLoaded.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(clearsReplaced.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(clearsRecorded.exchange(0, std::memory_order_relaxed)), recorders.c_str());
+}
+
+}
+
+bool Recorder::DeferredClearsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DEFERRED_CLEARS") == nullptr;
+    return enabled;
+}
+
+bool Recorder::DeferredDepthClearsEnabled() {
+    static const bool enabled = DeferredClearsEnabled() && std::getenv("APS5_NO_DEFERRED_DEPTH_CLEARS") == nullptr;
+    return enabled;
+}
+
+bool Recorder::PassesProfiled() {
+    return passProfiled();
+}
+
+bool Recorder::DeferredFillsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DEFERRED_FILLS") == nullptr;
+    return enabled;
+}
+
+void Recorder::DeferFill(DeferredFill fill) {
+    Require(open != nullptr && open->renderPass.open && fill.record, "a fill is deferred only past an open render pass");
+    if (passProfiled()) fillsDeferred.fetch_add(1, std::memory_order_relaxed);
+    open->deferredFills.push_back(std::move(fill));
+}
+
+bool Recorder::HasDeferredClear(VkImage image) const {
+    if (open == nullptr) return false;
+    return std::any_of(open->deferredClears.begin(), open->deferredClears.end(), [&](const DeferredClear& clear) { return clear.image == image; });
+}
+
+bool Recorder::DeferClear(DeferredClear clear) {
+    if (!DeferredClearsEnabled() || clear.image == VK_NULL_HANDLE || !clear.record) return false;
+    ensureOpen();
+    auto& clears = open->deferredClears;
+    const auto replaced = std::find_if(clears.begin(), clears.end(), [&](const DeferredClear& pending) { return pending.image == clear.image; });
+    // A depth clear of fewer aspects than the pending one does not replace it (the caller records
+    // it at once, after the pending one).
+    if (replaced != clears.end() && (replaced->aspects & ~clear.aspects) != 0) return false;
+    if (replaced != clears.end()) {
+        clears.erase(replaced);
+        clearsReplaced.fetch_add(1, std::memory_order_relaxed);
+    }
+    clears.push_back(std::move(clear));
+    clearsDeferred.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Recorder::flushDeferredClears() {
+    if (open == nullptr || open->deferredClears.empty()) return;
+    auto clears = std::move(open->deferredClears);
+    open->deferredClears.clear();
+    for (auto& clear : clears) {
+        clearsRecorded.fetch_add(1, std::memory_order_relaxed);
+        clear.record(Commands());
+    }
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
-    if (open->renderPass.open) endOpenRenderPass();
+    if (open->renderPass.open) {
+        notePassEnd(PassEnd::Command, __builtin_return_address(0), __builtin_return_address(1));
+        endOpenRenderPass();
+    }
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    if (!open->deferredClears.empty()) {
+        if (passProfiled()) noteCaller(clearRecorders, __builtin_return_address(0), __builtin_return_address(1));
+        flushDeferredClears();
+    }
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
@@ -1397,19 +1554,47 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
-Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::span<const ClearableAttachment> clearable, VkExtent2D extent) {
     ensureOpen();
     auto& pass = open->renderPass;
-    if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+    const bool clearsPending = !open->deferredClears.empty();
+    // A draw that may touch a deferred fill's range sees the fill: the pass ends (recording it).
+    const bool fillHazard = pass.open && !open->deferredFills.empty() && (access.anyReads || access.anyWrites || std::any_of(open->deferredFills.begin(), open->deferredFills.end(), [&](const DeferredFill& fill) {
+        const auto overlaps = [&](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < fill.end && fill.begin < range.second; }); };
+        return overlaps(access.reads) || overlaps(access.writes) || overlaps(access.inputReads);
+    }));
+    if (pass.open && passProfiled() && !forced && !clearsPending && !fillHazard && pass.key != key) {
+        const auto change = pass.colorKey != access.colorKey ? TargetChange::OtherColors : pass.depthAttached != access.depthAttached ? TargetChange::DepthToggled : TargetChange::SameColors;
+        targetChanges[static_cast<std::size_t>(change)].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!pass.open || forced || clearsPending || fillHazard || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        if (pass.open) notePassEnd(forced ? PassEnd::Forced : clearsPending ? PassEnd::DeferredClear : fillHazard ? PassEnd::DeferredFill : PassEnd::Forced);
+        if (passProfiled()) passesBegun.fetch_add(1, std::memory_order_relaxed);
+        if (pass.open) endOpenRenderPass();
+        std::vector<TakenClear> taken;
+        auto& clears = open->deferredClears;
+        for (const auto& candidate : clearable) {
+            const auto found = std::find_if(clears.begin(), clears.end(), [&](const DeferredClear& clear) {
+                const bool same = candidate.depthView != VK_NULL_HANDLE ? clear.aspects != 0 && clear.view == candidate.depthView : clear.aspects == 0 && clear.image == candidate.image;
+                return same && clear.format == candidate.format && clear.extent.width == extent.width && clear.extent.height == extent.height && candidate.baseLayer == 0 && candidate.layers == clear.layers;
+            });
+            if (found == clears.end()) continue;
+            taken.push_back({candidate.attachment, found->image, found->layers, found->value, found->aspects, found->depthStencil});
+            clears.erase(found);
+            clearsLoaded.fetch_add(1, std::memory_order_relaxed);
+        }
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
-        return {commands, false, true};
+        return {commands, false, true, std::move(taken)};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard != PassHazard::None && passProfiled()) (pass.key == key ? hazardsSameTarget : hazardsOtherTarget)[static_cast<std::size_t>(hazard)].fetch_add(1, std::memory_order_relaxed);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    notePassEnd(hazard != PassHazard::None ? PassEnd::Hazard : PassEnd::TargetChanged);
+    if (passProfiled()) passesBegun.fetch_add(1, std::memory_order_relaxed);
     endOpenRenderPass(!merge);
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
@@ -1417,15 +1602,23 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     return {commands, false, !elide};
 }
 
+void Recorder::TimePassTarget(std::uint64_t key) {
+    if (!GpuTimingEnabled() || open == nullptr || open->renderPass.open) return;
+    pendingTargetTiming = beginTiming(key);
+}
+
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
     if (!pass.open) {
         pass.timing = timing;
+        pass.targetTiming = std::exchange(pendingTargetTiming, NoTiming);
         pass.afterPass = std::move(afterPass);
     }
     pass.open = true;
     pass.key = key;
+    pass.colorKey = access.colorKey;
+    pass.depthAttached = access.depthAttached;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
 }
@@ -1441,7 +1634,15 @@ void Recorder::endOpenRenderPass(bool barrier) {
         CountBarriers(CommandClass::Draw);
     }
     if (pass.afterPass) pass.afterPass(open->commands);
+    EndGpuTiming(pass.targetTiming);
     EndGpuTiming(pass.timing);
+    // Fills asked for while the pass was open, after its draws (each with its own barriers; the
+    // pass's trailing barrier above still covers what is recorded after them).
+    if (!open->deferredFills.empty()) {
+        auto fills = std::move(open->deferredFills);
+        open->deferredFills.clear();
+        for (auto& fill : fills) fill.record(open->commands);
+    }
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
     pass = {};
@@ -1579,6 +1780,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     }
     // A label says the work before it is done: the queued key stores (results of that work) land
     // ahead of every store of the run.
+    if (!open->deferredClears.empty()) Commands();
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
     open->coveredAccess = 0;
@@ -1651,6 +1853,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         if (stores.empty()) return false;
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
+        flushDeferredClears();
         if (!open->keyStores.empty()) recordKeyStores(true);
         if (open->renderPass.open) endOpenRenderPass();
         const auto commands = open->commands;
@@ -1803,6 +2006,7 @@ void reportBarriers() {
         mergedLine += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    reportPassEnds();
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -3196,6 +3400,7 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    flushDeferredClears();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();

@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -14,6 +15,15 @@
 
 static constexpr std::uint32_t VIDEO_OUT_OUTPUT_OPTIONS_FIRST_WORD = 0x00FF0000;
 static constexpr std::size_t VIDEO_OUT_OUTPUT_OPTIONS_FREE_WORD = 3;
+
+// APS5_DISPLAY_1080P=1: titles are told the display is 1080p so they choose a 1080p output size.
+static bool display1080p() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DISPLAY_1080P");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 static int validateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) {
     if (!VideoOutDriver::Get().HasConfig(handle) || !VideoOutDriver::Get().IsOpen(handle)) return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -153,7 +163,7 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    status->resolution = (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
+    status->resolution = (!display1080p() && (cfg->width >= 3840 || cfg->height >= 2160)) ? 2u : 1u;
     status->dynamicRange = 1;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     status->flags = 0;
@@ -176,10 +186,11 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     *status = VideoOutResolutionStatus{};
-    status->fullWidth = cfg->width;
-    status->fullHeight = cfg->height;
-    status->paneWidth = cfg->width;
-    status->paneHeight = cfg->height;
+    const bool clamp = display1080p() && (cfg->width > 1920 || cfg->height > 1080);
+    status->fullWidth = clamp ? 1920 : cfg->width;
+    status->fullHeight = clamp ? 1080 : cfg->height;
+    status->paneWidth = status->fullWidth;
+    status->paneHeight = status->fullHeight;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     return 0;
 } catch (const ProcessShutdown&) {

@@ -391,8 +391,8 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 
 // APS5_PROFILE_DRAW: per-draw phase timers in microseconds (a recorded draw's phases are far below
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
-enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
-constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+enum DrawPhase : std::size_t { PhaseValidate, PhaseIndex, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
+constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "index", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -1155,6 +1155,39 @@ struct DrawInputs {
     std::vector<InPlaceBinding> inPlace;
 };
 
+// The highest index of an in-place (host-imported) index range, remembered per queue worker while
+// write tracking proves the range unchanged: Unity titles draw tens of thousands of sub-ranges of the
+// same index buffers per second, and scanning each one every draw dominated the draw's index phase.
+// APS5_NO_INDEX_MEMO=1 scans every draw.
+std::optional<std::uint32_t> memoizedHighestIndex(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t indexSize, bool skipRestart) {
+    static const bool enabled = std::getenv("APS5_NO_INDEX_MEMO") == nullptr;
+    if (!enabled) return HighestDrawIndex(bytes, indexSize, skipRestart);
+    struct Entry {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t registry = 0;
+        std::uint32_t indexSize = 0;
+        bool skipRestart = false;
+        std::optional<std::uint32_t> highest;
+    };
+    constexpr std::size_t Slots = 1024;
+    thread_local std::vector<Entry> entries(Slots);
+    // The range was flushed and checked for pending GPU writes by InPlaceDrawInput; collecting it
+    // stamps any CPU write since the last collect, so an equal generation proves equal bytes.
+    const auto generation = GuestMemory::CollectWrites(address, bytes.size());
+    if (generation == 0) return HighestDrawIndex(bytes, indexSize, skipRestart);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto& entry = entries[((address >> 1u) ^ (bytes.size() * 0x9e3779b97f4a7c15ull >> 40u)) % Slots];
+    if (entry.address == address && entry.bytes == bytes.size() && entry.indexSize == indexSize && entry.skipRestart == skipRestart && entry.registry == registry
+        && GuestMemory::UnchangedSince(address, bytes.size(), entry.generation)) {
+        return entry.highest;
+    }
+    const auto highest = HighestDrawIndex(bytes, indexSize, skipRestart);
+    entry = {address, bytes.size(), generation, registry, indexSize, skipRestart, highest};
+    return highest;
+}
+
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
     auto zero = std::make_shared<Buffer>(context, DecodeVertexFormat(attribute).bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
@@ -1239,8 +1272,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else if (recheckIndices) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
-        if (!copy.reused) {
-            const auto bytes = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+        if (import != nullptr) {
+            const std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes));
+            highest = memoizedHighestIndex(draw.indexAddress, bytes, draw.indexSize, skipRestart);
+        } else if (!copy.reused) {
+            const auto bytes = copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             highest = HighestDrawIndex(bytes, draw.indexSize, skipRestart);
             if (import == nullptr) KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
@@ -1270,6 +1306,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+    timer.phase(PhaseIndex);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
@@ -1978,9 +2015,33 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    // A fill deferred past the open pass is checked against the draw's in-place input reads too.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inputReads;
+    if (recorder->RenderPassOpen() && Recorder::DeferredFillsEnabled()) {
+        inputReads = resources.InPlaceReads();
+        inputReads.insert(inputReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+        passAccess.inputReads = inputReads;
+    }
+    if (Recorder::PassesProfiled()) {
+        const bool depthAttached = state.depth.has_value() && !record.targetViews.empty();
+        passAccess.colorKey = DrawRenderPassKey(context, state, depthAttached ? record.targetViews.first(record.targetViews.size() - 1) : record.targetViews);
+        passAccess.depthAttached = depthAttached;
+    }
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    std::vector<Recorder::ClearableAttachment> clearable;
+    if (recorder->HasDeferredClears() && record.proxies.empty() && state.samples == 1 && record.framebuffer != nullptr) {
+        for (std::size_t index = 0; index < state.colors.size() && index < record.targets.size(); ++index) {
+            const auto& target = record.targets[index];
+            const auto& color = state.colors[index];
+            if (target == nullptr || color.mip != 0 || color.depthSlice != 0 || record.framebuffer->Layers() != color.arraySliceCount || resources.ReadsImage(target.get())) continue;
+            clearable.push_back({static_cast<std::uint32_t>(index), target->Image(), color.format, target->Descriptor().baseArray + color.arraySlice, color.arraySliceCount});
+        }
+        // The depth attachment takes a deferred fast clear of its surface (DepthSurface.cpp) by its
+        // view; a draw that samples the surface had the clear recorded when it looked it up.
+        if (state.depth && record.framebuffer->Layers() == 1 && !record.targetViews.empty()) clearable.push_back({static_cast<std::uint32_t>(state.colors.size()), VK_NULL_HANDLE, state.depth->format, 0, 1, record.targetViews.back()});
+    }
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess, clearable, state.renderExtent);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -1990,6 +2051,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (!continued && drawTiming != Recorder::NoTiming && !record.targets.empty() && record.targets.front() != nullptr) {
+        const auto& target = record.targets.front()->Descriptor();
+        recorder->TimePassTarget(Recorder::TargetTimingKey(target.width, target.height, target.format));
+    }
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2018,9 +2083,24 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         if (start.barrier) {
             const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
-            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+            std::vector<VkImageMemoryBarrier> discards;
+            for (const auto& clear : start.clears) {
+                if (clear.aspects != 0) continue;
+                VkImageMemoryBarrier discard{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                discard.srcAccessMask = before.srcAccessMask;
+                discard.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                discard.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                discard.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                discard.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                discard.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                discard.image = clear.image;
+                discard.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, clear.layers};
+                discards.push_back(discard);
+            }
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, static_cast<std::uint32_t>(discards.size()), discards.empty() ? nullptr : discards.data());
             countBarrier(1);
         }
+        Require(start.barrier || start.clears.empty(), "a pass that loads a deferred clear began without its leading barrier");
         APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
@@ -2031,7 +2111,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        std::vector<Pipeline::AttachmentClear> clears;
+        for (const auto& clear : start.clears) clears.push_back({clear.attachment, clear.value, clear.aspects, clear.depthStencil});
+        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, clears);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {

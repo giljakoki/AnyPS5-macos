@@ -5885,6 +5885,239 @@ void denormalClearTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void deferredClearTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: deferred clears not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 64;
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the deferred clear block");
+    std::memset(block, 0x55, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the deferred clear block refused: deferred clears not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(ResolveTextureFormat(resource.format) == VK_FORMAT_R8G8B8A8_UNORM, "guest format 56 is not R8G8B8A8_UNORM");
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 21;
+    fragment.variantId = 22;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    state.viewport = {0, 0, static_cast<float>(side), static_cast<float>(side), 0, 1};
+    state.scissor = {{0, 0}, {side, side}};
+    state.renderExtent = {side, side};
+    ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        auto pipeline = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        const auto view = image->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0);
+        const std::array<std::shared_ptr<StorageTexture>, 1> owners{image};
+        auto framebuffer = pipeline->AcquireFramebuffer(std::span(&view, 1), owners, {side, side});
+        const auto holds = [&](std::uint32_t texel) {
+            Buffer readback(context, side * side * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {side, side, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto pixels = readback.Bytes();
+            for (std::size_t at = 0; at + 4 <= pixels.size(); at += 4) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, pixels.data() + at, 4);
+                if (value != texel) return false;
+            }
+            return true;
+        };
+        const auto fill = [&](std::uint32_t word) {
+            const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+            const char* refusal = nullptr;
+            const bool cleared = image->FillClear(pattern, StorageTexture::WholeImage, refusal);
+            Require(cleared, "a uniform RGBA8 fill clear was refused");
+        };
+        const std::array<Recorder::ClearableAttachment, 1> clearable{{{0, image->Image(), VK_FORMAT_R8G8B8A8_UNORM, 0, 1}}};
+        const std::array<Recorder::ClearableAttachment, 1> otherFormat{{{0, image->Image(), VK_FORMAT_R8G8B8A8_SRGB, 0, 1}}};
+        const auto pass = [&](std::uint64_t key, std::span<const Recorder::ClearableAttachment> candidates) {
+            auto start = recorder.StartDrawPass(key, false, false, PassAccess{}, candidates, {side, side});
+            if (!start.continued) {
+                std::vector<VkImageMemoryBarrier> discards;
+                std::vector<Pipeline::AttachmentClear> clears;
+                for (const auto& clear : start.clears) {
+                    VkImageMemoryBarrier discard{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    discard.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    discard.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    discard.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    discard.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    discard.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    discard.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    discard.image = clear.image;
+                    discard.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, clear.layers};
+                    discards.push_back(discard);
+                    clears.push_back({clear.attachment, clear.value});
+                }
+                const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(start.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, static_cast<std::uint32_t>(discards.size()), discards.empty() ? nullptr : discards.data());
+                pipeline->Begin(start.commands, *framebuffer, {side, side}, state, clears);
+            }
+            recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+            return start;
+        };
+        fill(0x11223344u);
+        if (!Recorder::DeferredClearsEnabled()) {
+            Require(!recorder.HasDeferredClears(), "a clear was deferred under APS5_NO_DEFERRED_CLEARS");
+            Require(holds(0x11223344u), "a fill clear recorded at once stored other texels");
+            std::cout << "deferred clears disabled (APS5_NO_DEFERRED_CLEARS): fill clears recorded at once\n";
+        } else {
+            Require(recorder.HasDeferredClears(), "a whole single-mip attachable fill clear was not deferred");
+            auto start = pass(0xc1ea, clearable);
+            Require(!start.continued && start.clears.size() == 1 && start.clears.front().attachment == 0 && !recorder.HasDeferredClears(), "a pass over the cleared image did not take its clear as the load");
+            Require(holds(0x11223344u), "a pass that loaded the clear left other texels");
+            fill(0x55667788u);
+            start = pass(0xc1ea, otherFormat);
+            Require(start.clears.empty() && !recorder.HasDeferredClears(), "a view of another format took the clear, or the clear was not recorded before its pass");
+            Require(holds(0x55667788u), "a clear recorded before a loading pass was lost");
+            fill(0x01020304u);
+            start = pass(0xc1ea, std::span<const Recorder::ClearableAttachment>{});
+            Require(start.clears.empty() && !recorder.HasDeferredClears(), "a pass without candidates took a clear");
+            Require(holds(0x01020304u), "a clear recorded before a pass without candidates was lost");
+            fill(0x0a0b0c0du);
+            fill(0x99aabbccu);
+            Require(recorder.HasDeferredClears(), "a second clear of the same image was not deferred");
+            Require(holds(0x99aabbccu), "the later of two deferred clears of one image did not win");
+            static_cast<void>(pass(0xc1eb, std::span<const Recorder::ClearableAttachment>{}));
+            fill(0x13579bdfu);
+            start = pass(0xc1eb, clearable);
+            Require(!start.continued && start.clears.size() == 1, "a draw after a deferred clear continued the open pass");
+            Require(holds(0x13579bdfu), "a clear deferred while a pass was open was lost");
+            fill(0x2468ace0u);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            Require(!recorder.HasDeferredClears() && holds(0x2468ace0u), "a deferred clear did not land at Submit");
+            if (Recorder::DeferredDepthClearsEnabled()) {
+                // A depth fast clear (HTILE) found pending when the surface is bound as an
+                // attachment waits for the pass that binds it, which takes it by the view.
+                constexpr std::uint64_t depthAddress = 0x7d0000000000ull;
+                constexpr std::uint64_t htile = 0x7d0001000000ull;
+                const DepthTarget depthTarget{depthAddress, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 0.5f, 0, htile};
+                const auto depthView = DepthSurfaceView(context, depthTarget);
+                const std::array<Recorder::ClearableAttachment, 1> depthCandidate{{{0, VK_NULL_HANDLE, VK_FORMAT_D32_SFLOAT, 0, 1, depthView}}};
+                NoteHtileDepthClear(htile);
+                Require(DepthSurfaceView(context, depthTarget) == depthView && recorder.HasDeferredClears(), "a pending depth fast clear was not deferred to the next pass");
+                auto depthStart = recorder.StartDrawPass(0xd0e1, false, true, PassAccess{}, depthCandidate, {side, side});
+                Require(!depthStart.continued && depthStart.clears.size() == 1 && depthStart.clears.front().aspects == VK_IMAGE_ASPECT_DEPTH_BIT && depthStart.clears.front().depthStencil.depth == 0.5f && !recorder.HasDeferredClears(), "a pass binding the depth surface did not take its fast clear as the load");
+                NoteHtileDepthClear(htile);
+                static_cast<void>(DepthSurfaceView(context, depthTarget));
+                depthStart = recorder.StartDrawPass(0xd0e2, false, true, PassAccess{}, depthCandidate, {side / 2, side / 2});
+                Require(depthStart.clears.empty() && !recorder.HasDeferredClears(), "a pass of another extent took the depth clear, or it was not recorded before the pass");
+                NoteHtileDepthClear(htile);
+                static_cast<void>(DepthSurfaceView(context, depthTarget));
+                static_cast<void>(recorder.Commands());
+                Require(!recorder.HasDeferredClears(), "another command did not record the deferred depth clear first");
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+                ClearDepthSurfaces(context.device);
+            }
+        }
+        {
+            // A fill deferred past an open pass: a draw that leaves its range alone continues the
+            // pass, one whose (input) reads overlap it ends the pass and the fill lands first.
+            Buffer filled(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            std::memset(filled.Bytes().data(), 0, 256);
+            int recorded = 0;
+            const auto deferFill = [&](std::uint32_t word) {
+                recorder.DeferFill({0x1000, 0x1100, [&, word](VkCommandBuffer commands) {
+                    ++recorded;
+                    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, filled.Handle(), 0, 256, word);
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                }});
+            };
+            const auto draw = [&](const PassAccess& access) {
+                auto start = recorder.StartDrawPass(0xf111, false, false, access, {}, {side, side});
+                if (!start.continued) pipeline->Begin(start.commands, *framebuffer, {side, side}, state, {});
+                recorder.LeaveRenderPassOpen(0xf111, Recorder::NoTiming, false, access);
+                return start.continued;
+            };
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> apart{{{0x2000, 0x2100}}};
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> inside{{{0x1080, 0x1090}}};
+            static_cast<void>(draw(PassAccess{}));
+            Require(recorder.RenderPassOpen(), "a draw left no pass open");
+            deferFill(0xabababab);
+            Require(draw(PassAccess{apart}) && recorded == 0, "a draw apart from a deferred fill did not continue the pass, or the fill was recorded");
+            PassAccess input{};
+            input.inputReads = inside;
+            Require(!draw(input) && recorded == 1, "a draw reading a deferred fill's range in place continued the pass before the fill");
+            deferFill(0xcdcdcdcd);
+            PassAccess unknown{};
+            unknown.anyReads = true;
+            Require(!draw(unknown) && recorded == 2, "a draw of unknown reads continued the pass past a deferred fill");
+            deferFill(0x12121212);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            std::uint32_t word = 0;
+            std::memcpy(&word, filled.Bytes().data() + 128, 4);
+            Require(recorded == 3 && word == 0x12121212u, "a deferred fill did not land at Submit");
+        }
+    }
+    ClearCachedTextures(context.device);
+    ClearCachedPipelines(context.device);
+    recorder.Sync();
+    std::cout << "Deferred clear tests passed\n";
+}
+
 void pipelineLibraryTests(const Device& device) {
     std::lock_guard gpu(GpuMutex());
     const auto& context = device.GetContext();
@@ -6308,6 +6541,7 @@ int main(int argc, char** argv) {
         viewPastLastMipTests(device, recorder);
         keysFillTests(device, recorder);
         denormalClearTests(device, recorder);
+        deferredClearTests(device, recorder);
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);

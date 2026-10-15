@@ -105,12 +105,64 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    struct DeferredClear {
+        VkImage image = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkExtent2D extent{};
+        std::uint32_t layers = 0;
+        VkClearColorValue value{};
+        std::function<void(VkCommandBuffer)> record;
+        // A depth/stencil clear (DepthSurface.cpp): the aspects it clears, its values and the
+        // attachment view a pass loads it through; color clears leave `aspects` 0.
+        VkImageAspectFlags aspects = 0;
+        VkClearDepthStencilValue depthStencil{};
+        VkImageView view = VK_NULL_HANDLE;
+    };
+    static bool DeferredClearsEnabled();
+    // APS5_NO_DEFERRED_DEPTH_CLEARS=1 records every depth/stencil fast clear at once.
+    static bool DeferredDepthClearsEnabled();
+    bool DeferClear(DeferredClear clear);
+    bool HasDeferredClears() const { return open != nullptr && !open->deferredClears.empty(); }
+    bool HasDeferredClear(VkImage image) const;
+    // A buffer fill (VulkanDevice::FillBuffer) asked for while a draw's render pass is open is
+    // recorded when the pass ends instead of ending it: the draws recorded before it precede it
+    // either way, and a later draw whose access may touch [begin, end) ends the pass first
+    // (StartDrawPass). `record` records the fill with its own leading and trailing barriers.
+    // APS5_NO_DEFERRED_FILLS=1 records every fill at once (ending the pass).
+    struct DeferredFill {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::function<void(VkCommandBuffer)> record;
+    };
+    static bool DeferredFillsEnabled();
+    // APS5_PROFILE_DRAW or APS5_PROFILE_GPU: the [passes] lines are collected.
+    static bool PassesProfiled();
+    bool RenderPassOpen() const { return open != nullptr && open->renderPass.open; }
+    void DeferFill(DeferredFill fill);
+    struct ClearableAttachment {
+        std::uint32_t attachment = 0;
+        VkImage image = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        std::uint32_t baseLayer = 0;
+        std::uint32_t layers = 0;
+        // The depth/stencil attachment, matched by its view.
+        VkImageView depthView = VK_NULL_HANDLE;
+    };
+    struct TakenClear {
+        std::uint32_t attachment = 0;
+        VkImage image = VK_NULL_HANDLE;
+        std::uint32_t layers = 0;
+        VkClearColorValue value{};
+        VkImageAspectFlags aspects = 0;
+        VkClearDepthStencilValue depthStencil{};
+    };
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
         bool barrier = true;
+        std::vector<TakenClear> clears;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::span<const ClearableAttachment> clearable = {}, VkExtent2D extent = {});
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -513,6 +565,8 @@ public:
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, SurfaceHash, SnapshotRefresh, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    static constexpr std::uint64_t TargetTimingKey(std::uint32_t width, std::uint32_t height, std::uint32_t format) { return 0xd000000000000000ull | (static_cast<std::uint64_t>(format & 0xfffu) << 40u) | (static_cast<std::uint64_t>(width & 0xfffffu) << 20u) | (height & 0xfffffu); }
+    void TimePassTarget(std::uint64_t key);
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
@@ -680,10 +734,17 @@ private:
             bool open = false;
             bool fenced = false;
             std::uint64_t key = 0;
+            // For the [passes] profile: the key of the color attachments alone and whether the
+            // pass has a depth attachment (PassAccess::colorKey, depthAttached).
+            std::uint64_t colorKey = 0;
+            bool depthAttached = false;
             std::uint32_t timing = NoTiming;
+            std::uint32_t targetTiming = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         PassHazards passHazards;
+        std::vector<DeferredClear> deferredClears;
+        std::vector<DeferredFill> deferredFills;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -788,6 +849,7 @@ private:
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass(bool barrier = true);
+    void flushDeferredClears();
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
@@ -853,6 +915,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     std::uint64_t submissions = 0;
+    std::uint32_t pendingTargetTiming = NoTiming;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per

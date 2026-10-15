@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <thread>
@@ -97,7 +98,15 @@ int main() {
             return false;
         };
 
+        const auto submitted = std::chrono::steady_clock::now();
         Store(texels);
+        // The store waits for the queues to stay idle for APS5_IDLE_STORE_DELAY_MS (100 ms by
+        // default): a frame's next batch then draws on without a write-back in between.
+        if (std::getenv("APS5_NO_IDLE_STORE_DELAY") == nullptr && std::getenv("APS5_IDLE_STORE_DELAY_MS") == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const bool early = stored();
+            if (std::chrono::steady_clock::now() - submitted < std::chrono::milliseconds(90)) Require(!early, "the queue-idle store did not wait for the queues to stay idle");
+        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (!stored() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         Require(stored(), "the queue-idle store did not bring the result to guest memory without a direct flush or further submission");
