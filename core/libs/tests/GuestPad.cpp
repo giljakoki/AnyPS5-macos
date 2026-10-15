@@ -101,6 +101,23 @@ static void CheckTouchContact() {
     Pad::ReadState();
 }
 
+static void CheckMouseLook() {
+    Pad::ReadState();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    PadAddMouseMotion_nid_postfix(10, -10);
+    PadAddMouseMotion_nid_postfix(10, 0);
+    const auto moved = Pad::ReadState();
+    Require(moved.right_stick_x > 128 && moved.right_stick_y < 128);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto idle = Pad::ReadState();
+    Require(idle.right_stick_x == 128 && idle.right_stick_y == 128);
+    // The same travel read after a longer interval is a gentler deflection, not a lost one.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    PadAddMouseMotion_nid_postfix(4, 0);
+    const auto slow = Pad::ReadState();
+    Require(slow.right_stick_x > 128 && slow.right_stick_x <= 128 + 64);
+}
+
 static void CheckReadQueue(int handle) {
     PadData drained[64]{};
     scePadRead_nid_postfix(handle, drained, 64);
@@ -276,6 +293,7 @@ int main() {
     Require(scePadGetHandle(user, 0, 0) == handle);
     CheckTiltCorrection(handle);
     CheckTouchContact();
+    CheckMouseLook();
     CheckReadQueue(handle);
     CheckReadStateHandle(handle);
     CheckButtonSteps(handle);

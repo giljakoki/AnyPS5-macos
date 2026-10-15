@@ -49,6 +49,9 @@ struct PadOutputState {
 };
 
 namespace Pad {
+// Mouse look: the stick deflection is the one a 33 ms poll of the same speed gave.
+inline constexpr int MousePollIntervalMs = 33;
+inline constexpr double MouseSensitivity = 1.0;
 void Initialize();
 PadData ReadState();
 int Read(PadData* data, int num);
@@ -62,6 +65,8 @@ void SetTiltCorrection(bool enabled);
 }
 
 extern "C" void PadPublishInput_nid_postfix(const PadInputState& input);
+// Relative mouse motion since the last call; the title's next pad read turns it into a right-stick deflection.
+extern "C" void PadAddMouseMotion_nid_postfix(int dx, int dy);
 extern "C" void PadReportInputFailure_nid_postfix(std::exception_ptr error);
 extern "C" bool PadFetchOutput_nid_postfix(std::uint32_t* seenSequence, PadOutputState* out);
 

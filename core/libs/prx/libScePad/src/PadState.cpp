@@ -40,6 +40,36 @@ namespace {
     std::uint32_t shownButtons = 0;
     std::uint64_t stepShownAt = 0;
 
+    // Relative mouse motion (counts) the window saw since the last title read. A title reads the
+    // pad once per frame (5-12 fps in a heavy one), so a deflection that only lasted one mouse poll
+    // was mostly never seen. The read turns the motion into the deflection the old 33 ms poll would
+    // have produced for the same speed, held for the whole interval since the previous read.
+    int pendingMouseX = 0;
+    int pendingMouseY = 0;
+    std::uint64_t lastMouseReadAt = 0;
+    std::array<std::uint8_t, 2> lastMouseStick{128, 128};
+    bool mouseStickShown = false;
+
+    void ApplyMouse(PadInputState& shown, std::uint64_t now) {
+        if (pendingMouseX == 0 && pendingMouseY == 0) {
+            if (mouseStickShown && now - lastMouseReadAt < LatchWindowMicros) { shown.sticks[2] = lastMouseStick[0]; shown.sticks[3] = lastMouseStick[1]; }
+            else { mouseStickShown = false; lastMouseReadAt = now; }
+            return;
+        }
+        const double elapsedMs = std::clamp(static_cast<double>(now - lastMouseReadAt) / 1000.0, 8.0, 500.0);
+        const double perPoll = Pad::MousePollIntervalMs / elapsedMs;
+        const double dx = pendingMouseX * perPoll, dy = pendingMouseY * perPoll;
+        const double distance = std::hypot(dx, dy);
+        const double scale = std::clamp(distance * Pad::MouseSensitivity + 16.0, 64.0, 128.0) / distance;
+        const auto map = [scale](double delta) { return static_cast<std::uint8_t>(std::clamp(128L + std::lround(delta * scale), 0L, 255L)); };
+        lastMouseStick = {map(dx), map(dy)};
+        pendingMouseX = pendingMouseY = 0;
+        lastMouseReadAt = now;
+        mouseStickShown = true;
+        shown.sticks[2] = lastMouseStick[0];
+        shown.sticks[3] = lastMouseStick[1];
+    }
+
     // APS5_TRACE_PAD=1 logs every published button or left-stick change and the first read that
     // reports it, with the delay between them and the number of reads in between.
     std::uint32_t tracedButtons = 0;
@@ -286,13 +316,15 @@ PadData Pad::ReadState() {
     if (!initialized) throw std::runtime_error("Pad: read before initialization");
     const std::uint64_t now = sceKernelGetProcessTime();
     const std::uint32_t injected = InjectedButtons(now);
+    PadInputState live = state;
+    ApplyMouse(live, now);
     if (!LatchEnabled()) {
-        const auto data = BuildData(state, timestamp, now, injected);
+        const auto data = BuildData(live, timestamp, now, injected);
         TraceRead(data, now, 0);
         return data;
     }
     const auto waiting = buttonSteps.size();
-    PadInputState shown = state;
+    PadInputState shown = live;
     shown.buttons = TakeButtonStep(now);
     if ((state.buttons & ~shown.buttons & 0x100u) != 0) shown.analogButtonsL2 = 0;
     if ((state.buttons & ~shown.buttons & 0x200u) != 0) shown.analogButtonsR2 = 0;
@@ -313,7 +345,9 @@ int Pad::Read(PadData* data, int num) {
     stepShownAt = 0;
     shownButtons = state.buttons;
     if (queue.empty()) {
-        data[0] = BuildData(state, timestamp, now, injected);
+        PadInputState live = state;
+        ApplyMouse(live, now);
+        data[0] = BuildData(live, timestamp, now, injected);
         return 1;
     }
     int count = 0;
@@ -429,6 +463,12 @@ void Pad::SetMotionEnabled(bool enabled) {
     if (output.motionEnabled == enabled) return;
     output.motionEnabled = enabled;
     ++output.sequence;
+}
+
+extern "C" void PadAddMouseMotion_nid_postfix(int dx, int dy) {
+    std::lock_guard lock(stateMutex);
+    pendingMouseX += dx;
+    pendingMouseY += dy;
 }
 
 extern "C" void PadPublishInput_nid_postfix(const PadInputState& input) {
