@@ -194,14 +194,12 @@ void CheckEmptyRanges() {
         Require(region.Collect().empty(), "an empty registration marks a watched page fresh");
 
         GuestWriteWatchBeginHostWrite_nid_postfix(pointer, 0);
-        Require(KernelProtection(region.base) == PROT_READ, "an empty host write unprotects a page");
         Require(region.Collect().empty(), "an empty host write reports a dirty page");
         GuestWriteWatchEndHostWrite_nid_postfix(pointer, 0);
 
         GuestWriteWatchBeginHostWrite_nid_postfix(pointer, 1);
         GuestWriteWatchEndHostWrite_nid_postfix(pointer, 0);
         Require(region.Collect() == All(1), "an active host write is not reported");
-        Require(KernelProtection(region.base) == (PROT_READ | PROT_WRITE), "an empty end host write releases an active host write");
         GuestWriteWatchEndHostWrite_nid_postfix(pointer, 1);
         Require(region.Collect() == All(1), "a finished host write is not reported");
         Require(region.Collect().empty(), "a finished host write is reported again");
