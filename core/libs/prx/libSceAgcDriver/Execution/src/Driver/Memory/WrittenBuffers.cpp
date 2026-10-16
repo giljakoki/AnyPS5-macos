@@ -7,6 +7,7 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
@@ -63,7 +64,7 @@ void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, s
 }
 
 bool ExactDrawWrites() {
-    static const bool exact = std::getenv("APS5_EXACT_DRAW_WRITES") != nullptr;
+    static const bool exact = [] { const char* text = std::getenv("APS5_EXACT_DRAW_WRITES"); return text == nullptr || std::strcmp(text, "0") != 0; }();
     return exact;
 }
 
