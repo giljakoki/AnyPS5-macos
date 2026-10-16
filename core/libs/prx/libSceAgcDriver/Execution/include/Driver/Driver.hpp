@@ -132,7 +132,8 @@ private:
     // `userWords` false leaves every user-data SGPR out (APS5_PROFILE_DRAW's key churn statistics).
     // `relocation` keys its pointer words by the contents behind them and its free words not at all
     // (the alias key); `readable` turns false when such contents are not mapped.
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords = true, const DrawRelocation* relocation = nullptr, bool* readable = nullptr);
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords = true, const DrawRelocation* relocation = nullptr, bool* readable = nullptr, std::array<std::uint64_t, 5>* components = nullptr);
+    void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);

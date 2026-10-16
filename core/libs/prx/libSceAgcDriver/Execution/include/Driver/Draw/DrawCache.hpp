@@ -123,6 +123,9 @@ struct DrawEntryCounters {
     double keyUs = 0;
     // Draws without an entry whose key without user-data SGPRs an earlier draw had (APS5_PROFILE_DRAW).
     std::uint64_t absentUserDataOnly = 0;
+    // Register-key misses by the key component that changed since the last lookup with the same shader set:
+    // stable registers, user data, auxiliary registers, device, first sight of the shader set, nothing changed.
+    std::array<std::uint64_t, 6> registerKeyMissChanges{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

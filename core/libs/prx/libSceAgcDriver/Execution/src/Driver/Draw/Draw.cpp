@@ -151,7 +151,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::shared_ptr<const DrawDecode> decode;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        std::array<std::uint64_t, 5> drawKeyComponents{};
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), true, nullptr, nullptr, profile ? &drawKeyComponents : nullptr);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -163,6 +164,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         } else {
             ++drawEntryCounters.absent;
         }
+        if (profile) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
         // APS5_PROFILE_DRAW: whether a draw without an entry differs from an earlier draw only in
         // its user-data SGPRs (per-draw constant pointers), the churn a key over them cannot hit.
         if (profile) {

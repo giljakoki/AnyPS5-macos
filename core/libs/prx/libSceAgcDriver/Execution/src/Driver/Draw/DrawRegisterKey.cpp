@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
 
@@ -36,7 +37,7 @@ std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegis
     return key == 0 ? 1 : key;
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords, const DrawRelocation* relocation, bool* readable) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool userWords, const DrawRelocation* relocation, bool* readable, std::array<std::uint64_t, 5>* components) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
@@ -55,6 +56,16 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     const auto unread = [&](std::uint32_t offset) {
         return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.second && offset < user.first + 32u; });
     };
+    std::array<std::uint64_t, 5> parts{0xcbf29ce484222325ull, 0xcbf29ce484222325ull, 0xcbf29ce484222325ull, deviceSerial, 0xcbf29ce484222325ull};
+    const auto mixPart = [&](std::size_t part, std::uint64_t value) {
+        if (components != nullptr) parts[part] = (parts[part] ^ value) * 0x100000001b3ull;
+    };
+    const auto partOf = [](bool shader, std::uint32_t offset) -> std::size_t {
+        if (!shader) return 0;
+        if ((offset >= 0x00cu && offset < 0x02cu) || (offset >= 0x08cu && offset < 0x0acu) || (offset >= 0x10cu && offset < 0x12cu)) return 1;
+        if ((offset >= 0x082u && offset < 0x084u) || (offset >= 0x102u && offset < 0x104u)) return 2;
+        return 0;
+    };
     mix(deviceSerial);
     if (relocation != nullptr) mix(0x9e3779b97f4a7c15ull);
     bool contentsReadable = true;
@@ -71,8 +82,12 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
             mix(it->first);
-            if (const auto* word = shader ? relocated(it->first) : nullptr) mix(word->free ? 0x46524545ull : relocatedContentKey(*word, it->second, contentsReadable));
-            else mix(it->second);
+            const auto* word = shader ? relocated(it->first) : nullptr;
+            const std::uint64_t value = word != nullptr ? (word->free ? 0x46524545ull : relocatedContentKey(*word, it->second, contentsReadable)) : it->second;
+            mix(value);
+            const auto part = partOf(shader, it->first);
+            mixPart(part, it->first);
+            mixPart(part, value);
         }
     }
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
@@ -80,20 +95,54 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         const auto high = queue.shader.find(base + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) {
             mix(0);
+            mixPart(4, 0);
             continue;
         }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
         auto it = registry.upper_bound(address);
         if (it == registry.begin()) {
             mix(1);
+            mixPart(4, 1);
             continue;
         }
         --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        for (const auto& snapshot : it->second) {
+            mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+            mixPart(4, reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        }
         mix(address - it->first);
+        mixPart(4, address - it->first);
     }
+    if (components != nullptr) *components = parts;
     if (readable != nullptr) *readable = contentsReadable;
     return key;
+}
+
+void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
+    struct Previous {
+        std::array<std::uint64_t, 4> parts{};
+    };
+    static std::unordered_map<std::uint64_t, Previous> previous;
+    const auto shaderSet = components[4];
+    if (previous.size() >= 2048 && previous.find(shaderSet) == previous.end()) previous.clear();
+    const auto [it, inserted] = previous.try_emplace(shaderSet);
+    const std::array<std::uint64_t, 4> current{components[0], components[1], components[2], components[3]};
+    if (cacheMiss) {
+        auto& changes = drawEntryCounters.registerKeyMissChanges;
+        if (inserted) {
+            ++changes[4];
+        } else {
+            bool changed = false;
+            for (std::size_t i = 0; i < current.size(); ++i) {
+                if (it->second.parts[i] != current[i]) {
+                    ++changes[i];
+                    changed = true;
+                }
+            }
+            if (!changed) ++changes[5];
+        }
+    }
+    it->second.parts = current;
 }
 
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {
